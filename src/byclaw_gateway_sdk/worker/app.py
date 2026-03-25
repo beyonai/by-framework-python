@@ -31,7 +31,7 @@ async def _run_worker_async(
     ] = None,
     plugin_hook_timeout_seconds: Optional[float] = None,
     plugin_log_hook_stats_on_shutdown: bool = True,
-    history_storage: Optional[BaseHistoryStorage] = None,
+    history: Optional[BaseHistoryStorage] = None,
     plugin_dir: Optional[str] = None,
     **worker_kwargs,
 ):
@@ -60,8 +60,11 @@ async def _run_worker_async(
     )
 
     # 2.1 配置历史消息存储后端
-    if history_storage:
-        HistoryProvider.set_storage(history_storage)
+    # - history=None: 使用默认 in-memory 存储
+    # - history=BaseHistoryStorage: 使用指定存储
+    # 存储后端自身决定支持哪些操作（如 save_message 未实现则无法保存）
+    if history is not None:
+        HistoryProvider.set_storage(history)
 
     # 3. 创建并配置 PluginRegistry
     plugin_registry = PluginRegistry()
@@ -137,7 +140,7 @@ def run_worker(
     ] = None,
     plugin_hook_timeout_seconds: Optional[float] = None,
     plugin_log_hook_stats_on_shutdown: bool = True,
-    history_storage: Optional[BaseHistoryStorage] = None,
+    history: Optional[BaseHistoryStorage] = None,
     plugin_dir: Optional[str] = None,
     **worker_kwargs,
 ):
@@ -148,6 +151,11 @@ def run_worker(
     - **自动模式**：系统会自动发现并加载所有继承 `Plugin` 的子类。
     - **目录扫描模式**：通过 `plugin_dir` 指定目录，自动扫描并加载其中的 Python 脚本。
     - **显式模式**：可以通过 `plugin_list` 手动传入插件实例，或通过 `plugin_configurator` 进行自定义配置。
+
+    历史消息存储：
+    - ``history=None``: 使用默认 in-memory 存储。
+    - ``history=BaseHistoryStorage``: 使用指定的自定义存储后端。
+      存储后端自身决定支持哪些操作（如未实现 ``save_message`` 则无法保存消息）。
     """
     import os
 
@@ -175,7 +183,7 @@ def run_worker(
                 plugin_configurator=plugin_configurator,
                 plugin_hook_timeout_seconds=plugin_hook_timeout_seconds,
                 plugin_log_hook_stats_on_shutdown=plugin_log_hook_stats_on_shutdown,
-                history_storage=history_storage,
+                history=history,
                 plugin_dir=plugin_dir,
                 **worker_kwargs,
             )

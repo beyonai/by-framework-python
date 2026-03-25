@@ -37,7 +37,10 @@ class HistoryProvider:
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """持久化一条消息到会话历史"""
+        """持久化一条消息到会话历史。
+
+        具体行为取决于当前存储后端是否实现 ``save_message`` 方法。
+        """
         if not content:
             return
         await cls._storage.save_message(session_id, role, content, metadata)

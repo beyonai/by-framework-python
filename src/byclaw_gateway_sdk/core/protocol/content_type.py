@@ -1,8 +1,15 @@
+"""
+Content type definitions for SSE messages.
+
+Contains enum types for SSE message types and reasoning message types
+used in the Gateway protocol.
+"""
+
 from enum import Enum
 
 
 class SseMessageType(str, Enum):
-    """SseMessageType 枚举"""
+    """SSE 消息类型枚举。"""
 
     text = "1002"  # 文本
     echart = "2001"  # 图表
@@ -13,7 +20,7 @@ class SseMessageType(str, Enum):
 
 
 class SseReasonMessageType(str, Enum):
-    """SseReasonMessageType 枚举"""
+    """SSE 推理消息类型枚举。"""
 
     think_title = "3003"  # 思考过程标题
     think_sub_title = "3005"  # 思考过程子标题

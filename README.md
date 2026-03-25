@@ -239,35 +239,20 @@ async def process_command(self, command, context: AgentContext):
     # 1. 发送流式输出
     await context.emit_chunk("正在处理...")
 
-    # 2. 发送结构化数据
-    await context.emit_data({"key": "value"})
+    # 2. 发送产物/结构化数据
+    await context.emit_artifact({"key": "value"})
 
-    # 3. 更新状态
-    await context.emit_state("thinking")
-
-    # 4. 发送附件
-    await context.emit_artifact(
-        name="report.pdf",
-        content_type="application/pdf",
-        data=b"...pdf content..."
-    )
-
-    # 5. 获取消息 ID 和会话 ID
+    # 3. 获取消息 ID 和会话 ID
     msg_id = context.current_message_id
     session_id = context.session_id
 
-    # 6. 调用其他 Agent (支持挂起当前任务等待返回)
+    # 4. 调用其他 Agent (支持挂起当前任务等待返回)
     result = await context.call_agent(
         target_agent_type="translator_agent",
         content="Hello",
         wait_for_reply=True
     )
 
-    # 7. 并行调用多个 Agent (任务组)
-    group_result = await context.dispatch_group([
-        {"target_agent_type": "search_agent", "content": "Query 1"},
-        {"target_agent_type": "search_agent", "content": "Query 2"},
-    ])
 ```
 
 ### 命令与消息协议
@@ -298,7 +283,6 @@ command = AskAgentCommand(
 | `chunk` | 文本片段 (用于流式输出) |
 | `data` | 结构化数据 |
 | `state` | 状态更新 |
-| `attachment` | 附件 |
 | `error` | 错误 |
 | `done` | 完成 |
 
@@ -387,22 +371,36 @@ class WeatherPlugin(Plugin):
 
 ### 使用插件
 
-方式一：通过代码注册
+方式一：通过 plugin_list 参数传入
 
 ```python
 from byclaw_gateway_sdk import run_worker
 from my_cool_plugin import WeatherPlugin
 
-worker = MyAssistant()
-worker.register_plugin(WeatherPlugin())
-
 run_worker(
     worker_class=MyAssistant,
-    worker_id="worker-01"
+    worker_id="worker-01",
+    plugin_list=[WeatherPlugin()]
 )
 ```
 
-方式二：通过插件目录自动加载 (支持热重载)
+方式二：通过 plugin_configurator 回调配置
+
+```python
+from byclaw_gateway_sdk import run_worker
+from my_cool_plugin import WeatherPlugin
+
+def configure_plugins(registry):
+    registry.register_bundle(WeatherPlugin())
+
+run_worker(
+    worker_class=MyAssistant,
+    worker_id="worker-01",
+    plugin_configurator=configure_plugins
+)
+```
+
+方式三：通过插件目录自动加载 (支持热重载)
 
 ```python
 run_worker(
@@ -415,7 +413,7 @@ run_worker(
 
 ## 📡 发送任务
 
-### 使用 ByaiGatewayClient (推荐)
+### 使用 ByaiGatewayClient
 
 `ByaiGatewayClient` 是对 `GatewayClient` 的封装，默认集成了 `ByaiMessageInterceptor`，支持更高级的消息协议。
 
@@ -447,19 +445,6 @@ import asyncio
 asyncio.run(main())
 ```
 
-### 监听结果
-
-```python
-async def listen_for_results():
-    client = ByaiGatewayClient(redis_host="localhost")
-
-    # 订阅数据流
-    async for message in client.subscribe_data_stream():
-        print(f"收到消息类型: {message.type}, 内容: {message.data}")
-        if message.type == "done":
-            break
-```
-
 ---
 
 ## 🧪 示例
@@ -483,9 +468,9 @@ class StreamingAgent(GatewayWorker):
 
 ### 示例 2: 使用工具调用
 
-```python
-from byclaw_gateway_sdk.core.extensions.tool import tool
+工具通过插件机制提供，使用 `context.call_tool(name, **kwargs)` 调用。
 
+```python
 class ToolAgent(GatewayWorker):
     def get_capabilities(self):
         return ["tool_demo"]
@@ -497,15 +482,14 @@ class ToolAgent(GatewayWorker):
         }
 
     async def process_command(self, command, context: AgentContext):
-        # 工具会自动注入到 context 中
-        if "calculate" in context.tools:
-            result = await context.tools["calculate"](2, 3, "+")
-            await context.emit_chunk(f"计算结果: {result}")
+        # 通过 call_tool 调用工具
+        result = await context.call_tool("calculate", a=2, b=3, op="+")
+        await context.emit_chunk(f"计算结果: {result}")
 
         return {"status": "success"}
 
-    @tool(name="calculate", description="简单计算器")
     async def calculate(self, a: float, b: float, op: str) -> float:
+        """计算工具"""
         if op == "+":
             return a + b
         elif op == "-":
@@ -515,41 +499,31 @@ class ToolAgent(GatewayWorker):
         elif op == "/":
             return a / b if b != 0 else 0
         return 0
-
-    @tool
-    async def search(self, query: str) -> list[str]:
-        """搜索功能"""
-        return [f"结果1: {query}", f"结果2: {query}"]
 ```
 
 ### 示例 3: 历史记录持久化
 
+历史消息通过 `HistoryProvider` 管理，自动保存流式响应。
+
 ```python
-from byclaw_gateway_sdk.core.history import HistoryManager
-from byclaw_gateway_sdk.core.history.storage.postgres import PostgresHistoryStorage
+from byclaw_gateway_sdk.core.history import HistoryProvider
 
 class HistoryAgent(GatewayWorker):
     def get_capabilities(self):
         return ["history_demo"]
 
     async def process_command(self, command, context: AgentContext):
-        # 访问历史记录
-        if context.history:
-            history = await context.history.get_recent(limit=10)
-            await context.emit_data({"history": history})
-
-        # 保存当前消息
-        await context.history.add_message({
-            "role": "assistant",
-            "content": "这是一条新消息"
-        })
+        # 获取历史记录
+        history = await HistoryProvider.get_session_history(
+            session_id=context.session_id,
+            limit=10
+        )
+        await context.emit_chunk(f"历史记录: {history}")
 
         return {"status": "success"}
 ```
 
-### 更多示例
-
-查看 [examples/](examples/) 目录获取更多示例代码。
+历史记录会在 `emit_chunk` 时自动保存到 `HistoryProvider` 指定的存储后端。
 
 ---
 
@@ -567,13 +541,16 @@ class HistoryAgent(GatewayWorker):
 | `redis_port` | `int` | Redis 端口。 | `6379` |
 | `redis_db` | `int` | Redis 数据库号。 | `0` |
 | `redis_password` | `str` | Redis 密码 (可选)。 | `None` |
+| `redis_username` | `str` | Redis 用户名 (可选)。 | `None` |
 | `workspace_dir` | `str` | 任务执行的本地工作目录。 | `"/tmp/gateway-workspace"` |
+| `consumer_group` | `str` | Redis 消费者组名称。 | `"agent_engines"` |
 | `max_concurrency` | `int` | 单个 Worker 的最大并发处理数。 | `50` |
+| `fetch_count` | `int` | 每次从 Redis 批量获取的消息数量。 | `10` |
+| `redis_max_connections` | `int` | Redis 最大连接数。 | `max_concurrency + 10` |
+| `plugin_list` | `List[Plugin]` | 显式传入的插件列表。 | `None` |
+| `plugin_configurator` | `Callable` | 插件配置回调函数。 | `None` |
 | `plugin_dir` | `str` | 插件自动扫描目录 (支持热重载)。 | `None` |
-| `history_storage` | `HistoryStorage` | 历史记录存储实现。 | `None` |
-| `enable_heartbeat` | `bool` | 是否启用心跳检测。 | `True` |
-| `heartbeat_interval` | `float` | 心跳间隔 (秒)。 | `30.0` |
-| `log_level` | `str` | 日志级别。 | `"INFO"` |
+| `history` | `BaseHistoryStorage` | 历史记录存储后端。 | `None` (默认 in-memory) |
 
 ### 环境变量
 
@@ -583,26 +560,10 @@ class HistoryAgent(GatewayWorker):
 | `REDIS_PORT` | Redis 端口 | `6379` |
 | `REDIS_DB` | Redis 数据库 | `0` |
 | `REDIS_PASSWORD` | Redis 密码 | - |
-| `GATEWAY_WORKSPACE_DIR` | 工作目录 | `/tmp/gateway-workspace` |
-| `GATEWAY_MAX_CONCURRENCY` | 最大并发数 | `50` |
-
-### 使用配置文件
-
-创建 `config/config.yaml`：
-
-```yaml
-redis:
-  host: localhost
-  port: 6379
-  db: 0
-
-worker:
-  max_concurrency: 50
-  workspace_dir: ./workspace
-
-logging:
-  level: INFO
-```
+| `REDIS_USERNAME` | Redis 用户名 | - |
+| `BYAI_WORKER_CONCURRENCY` | 最大并发数 | `50` |
+| `BYAI_WORKER_FETCH_COUNT` | 批量获取消息数 | `10` |
+| `BYAI_REDIS_MAX_CONNECTIONS` | Redis 最大连接数 | `max_concurrency + 10` |
 
 ---
 
@@ -612,20 +573,12 @@ logging:
 
 ```python
 class GatewayWorker:
-    def get_capabilities(self) -> list[str]:
+    def get_capabilities(self) -> List[str]:
         """返回此 Worker 能处理的 Agent 类型列表"""
         pass
 
-    async def process_command(self, command: Command, context: AgentContext) -> Any:
+    async def process_command(self, command, context: AgentContext) -> Any:
         """处理命令并返回结果"""
-        pass
-
-    def get_tools(self) -> dict[str, Callable]:
-        """(可选) 返回此 Worker 提供的工具"""
-        return {}
-
-    def register_plugin(self, plugin: Plugin):
-        """注册插件"""
         pass
 ```
 
@@ -633,25 +586,34 @@ class GatewayWorker:
 
 ```python
 class AgentContext:
-    task_id: str
-    workspace_dir: str
-    tools: dict[str, Callable]
-    history: HistoryManager | None
+    session_id: str
+    trace_id: str
+    current_agent_id: str
+    current_message_id: str
 
-    async def emit_chunk(self, text: str):
-        """发送文本片段"""
+    async def emit_chunk(self, event: Union[StreamChunkEvent, str], event_type: Optional[str] = None):
+        """发送文本片段或流式事件"""
 
-    async def emit_data(self, data: dict):
-        """发送结构化数据"""
-
-    async def emit_state(self, state: str):
+    async def emit_state(self, event: Union[StateChangeEvent, str], event_type: Optional[str] = None):
         """发送状态更新"""
 
-    async def emit_attachment(self, name: str, content_type: str, data: bytes):
-        """发送附件"""
+    async def emit_artifact(self, event: Union[ArtifactEvent, str], event_type: Optional[str] = None):
+        """发送产物/附件"""
 
-    async def emit_error(self, error: str):
-        """发送错误"""
+    async def ask_user(self, event: Union[AskUserEvent, str]) -> dict:
+        """向用户发送等待输入请求"""
+
+    async def call_agent(self, target_agent_type: str, content: str, **kwargs) -> dict:
+        """调用其他 Agent"""
+
+    async def dispatch_group(self, tasks: list[dict], **kwargs) -> dict:
+        """分发任务组"""
+
+    async def call_tool(self, name: str, **kwargs):
+        """调用已注册的工具"""
+
+    async def get_active_workers(self) -> Dict[str, Any]:
+        """获取集群中所有活跃的 worker"""
 ```
 
 ### GatewayClient / ByaiGatewayClient
@@ -671,23 +633,6 @@ class GatewayClient:
 
     async def cancel_task(self, message_id: str, session_id: str, reason: str = "") -> CancelTaskResponse:
         """取消指定的任务"""
-
-    async def subscribe_data_stream(self) -> AsyncGenerator[DataMessage, None]:
-        """订阅全局数据流"""
-```
-
-### Command
-
-```python
-@dataclass
-class Command:
-    agent_type: str
-    data: dict = field(default_factory=dict)
-    metadata: dict = field(default_factory=dict)
-    command_id: str | None = None
-```
-
----
 
 ## 🚀 部署指南
 
@@ -765,7 +710,7 @@ volumes:
 ```python
 run_worker(
     worker_class=MyAgent,
-    redis_pool_max_connections=50
+    redis_max_connections=50
 )
 ```
 
@@ -788,126 +733,13 @@ storage = PostgresHistoryStorage(
 
 run_worker(
     worker_class=MyAgent,
-    history_storage=storage
+    history=storage
 )
 ```
 
-4. **使用进程管理器**
-
-```bash
-# 使用 supervisord
-pip install supervisor
-
-# 或使用 systemd
-cat > /etc/systemd/system/gateway-worker.service <<EOF
-[Unit]
-Description=Gateway Worker
-After=network.target
-
-[Service]
-Type=simple
-User=app
-WorkingDirectory=/opt/gateway
-ExecStart=/opt/gateway/.venv/bin/python -m byclaw_gateway_sdk --worker-class my_agent.MyAgent
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
-```
-
 ---
-
-## 🔧 开发指南
-
-### 运行测试
-
-```bash
-cd byclaw_gateway_sdk
-
-# 运行所有测试
-uv run pytest tests/
-
-# 运行特定测试
-uv run pytest tests/test_worker.py -v
-
-# 生成覆盖率报告
-uv run pytest --cov=byclaw_gateway_sdk --cov-report=html
-```
-
-### 代码风格
-
-项目使用以下工具：
-- `black` - 代码格式化
-- `ruff` - 代码检查
-- `mypy` - 类型检查
-
-```bash
-# 格式化代码
-uv run black src/ tests/
-
-# 代码检查
-uv run ruff check src/
-
-# 类型检查
-uv run mypy src/
-```
-
-### 调试技巧
-
-1. **启用调试日志**
-
-```python
-run_worker(
-    worker_class=MyAgent,
-    log_level="DEBUG"
-)
-```
-
-2. **使用调试器**
-
-```python
-import pdb
-
-async def process_command(self, command, context):
-    pdb.set_trace()  # 断点
-    ...
-```
-
-3. **查看 Redis 消息**
-
-```bash
-redis-cli
-
-# 查看队列长度
-XLEN queue:ctrl
-
-# 读取消息
-XREAD COUNT 10 BLOCK 1000 STREAMS queue:ctrl 0
-```
-
----
-
-## 🔗 更多资源
-
-- 📖 [外部 Worker 接入指南](docs/external_worker_guide.md)
-- 🐞 [调试器使用指南](docs/debugger_usage_guide.md)
-- 🏗️ [架构设计文档](../docs/architecture.md)
-- 🧪 [运行验证示例](scripts/demo_run.py)
-- 💻 [Java 版本 SDK](../byclaw_gateway_sdk_java/)
-- 💻 [TypeScript 版本 SDK](../byclaw_gateway_sdk_ts/)
-
-### 相关项目
-
-- [Backend (WebSocket 代理)](../backend/)
-- [Frontend (React UI)](../frontend/)
-- [数字员工](../digital_employee/)
 
 ### 常见问题
-
-**Q: 如何处理长时间运行的任务？**
-
-A: Gateway SDK 原生支持异步任务，只要在 `process_command` 中使用 `await` 即可。Worker 默认支持 50 并发，可以通过 `max_concurrency` 调整。
 
 **Q: 如何保证任务不丢失？**
 
@@ -939,10 +771,10 @@ A: 目前支持 Python、Java、TypeScript。可以参考现有 SDK 实现其他
 
 ## 📄 许可证
 
-本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
+本项目采用 Apache 2.0 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
 
 ---
 
-由 **白音 Agent 团队** 维护。
+由 **byclaw 团队** 维护。
 
 有问题或建议？欢迎联系我们！

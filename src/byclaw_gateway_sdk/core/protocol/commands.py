@@ -1,3 +1,10 @@
+"""
+Command definitions for Gateway protocol.
+
+Contains command dataclasses for all command types (AskAgent, Resume, CancelTask)
+and command registry for dynamic command dispatch.
+"""
+
 from __future__ import annotations
 
 import json
@@ -29,6 +36,13 @@ def _has_content(value: Union[str, List[Dict[str, Any]]]) -> bool:
 
 @dataclass
 class BaseCommand:
+    """命令基类，所有命令类型的父类。
+
+    Attributes:
+        header: 消息头
+        action_type: 动作类型
+    """
+
     header: MessageHeader
 
     action_type: ClassVar[str]
@@ -49,6 +63,14 @@ class BaseCommand:
 
 @dataclass
 class AskAgentCommand(BaseCommand):
+    """向智能体发送消息并等待回复的命令。
+
+    Attributes:
+        content: 消息内容
+        wait_for_reply: 是否等待回复
+        extra_payload: 附加负载
+    """
+
     action_type: ClassVar[str] = ActionType.ASK_AGENT.value
 
     content: Union[str, List[Dict[str, Any]]]
@@ -88,6 +110,15 @@ class AskAgentCommand(BaseCommand):
 
 @dataclass
 class ResumeCommand(BaseCommand):
+    """恢复挂起的任务执行的命令。
+
+    Attributes:
+        content: 消息内容
+        status: 状态
+        reply_data: 回复数据
+        extra_payload: 附加负载
+    """
+
     action_type: ClassVar[str] = ActionType.RESUME.value
 
     content: Union[str, List[Dict[str, Any]]] = ""
@@ -130,6 +161,17 @@ class ResumeCommand(BaseCommand):
 
 @dataclass
 class CancelTaskCommand(BaseCommand):
+    """取消正在执行的任务的命令。
+
+    Attributes:
+        target_message_id: 目标消息ID
+        target_execution_id: 目标执行ID
+        target_worker_id: 目标Worker ID
+        reason: 取消原因
+        requested_by: 请求方
+        cancel_mode: 取消模式 (graceful 或 force)
+    """
+
     action_type: ClassVar[str] = ActionType.CANCEL_TASK.value
 
     target_message_id: str

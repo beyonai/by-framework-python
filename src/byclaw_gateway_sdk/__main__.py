@@ -1,3 +1,9 @@
+"""
+Gateway SDK CLI entry point.
+
+Allows running a Worker class from the command line with Redis configuration.
+"""
+
 #!/usr/bin/env python3
 import argparse
 import importlib
@@ -6,6 +12,7 @@ from .worker.app import run_worker
 
 
 def parse_args():
+    """Parse command line arguments for the CLI runner."""
     parser = argparse.ArgumentParser(description="Gateway SDK CLI Runner")
     parser.add_argument(
         "--worker-class",

@@ -1,3 +1,10 @@
+"""
+Core module of the Gateway SDK.
+
+Provides core components including protocol definitions, worker registry,
+workspace management, and history provider.
+"""
+
 from .history import HistoryProvider
 from .protocol import (
     ActionType,

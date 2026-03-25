@@ -110,6 +110,7 @@ class GatewayDataEmitter:
         source_agent_id: str = "",
         message_id: str = "",
         event_type: Optional[str] = None,
+        content_type: Optional[str] = None,
     ) -> None:
         if isinstance(event, str):
             event = StreamChunkEvent(content=event)
@@ -138,6 +139,7 @@ class GatewayDataEmitter:
         source_agent_id: str = "",
         message_id: str = "",
         event_type: Optional[str] = None,
+        content_type: Optional[str] = None,
     ) -> None:
         if isinstance(event, str):
             event = StateChangeEvent(state=event)
@@ -150,7 +152,7 @@ class GatewayDataEmitter:
             data=_build_sse_layout(
                 content=event.state,
                 role=None,
-                content_type=SseReasonMessageType.think_title.value,
+                content_type=content_type or SseReasonMessageType.think_title.value,
                 source_agent_id=source_agent_id,
             ),
             metadata=event.metadata,
@@ -164,6 +166,7 @@ class GatewayDataEmitter:
         source_agent_id: str = "",
         message_id: str = "",
         event_type: Optional[str] = None,
+        content_type: Optional[str] = None,
     ) -> None:
         if isinstance(event, str):
             event = ArtifactEvent(url=event)
@@ -177,7 +180,7 @@ class GatewayDataEmitter:
             data=_build_sse_layout(
                 content=json.dumps(files_payload, ensure_ascii=False),
                 role=None,
-                content_type=SseReasonMessageType.task_create_file.value,
+                content_type=content_type or SseReasonMessageType.task_create_file.value,
                 source_agent_id=source_agent_id,
             ),
             metadata=event.metadata,

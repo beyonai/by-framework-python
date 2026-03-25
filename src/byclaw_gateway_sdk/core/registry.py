@@ -58,6 +58,11 @@ class WorkerRegistry:
         return random.choice(list(workers))
 
     async def get_all_workers(self) -> dict[str, Any]:
+        """获取所有已注册的 Worker 信息。
+
+        Returns:
+            包含所有 worker ID 及其能力和最后活跃时间的字典
+        """
         redis_inst = self.redis
         worker_ids = await redis_inst.zrange(
             RedisKeys.ACTIVE_WORKERS, 0, -1, withscores=True
@@ -81,6 +86,18 @@ class WorkerRegistry:
         return result
 
     async def claim_worker_id(self, worker_id: str, ttl_seconds: int = 60) -> str:
+        """尝试获取 Worker ID 的独占锁。
+
+        Args:
+            worker_id: 要获取锁的 Worker ID
+            ttl_seconds: 锁的 TTL 秒数
+
+        Returns:
+            锁令牌
+
+        Raises:
+            ValueError: 如果 worker_id 已被占用
+        """
         token = uuid.uuid4().hex
         ok = await self.redis.set(
             RedisKeys.worker_lock(worker_id),
@@ -96,6 +113,15 @@ class WorkerRegistry:
     async def refresh_worker_id_lock(
         self, worker_id: str, ttl_seconds: int = 60
     ) -> bool:
+        """刷新 Worker ID 锁的 TTL。
+
+        Args:
+            worker_id: Worker ID
+            ttl_seconds: 新的 TTL 秒数
+
+        Returns:
+            如果刷新成功返回 True，否则返回 False
+        """
         token = self._lock_tokens.get(worker_id)
         if not token:
             return False
@@ -112,6 +138,15 @@ class WorkerRegistry:
     async def release_worker_id(
         self, worker_id: str, token: Optional[str] = None
     ) -> bool:
+        """释放 Worker ID 的独占锁。
+
+        Args:
+            worker_id: Worker ID
+            token: 可选的锁令牌
+
+        Returns:
+            如果释放成功返回 True，否则返回 False
+        """
         expected = token or self._lock_tokens.get(worker_id)
         if not expected:
             return False
@@ -128,6 +163,11 @@ class WorkerRegistry:
         return True
 
     async def save_execution(self, execution: dict[str, Any]):
+        """保存执行数据到 Redis。
+
+        Args:
+            execution: 执行信息字典，包含 execution_id, message_id, session_id 等
+        """
         execution_id = execution["execution_id"]
         message_id = execution["message_id"]
         session_id = execution["session_id"]
@@ -193,6 +233,13 @@ class WorkerRegistry:
     async def mark_execution_cancelling(
         self, execution_id: str, session_id: str, reason: str
     ):
+        """标记执行状态为 CANCELLING。
+
+        Args:
+            execution_id: 执行ID
+            session_id: 会话ID
+            reason: 取消原因
+        """
         current = await self.get_execution(execution_id, session_id)
         if current is None:
             return
@@ -215,6 +262,13 @@ class WorkerRegistry:
     async def mark_execution_finished(
         self, execution_id: str, session_id: str, status: str
     ):
+        """标记执行为已完成状态。
+
+        Args:
+            execution_id: 执行ID
+            session_id: 会话ID
+            status: 最终状态
+        """
         current = await self.get_execution(execution_id, session_id)
         if current is None:
             return

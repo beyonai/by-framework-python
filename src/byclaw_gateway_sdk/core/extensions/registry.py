@@ -1,3 +1,10 @@
+"""
+Plugin registry module.
+
+Provides the PluginRegistry class for plugin discovery, registration,
+and lifecycle management in Gateway Workers.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -94,6 +101,8 @@ class PluginRegistry:
         trace_id: str = "",
         worker_id: str = "",
     ) -> None:
+        """执行插件钩子的内部方法，包含超时和错误处理。"""
+
         stat = self._ensure_hook_stats(plugin.name, hook_name)
         started_at = time.perf_counter()
         timeout_seconds = getattr(plugin, "hook_timeout_seconds", None)
@@ -136,6 +145,11 @@ class PluginRegistry:
             stat["total_ms"] += (time.perf_counter() - started_at) * 1000
 
     def get_hook_stats(self) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """获取所有插件钩子的执行统计信息。
+
+        Returns:
+            包含每个插件每个钩子的统计信息的字典
+        """
         snapshot: Dict[str, Dict[str, Dict[str, Any]]] = {}
         for plugin_name, plugin_stats in self.hook_stats.items():
             snapshot[plugin_name] = {}
@@ -225,6 +239,7 @@ class PluginRegistry:
             self._agent_configs.append(config)
 
     async def discover_plugins(self) -> None:
+        """自动发现已注册的插件类并实例化注册。"""
         for cls in Plugin.get_registered_plugins():
             if any(isinstance(p, cls) for p in self.plugins):
                 continue
@@ -245,6 +260,11 @@ class PluginRegistry:
                 )
 
     def load_plugins_from_dir(self, directory: str) -> None:
+        """从指定目录动态加载插件模块。
+
+        Args:
+            directory: 包含插件 Python 文件的目录路径
+        """
         if not os.path.isdir(directory):
             logger.warning(
                 "Plugin directory not found or not a directory: %s", directory
@@ -278,6 +298,11 @@ class PluginRegistry:
     async def initialize_plugins(
         self, build_context: PluginBuildContext | None = None
     ) -> None:
+        """初始化所有已发现的插件。
+
+        Args:
+            build_context: 可选的构建上下文
+        """
         if build_context is None:
             build_context = PluginBuildContext(agent_configs=list(self._agent_configs))
 
@@ -303,6 +328,11 @@ class PluginRegistry:
                 self._initialized_plugins.add(plugin_id)
 
     def apply_default_hook_timeout(self, timeout_seconds: float) -> None:
+        """为所有未设置超时的插件设置默认钩子超时时间。
+
+        Args:
+            timeout_seconds: 默认超时秒数
+        """
         if timeout_seconds <= 0:
             return
         for plugin in self.plugins:

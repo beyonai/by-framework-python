@@ -1,3 +1,10 @@
+"""
+Response type definitions for Gateway protocol.
+
+Contains response dataclasses and TypedDict definitions for
+send message and cancel task operations.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
