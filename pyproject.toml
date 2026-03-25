@@ -1,0 +1,44 @@
+[project]
+name = "byclaw-gateway-sdk"
+version = "0.1.0"
+description = "基于 ByClaw Gateway SDK 的 Agent 调度引擎"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "redis>=7.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.21.0",
+    "isort>=5.13.0",
+    "pyink>=24.0.0",
+    "pylint>=3.0.0",
+    "ruff>=0.3.0",
+]
+postgres = [
+    "asyncpg>=0.29.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/byclaw_gateway_sdk"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = [
+    "tests/common",
+    "tests/core",
+    "tests/client",
+    "tests/worker",
+    "tests/plugin",
+    "tests/integration",
+]
+# Suppress deprecation warnings
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
