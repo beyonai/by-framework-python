@@ -47,6 +47,7 @@ class AgentConfig:
         knowledge_bases: 知识库配置字典
         sub_agents: 子智能体ID列表
         on_conflict: 冲突策略：error、overwrite 或 skip
+        extra: 扩展信息
     """
 
     agent_id: str
@@ -58,4 +59,5 @@ class AgentConfig:
     callbacks: dict[CallbackType, list[Callable]] = field(default_factory=dict)
     knowledge_bases: dict[str, Any] = field(default_factory=dict)
     sub_agents: list[str] = field(default_factory=list)
+    extra: dict[str, Any] = field(default_factory=dict)
     on_conflict: ConflictStrategy = "error"
