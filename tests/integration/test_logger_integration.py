@@ -2,7 +2,7 @@ import asyncio
 import logging
 import unittest
 
-from byclaw_gateway_sdk import logger
+from by_framework import logger
 
 
 class TestLoggerIntegration(unittest.TestCase):
@@ -22,7 +22,7 @@ class TestLoggerIntegration(unittest.TestCase):
         """测试 logger 是否能在 Client 模块中正常工作"""
         from unittest.mock import AsyncMock, MagicMock
 
-        from byclaw_gateway_sdk import ByaiGatewayClient, SendMessageResponse
+        from by_framework import ByaiGatewayClient, SendMessageResponse
 
         redis_mock = AsyncMock()
         redis_mock.pipeline = MagicMock(
@@ -45,7 +45,7 @@ class TestLoggerIntegration(unittest.TestCase):
         import asyncio
         from unittest.mock import AsyncMock, MagicMock, Mock
 
-        from byclaw_gateway_sdk import GatewayWorker
+        from by_framework import GatewayWorker
 
         # 创建一个简单的 Worker 子类进行测试
         class TestWorker(GatewayWorker):
@@ -54,7 +54,7 @@ class TestLoggerIntegration(unittest.TestCase):
                 return ["test-agent"]
 
             async def process_command(self, command, context):
-                from byclaw_gateway_sdk import StateChangeEvent
+                from by_framework import StateChangeEvent
 
                 self.logger.debug("Test worker processing task")
                 await context.emit_state(StateChangeEvent(state="COMPLETED"))
@@ -71,8 +71,8 @@ class TestLoggerIntegration(unittest.TestCase):
         workspace_manager_mock.cleanup_task = AsyncMock(return_value=None)
 
         # 配置 msg 模拟对象
-        from byclaw_gateway_sdk.core.protocol.commands import AskAgentCommand
-        from byclaw_gateway_sdk.core.protocol.message_header import MessageHeader
+        from by_framework.core.protocol.commands import AskAgentCommand
+        from by_framework.core.protocol.message_header import MessageHeader
 
         msg_mock = AskAgentCommand(
             header=MessageHeader(

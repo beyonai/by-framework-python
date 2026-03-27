@@ -1,12 +1,12 @@
 """
-Tests for byclaw_gateway_sdk.worker.heartbeat module.
+Tests for by_framework.worker.heartbeat module.
 """
 
 import asyncio
 import unittest
 from unittest.mock import Mock
 
-from byclaw_gateway_sdk.worker.heartbeat import WorkerHeartbeat
+from by_framework.worker.heartbeat import WorkerHeartbeat
 
 
 class MockRegistry:

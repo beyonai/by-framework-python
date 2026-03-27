@@ -4,8 +4,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from byclaw_gateway_sdk import AgentContext
-from byclaw_gateway_sdk.core.protocol.commands import (
+from by_framework import AgentContext
+from by_framework.core.protocol.commands import (
     AskAgentCommand,
     command_from_dict,
 )

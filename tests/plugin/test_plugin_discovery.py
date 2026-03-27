@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from byclaw_gateway_sdk import (
+from by_framework import (
     AgentConfig,
     AgentContext,
     Plugin,
@@ -52,9 +52,12 @@ async def test_plugin_discovery_and_context():
     assert config is not None
     assert callable(config.tools.get("auto_tool"))
 
-    context = AgentContext(session_id="test_session", trace_id="test_trace")
-    context.set_agent_configs(registry.agent_configs)
-    context_config = context.get_agent_config("auto_agent")
+    context = AgentContext(
+        session_id="test_session",
+        trace_id="test_trace",
+        agent_configs=registry.agent_configs,
+    )
+    context_config = context.agent_runtime_state.config_manager.get_config("auto_agent")
     assert context_config is config
 
 

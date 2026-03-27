@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from byclaw_gateway_sdk import (
+from by_framework import (
     AgentConfig,
     Plugin,
     PluginManifest,

@@ -4,18 +4,18 @@ import unittest
 from typing import Any
 from unittest.mock import AsyncMock, Mock
 
-from byclaw_gateway_sdk import (
+from by_framework import (
     GatewayWorker,
     RedisKeys,
     RunningExecution,
     WorkerRunner,
 )
-from byclaw_gateway_sdk.core.protocol.agent_state import AgentState
-from byclaw_gateway_sdk.core.protocol.commands import (
+from by_framework.core.protocol.agent_state import AgentState
+from by_framework.core.protocol.commands import (
     AskAgentCommand,
     CancelTaskCommand,
 )
-from byclaw_gateway_sdk.core.protocol.message_header import MessageHeader
+from by_framework.core.protocol.message_header import MessageHeader
 
 
 class MockRedisRunner:

@@ -1,11 +1,11 @@
 """
-Tests for byclaw_gateway_sdk.common.exceptions module.
+Tests for by_framework.common.exceptions module.
 """
 
 import json
 import unittest
 
-from byclaw_gateway_sdk.common.exceptions import (
+from by_framework.common.exceptions import (
     CommandValidationError,
     ExecutionDataError,
     ExecutionNotFoundError,

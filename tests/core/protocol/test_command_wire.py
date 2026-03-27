@@ -1,7 +1,7 @@
 import json
 
-from byclaw_gateway_sdk.core.protocol.commands import AskAgentCommand
-from byclaw_gateway_sdk.core.protocol.message_header import MessageHeader
+from by_framework.core.protocol.commands import AskAgentCommand
+from by_framework.core.protocol.message_header import MessageHeader
 
 
 def test_command_wire_metadata():

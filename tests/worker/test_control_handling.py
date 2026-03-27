@@ -1,15 +1,15 @@
 """
-Tests for byclaw_gateway_sdk.worker._control_handling module.
+Tests for by_framework.worker._control_handling module.
 """
 
 import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from byclaw_gateway_sdk.common.exceptions import UnsupportedCommandError
-from byclaw_gateway_sdk.core.protocol.commands import CancelTaskCommand
-from byclaw_gateway_sdk.core.protocol.message_header import MessageHeader
-from byclaw_gateway_sdk.worker._control_handling import (
+from by_framework.common.exceptions import UnsupportedCommandError
+from by_framework.core.protocol.commands import CancelTaskCommand
+from by_framework.core.protocol.message_header import MessageHeader
+from by_framework.worker._control_handling import (
     handle_cancel_task,
     parse_control_command,
 )

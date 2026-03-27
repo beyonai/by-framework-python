@@ -1,5 +1,5 @@
 """
-Tests for byclaw_gateway_sdk.worker._message_processing module.
+Tests for by_framework.worker._message_processing module.
 """
 
 import asyncio
@@ -7,15 +7,14 @@ import json
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from byclaw_gateway_sdk.common.exceptions import (
+from by_framework.common.exceptions import (
     MessageDataNotFoundError,
     MessageParseError,
 )
-from byclaw_gateway_sdk.core.protocol.commands import (AskAgentCommand, ResumeCommand)
-from byclaw_gateway_sdk.core.protocol.message_header import MessageHeader
-from byclaw_gateway_sdk.worker._message_processing import (
+from by_framework.core.protocol.commands import (AskAgentCommand, ResumeCommand)
+from by_framework.core.protocol.message_header import MessageHeader
+from by_framework.worker._message_processing import (
     decode_message_id,
-    inject_history,
     parse_message_data,
     process_command,
 )
@@ -62,55 +61,6 @@ class TestParseMessageData(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(MessageParseError) as ctx:
             await parse_message_data(msg_data)
         self.assertIsInstance(ctx.exception.cause, json.JSONDecodeError)
-
-
-class MockHistoryProvider:
-    """Mock HistoryProvider for testing."""
-
-    history_data = [
-        {"role": "user", "content": "Hello"},
-        {"role": "assistant", "content": "Hi there!"},
-    ]
-
-    @classmethod
-    async def get_session_history(cls, session_id: str):
-        return cls.history_data
-
-
-class TestInjectHistory(unittest.IsolatedAsyncioTestCase):
-    """Tests for inject_history function."""
-
-    async def test_injects_history_into_command(self):
-        """Test that history is injected into command extra_payload."""
-        # Patch HistoryProvider
-        import byclaw_gateway_sdk.worker._message_processing as mp
-
-        original = mp.HistoryProvider
-        mp.HistoryProvider = MockHistoryProvider
-
-        try:
-            command = AskAgentCommand(
-                header=MessageHeader(
-                    message_id="msg-1",
-                    session_id="sess-123",
-                    trace_id="trace-1",
-                    target_agent_type="test_agent",
-                ),
-                content="Hello",
-            )
-
-            # History should not be in extra_payload initially
-            self.assertNotIn("history", command.extra_payload)
-
-            await inject_history(command)
-
-            # Now history should be injected
-            self.assertIn("history", command.extra_payload)
-            self.assertEqual(
-                command.extra_payload["history"], MockHistoryProvider.history_data
-            )
-        finally:
-            mp.HistoryProvider = original
 
 
 class MockRedis:
@@ -190,34 +140,25 @@ class TestProcessCommand(unittest.IsolatedAsyncioTestCase):
             content="Hello",
         )
 
-        # Patch HistoryProvider to avoid real DB calls
-        import byclaw_gateway_sdk.worker._message_processing as mp
+        result = await process_command(
+            command=command,
+            worker=mock_worker,
+            cancel_event=asyncio.Event(),
+            cancel_reason="",
+            existing_execution=None,
+            execution_id="exec-1",
+            stream_name="test_stream",
+            msg_id="1-0",
+            redis_client=mock_redis,
+            group_name="test_group",
+            terminal_states=frozenset({"COMPLETED", "FAILED", "CANCELLED"}),
+        )
 
-        original = mp.HistoryProvider
-        mp.HistoryProvider = MockHistoryProvider
-
-        try:
-            result = await process_command(
-                command=command,
-                worker=mock_worker,
-                cancel_event=asyncio.Event(),
-                cancel_reason="",
-                existing_execution=None,
-                execution_id="exec-1",
-                stream_name="test_stream",
-                msg_id="1-0",
-                redis_client=mock_redis,
-                group_name="test_group",
-                terminal_states=frozenset({"COMPLETED", "FAILED", "CANCELLED"}),
-            )
-
-            self.assertEqual(result, "COMPLETED")
-            mock_worker._handle_message.assert_awaited_once()
-        finally:
-            mp.HistoryProvider = original
+        self.assertEqual(result, "COMPLETED")
+        mock_worker._handle_message.assert_awaited_once()
 
     async def test_resume_command_processed(self):
-        """Test that ResumeCommand is processed without history injection."""
+        """Test that ResumeCommand is processed."""
         mock_redis = MockRedis()
         mock_worker = Mock()
         mock_worker.worker_id = "worker-1"
@@ -234,42 +175,22 @@ class TestProcessCommand(unittest.IsolatedAsyncioTestCase):
             status="RESUMED",
         )
 
-        # Patch HistoryProvider to detect if it's called
-        class TrackingHistoryProvider:
-            called = False
+        result = await process_command(
+            command=command,
+            worker=mock_worker,
+            cancel_event=asyncio.Event(),
+            cancel_reason="",
+            existing_execution=None,
+            execution_id="exec-1",
+            stream_name="test_stream",
+            msg_id="1-0",
+            redis_client=mock_redis,
+            group_name="test_group",
+            terminal_states=frozenset({"COMPLETED", "FAILED", "CANCELLED"}),
+        )
 
-            @classmethod
-            async def get_session_history(cls, session_id):
-                cls.called = True
-                return []
-
-        import byclaw_gateway_sdk.worker._message_processing as mp
-
-        original = mp.HistoryProvider
-        mp.HistoryProvider = TrackingHistoryProvider
-
-        try:
-            result = await process_command(
-                command=command,
-                worker=mock_worker,
-                cancel_event=asyncio.Event(),
-                cancel_reason="",
-                existing_execution=None,
-                execution_id="exec-1",
-                stream_name="test_stream",
-                msg_id="1-0",
-                redis_client=mock_redis,
-                group_name="test_group",
-                terminal_states=frozenset({"COMPLETED", "FAILED", "CANCELLED"}),
-            )
-
-            self.assertEqual(result, "RESUMED")
-            mock_worker._handle_message.assert_awaited_once()
-
-            # ResumeCommand should NOT call get_session_history (no history injection)
-            self.assertFalse(TrackingHistoryProvider.called)
-        finally:
-            mp.HistoryProvider = original
+        self.assertEqual(result, "RESUMED")
+        mock_worker._handle_message.assert_awaited_once()
 
 
 if __name__ == "__main__":

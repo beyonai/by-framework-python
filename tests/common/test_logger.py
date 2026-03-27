@@ -1,7 +1,7 @@
 import logging
 
 # logger is now pre-configured or exported
-from byclaw_gateway_sdk import setup_logging
+from by_framework import setup_logging
 
 
 class TestLogger:

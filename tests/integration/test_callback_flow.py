@@ -2,15 +2,15 @@ import json
 import unittest
 from typing import Any
 
-from byclaw_gateway_sdk import (
+from by_framework import (
     GatewayWorker,
     RedisKeys,
     StateChangeEvent,
     StreamChunkEvent,
     WorkerRunner,
 )
-from byclaw_gateway_sdk.core.protocol.commands import (AskAgentCommand, ResumeCommand)
-from byclaw_gateway_sdk.core.protocol.message_header import MessageHeader
+from by_framework.core.protocol.commands import (AskAgentCommand, ResumeCommand)
+from by_framework.core.protocol.message_header import MessageHeader
 
 
 class MockPipeline:

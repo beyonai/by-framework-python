@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-`byclaw-gateway-sdk` is a distributed, high-performance Agent scheduling engine built on Redis Streams. It provides a framework for building AI agents with self-driven orchestration and sandbox isolation capabilities.
+`by-framework` is a distributed, high-performance Agent scheduling engine built on Redis Streams. It provides a framework for building AI agents with self-driven orchestration and sandbox isolation capabilities.
 
 ## Build Commands
 
@@ -44,17 +44,17 @@ Client → Redis Input MQ (queue:ctrl:{agent_type}) → GatewayWorker
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| `GatewayWorker` | `src/byclaw_gateway_sdk/worker/worker.py` | Abstract base class for workers; implement `get_capabilities()` and `process_command()` |
-| `AgentContext` | `src/byclaw_gateway_sdk/worker/context.py` | Runtime context for task execution; emits chunks, states, artifacts; calls other agents |
-| `run_worker()` | `src/byclaw_gateway_sdk/worker/app.py` | Main entry point for starting a worker |
-| `GatewayClient` | `src/byclaw_gateway_sdk/client/client.py` | Sends commands to Redis Streams |
-| `ByaiGatewayClient` | `src/byclaw_gateway_sdk/client/byai_client.py` | GatewayClient with ByaiMessageInterceptor |
-| `Plugin` | `src/byclaw_gateway_sdk/core/extensions/plugin.py` | Abstract base for extensible plugins with lifecycle hooks |
-| `PluginRegistry` | `src/byclaw_gateway_sdk/core/extensions/registry.py` | Manages plugin registration and discovery |
+| `GatewayWorker` | `src/by_framework/worker/worker.py` | Abstract base class for workers; implement `get_capabilities()` and `process_command()` |
+| `AgentContext` | `src/by_framework/worker/context.py` | Runtime context for task execution; emits chunks, states, artifacts; calls other agents |
+| `run_worker()` | `src/by_framework/worker/app.py` | Main entry point for starting a worker |
+| `GatewayClient` | `src/by_framework/client/client.py` | Sends commands to Redis Streams |
+| `ByaiGatewayClient` | `src/by_framework/client/byai_client.py` | GatewayClient with ByaiMessageInterceptor |
+| `Plugin` | `src/by_framework/core/extensions/plugin.py` | Abstract base for extensible plugins with lifecycle hooks |
+| `PluginRegistry` | `src/by_framework/core/extensions/registry.py` | Manages plugin registration and discovery |
 
 ### Protocol System
 
-Commands and events are defined in `src/byclaw_gateway_sdk/core/protocol/`:
+Commands and events are defined in `src/by_framework/core/protocol/`:
 - `commands.py` - `AskAgentCommand`, `CancelTaskCommand`, `ResumeCommand`
 - `events.py` - `StreamChunkEvent`, `StateChangeEvent`, `ArtifactEvent`
 - `message_header.py` - `MessageHeader` with session_id, trace_id, message_id
@@ -90,7 +90,7 @@ Pre-commit hooks are configured in `.pre-commit-config.yaml` and run isort, ruff
 
 ## Development Notes
 
-- Package is at `src/byclaw_gateway_sdk/` (configured in `pyproject.toml`)
+- Package is at `src/by_framework/` (configured in `pyproject.toml`)
 - `pythonpath = ["src"]` is set in pytest config
 - Redis 7.0+ is required for Streams functionality
 - Worker capabilities are declared via `get_capabilities()` and used for task routing

@@ -2,9 +2,9 @@ from typing import List
 
 import pytest
 
-from byclaw_gateway_sdk.core.protocol.commands import ResumeCommand
-from byclaw_gateway_sdk.core.protocol.message_header import MessageHeader
-from byclaw_gateway_sdk.worker.worker import GatewayWorker
+from by_framework.core.protocol.commands import ResumeCommand
+from by_framework.core.protocol.message_header import MessageHeader
+from by_framework.worker.worker import GatewayWorker
 
 
 class DummyWorker(GatewayWorker):

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from byclaw_gateway_sdk import WorkspaceManager
+from by_framework import WorkspaceManager
 
 
 @pytest.mark.asyncio

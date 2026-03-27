@@ -3,8 +3,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from byclaw_gateway_sdk import ByaiGatewayClient, GatewayClient
-from byclaw_gateway_sdk.core.protocol.commands import (
+from by_framework import ByaiGatewayClient, GatewayClient
+from by_framework.core.protocol.commands import (
     AskAgentCommand,
     CancelTaskCommand,
     command_from_dict,

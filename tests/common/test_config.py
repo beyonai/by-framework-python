@@ -1,11 +1,11 @@
 """
-Tests for byclaw_gateway_sdk.common.config module.
+Tests for by_framework.common.config module.
 """
 
 import os
 import unittest
 
-from byclaw_gateway_sdk.common.config import (
+from by_framework.common.config import (
     LoggingConfig,
     RedisConfig,
     SDKConfig,
@@ -215,13 +215,13 @@ class TestGlobalConfigFunctions(unittest.TestCase):
 
     def setUp(self):
         """Save original config state."""
-        import byclaw_gateway_sdk.common.config as config_module
+        import by_framework.common.config as config_module
 
         self._original_config = config_module._config
 
     def tearDown(self):
         """Restore original config state."""
-        import byclaw_gateway_sdk.common.config as config_module
+        import by_framework.common.config as config_module
 
         config_module._config = self._original_config
 
@@ -238,13 +238,13 @@ class TestGlobalConfigFunctions(unittest.TestCase):
         custom_config = SDKConfig(redis=RedisConfig(host="test-host"))
         init_config(custom_config)
 
-        import byclaw_gateway_sdk.common.config as config_module
+        import by_framework.common.config as config_module
 
         self.assertIs(config_module._config, custom_config)
 
     def test_get_config_lazy_loads(self):
         """Test that get_config loads from env when not set."""
-        import byclaw_gateway_sdk.common.config as config_module
+        import by_framework.common.config as config_module
 
         config_module._config = None
 

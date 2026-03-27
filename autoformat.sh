@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Autoformat byclaw-gateway-sdk-python codebase.
+# Autoformat by-framework-python codebase.
 
 if ! command -v isort &> /dev/null
 then

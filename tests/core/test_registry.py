@@ -1,6 +1,6 @@
 import pytest
 
-from byclaw_gateway_sdk import RedisKeys, WorkerRegistry
+from by_framework import RedisKeys, WorkerRegistry
 
 
 class MockPipeline:

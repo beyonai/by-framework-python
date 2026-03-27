@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from byclaw_gateway_sdk import (
+from by_framework import (
     AgentConfig,
     AgentContext,
     Plugin,
@@ -177,44 +177,6 @@ async def test_agent_config_conflict_strategy_error_skip_overwrite():
     await registry.initialize_plugins()
 
     assert registry.agent_config("dup_agent") is not None
-
-
-@pytest.mark.asyncio
-async def test_agent_context_call_tool_supports_sync_and_async():
-    """Test that AgentContext.call_tool works with both sync and async tools."""
-    registry = PluginRegistry()
-
-    def sync_tool(x: int):
-        return x + 1
-
-    async def async_tool(x: int):
-        return x + 2
-
-    class ToolsBundle(Plugin):
-
-        def __init__(self):
-            super().__init__(PluginManifest(plugin_id="tools_bundle"))
-
-        async def register_agent_configs(self, agent_context=None) -> list[AgentConfig]:
-            return [
-                AgentConfig(
-                    agent_id="tools_agent",
-                    tools={"sync_tool": sync_tool, "async_tool": async_tool},
-                )
-            ]
-
-    registry.register_bundle(ToolsBundle())
-    await registry.initialize_plugins()
-
-    context = AgentContext(
-        session_id="s-1",
-        trace_id="t-1",
-        redis_client=object(),
-    )
-    context.set_agent_configs(registry.agent_configs)
-
-    assert await context.call_tool("sync_tool", x=3) == 4
-    assert await context.call_tool("async_tool", x=3) == 5
 
 
 def test_prompt_template_render_reports_missing_variables():

@@ -4,9 +4,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from byclaw_gateway_sdk import GatewayWorker
-from byclaw_gateway_sdk.core.protocol.commands import (AskAgentCommand, ResumeCommand)
-from byclaw_gateway_sdk.core.protocol.message_header import MessageHeader
+from by_framework import GatewayWorker
+from by_framework.core.protocol.commands import (AskAgentCommand, ResumeCommand)
+from by_framework.core.protocol.message_header import MessageHeader
 
 
 class DummyWorker(GatewayWorker):

@@ -1,7 +1,7 @@
 [project]
-name = "byclaw-gateway-sdk"
+name = "by-framework"
 version = "0.1.1"
-description = "基于 ByClaw Gateway SDK 的 Agent 调度引擎"
+description = "分布式 Agent 调度框架"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -26,7 +26,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/byclaw_gateway_sdk"]
+packages = ["src/by_framework"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

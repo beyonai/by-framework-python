@@ -3,13 +3,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from byclaw_gateway_sdk import GatewayProcessor
-from byclaw_gateway_sdk.core.protocol.commands import (
+from by_framework import GatewayProcessor
+from by_framework.core.protocol.commands import (
     AskAgentCommand,
     ResumeCommand,
     command_from_dict,
 )
-from byclaw_gateway_sdk.core.protocol.message_header import MessageHeader
+from by_framework.core.protocol.message_header import MessageHeader
 
 
 @pytest.mark.asyncio

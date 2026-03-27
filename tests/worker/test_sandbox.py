@@ -1,6 +1,6 @@
 import pytest
 
-from byclaw_gateway_sdk.worker.sandbox.hook_sandbox import (
+from by_framework.worker.sandbox.hook_sandbox import (
     HookSandbox,
     active_workspace,
 )

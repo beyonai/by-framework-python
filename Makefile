@@ -1,4 +1,4 @@
-# Makefile for byclaw-gateway-sdk-python
+# Makefile for by-framework-python
 
 .PHONY: all install format lint test clean
 

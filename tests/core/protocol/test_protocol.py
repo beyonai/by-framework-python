@@ -3,8 +3,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from byclaw_gateway_sdk import ActionType, AgentState, DataMessage, RedisKeys
-from byclaw_gateway_sdk.core.protocol.commands import (
+from by_framework import ActionType, AgentState, DataMessage, RedisKeys
+from by_framework.core.protocol.commands import (
     AskAgentCommand,
     BaseCommand,
     CancelTaskCommand,
@@ -13,7 +13,7 @@ from byclaw_gateway_sdk.core.protocol.commands import (
     register_command,
     unregister_command,
 )
-from byclaw_gateway_sdk.core.protocol.message_header import MessageHeader
+from by_framework.core.protocol.message_header import MessageHeader
 
 
 def test_data_message_creation():

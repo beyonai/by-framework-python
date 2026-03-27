@@ -1,10 +1,10 @@
-# 🚀 byclaw-gateway-sdk-python
+# 🚀 by-framework-python
 
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](pyproject.toml)
 [![Python](https://img.shields.io/badge/python-3.12+-yellow.svg)](pyproject.toml)
 [![Redis](https://img.shields.io/badge/redis-7.0+-red.svg)](pyproject.toml)
 
-**byclaw-gateway-sdk** 是一个基于 Redis Streams 构建的分布式、高性能 Agent 调度引擎。它为【超级助手】、【数字员工】等具备自驱编排、沙箱隔离能力的智能体服务提供了标准化的开发框架和运行环境。
+**by-framework** 是一个基于 Redis Streams 构建的分布式、高性能 Agent 调度引擎。它为【超级助手】、【数字员工】等具备自驱编排、沙箱隔离能力的智能体服务提供了标准化的开发框架和运行环境。
 
 ---
 
@@ -91,10 +91,10 @@ Frontend (渲染实时 AI 响应)
 
 ```bash
 # 基础安装
-pip install byclaw-gateway-sdk
+pip install by-framework
 
 # 包含 Postgres 支持
-pip install "byclaw-gateway-sdk[postgres]"
+pip install "by-framework[postgres]"
 
 # 开发模式安装
 pip install -e ".[dev]"
@@ -104,7 +104,7 @@ pip install -e ".[dev]"
 
 ```bash
 # 克隆项目后安装所有依赖
-cd byclaw-gateway-sdk-python
+cd by-framework-python
 uv sync
 ```
 
@@ -118,7 +118,7 @@ uv sync
 
 ```python
 import asyncio
-from byclaw_gateway_sdk import GatewayWorker, AgentContext, run_worker
+from by_framework import GatewayWorker, AgentContext, run_worker
 
 class MyAssistant(GatewayWorker):
     def get_capabilities(self):
@@ -169,7 +169,7 @@ docker run -d -p 6379:6379 redis:7-alpine
 ### 3. 启动 Worker
 
 ```bash
-cd byclaw-gateway-sdk-python
+cd by-framework-python
 uv run python my_agent.py
 ```
 
@@ -179,7 +179,7 @@ uv run python my_agent.py
 
 ```python
 import asyncio
-from byclaw_gateway_sdk import ByaiGatewayClient, AskAgentCommand
+from by_framework import ByaiGatewayClient, AskAgentCommand
 
 async def send_task():
     # 使用 ByaiGatewayClient，它集成了默认的消息拦截器
@@ -260,8 +260,8 @@ async def process_command(self, command, context: AgentContext):
 #### AskAgentCommand (任务指令)
 
 ```python
-from byclaw_gateway_sdk.core.protocol.commands import AskAgentCommand
-from byclaw_gateway_sdk.core.protocol.message_header import MessageHeader
+from by_framework.core.protocol.commands import AskAgentCommand
+from by_framework.core.protocol.message_header import MessageHeader
 
 command = AskAgentCommand(
     header=MessageHeader(
@@ -311,7 +311,7 @@ my_plugins/
 创建 `my_cool_plugin.py`：
 
 ```python
-from byclaw_gateway_sdk import Plugin, PluginManifest, AgentConfig, PluginBuildContext
+from by_framework import Plugin, PluginManifest, AgentConfig, PluginBuildContext
 from typing import Any
 
 class WeatherPlugin(Plugin):
@@ -374,7 +374,7 @@ class WeatherPlugin(Plugin):
 方式一：通过 plugin_list 参数传入
 
 ```python
-from byclaw_gateway_sdk import run_worker
+from by_framework import run_worker
 from my_cool_plugin import WeatherPlugin
 
 run_worker(
@@ -387,7 +387,7 @@ run_worker(
 方式二：通过 plugin_configurator 回调配置
 
 ```python
-from byclaw_gateway_sdk import run_worker
+from by_framework import run_worker
 from my_cool_plugin import WeatherPlugin
 
 def configure_plugins(registry):
@@ -418,7 +418,7 @@ run_worker(
 `ByaiGatewayClient` 是对 `GatewayClient` 的封装，默认集成了 `ByaiMessageInterceptor`，支持更高级的消息协议。
 
 ```python
-from byclaw_gateway_sdk import ByaiGatewayClient
+from by_framework import ByaiGatewayClient
 
 async def main():
     # 初始化客户端
@@ -431,8 +431,8 @@ async def main():
     response = await client.send_message(
         target_agent_type="weather_agent",
         session_id="session_123",
-        content="查询北京今天的天气",
-        metadata={"user_id": "u123"}
+        tenant_id="tenant_123",
+        content="查询北京今天的天气"
     )
     
     if response.success:
@@ -506,7 +506,7 @@ class ToolAgent(GatewayWorker):
 历史消息通过 `HistoryProvider` 管理，自动保存流式响应。
 
 ```python
-from byclaw_gateway_sdk.core.history import HistoryProvider
+from by_framework.core.history import HistoryProvider
 
 class HistoryAgent(GatewayWorker):
     def get_capabilities(self):
@@ -642,7 +642,7 @@ class GatewayClient:
 
 ```bash
 # 安装依赖
-cd byclaw_gateway_sdk
+cd by_framework
 uv sync
 ```
 
@@ -658,7 +658,7 @@ docker run -d --name gateway-redis \
 3. **启动 Worker**
 
 ```bash
-uv run python -m byclaw_gateway_sdk \
+uv run python -m by_framework \
   --worker-class my_agent.MyAgent \
   --worker-id worker-01 \
   --redis-host localhost
@@ -682,7 +682,7 @@ services:
   worker-1:
     build: .
     command: >
-      python -m byclaw_gateway_sdk
+      python -m by_framework
       --worker-class my_agent.MyAgent
       --worker-id worker-01
       --redis-host redis
@@ -692,7 +692,7 @@ services:
   worker-2:
     build: .
     command: >
-      python -m byclaw_gateway_sdk
+      python -m by_framework
       --worker-class my_agent.MyAgent
       --worker-id worker-02
       --redis-host redis
@@ -717,7 +717,7 @@ run_worker(
 2. **配置监控**
 
 ```python
-from byclaw_gateway_sdk.common.logger import setup_logging
+from by_framework.common.logger import setup_logging
 
 setup_logging(level="INFO", json_format=True)
 ```
@@ -725,7 +725,7 @@ setup_logging(level="INFO", json_format=True)
 3. **启用历史持久化**
 
 ```python
-from byclaw_gateway_sdk.core.history.storage.postgres import PostgresHistoryStorage
+from by_framework.core.history.storage.postgres import PostgresHistoryStorage
 
 storage = PostgresHistoryStorage(
     dsn="postgresql://user:pass@localhost/gateway"
@@ -775,6 +775,6 @@ A: 目前支持 Python、Java、TypeScript。可以参考现有 SDK 实现其他
 
 ---
 
-由 **byclaw 团队** 维护。
+由 **byai 团队** 维护。
 
 有问题或建议？欢迎联系我们！
