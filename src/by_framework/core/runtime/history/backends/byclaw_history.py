@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
+from by_framework.common.logger import logger
 from ..base import BaseHistoryBackend
 
 
@@ -40,25 +41,65 @@ class ByClawHistoryBackend(BaseHistoryBackend):
                 resp.raise_for_status()
                 data = resp.json()
 
-                if data.get("resultCode") != "0":
+                if not isinstance(data, dict):
+                    logger.error(
+                        "ByClawHistoryBackend: Invalid response format for session %s, expected dict, got %s",
+                        session_id,
+                        type(data),
+                    )
                     return []
 
-                result_object = data.get("resultObject") or []
+                result_code = data.get("resultCode")
+                if result_code != "0":
+                    logger.error(
+                        "ByClawHistoryBackend: Failed to get messages for session %s, resultCode: %s, message: %s",
+                        session_id,
+                        result_code,
+                        data.get("resultMessage", "Unknown error"),
+                    )
+                    return []
+
+                result_object = data.get("resultObject")
+                if not isinstance(result_object, list):
+                    logger.warning(
+                        "ByClawHistoryBackend: resultObject for session %s is not a list, got %s",
+                        session_id,
+                        type(result_object),
+                    )
+                    return []
+
                 formatted_messages = []
                 for item in result_object:
+                    if not isinstance(item, dict):
+                        continue
+
                     usage = item.get("usage")
                     # 映射规则：usage=1 -> user, usage=2 -> assistant
-                    role = "user" if usage == 1 else "assistant" if usage == 2 else "unknown"
+                    role = (
+                        "user"
+                        if usage == 1
+                        else "assistant"
+                        if usage == 2
+                        else "unknown"
+                    )
                     content = item.get("messageContent") or ""
-                    
-                    formatted_messages.append({
-                        "role": role,
-                        "content": content,
-                        "metadata": item.get("metadata")
-                    })
+
+                    formatted_messages.append(
+                        {
+                            "role": role,
+                            "content": content,
+                            "metadata": item.get("metadata"),
+                        }
+                    )
                 
                 # 返回的消息通常是按时间正序排列的，符合 SDK 要求
                 return formatted_messages
-        except Exception:
+        except Exception as e:
             # 记录错误并返回空，保证 runtime 不崩溃
+            logger.error(
+                "ByClawHistoryBackend: Unexpected error while getting messages for session %s: %s",
+                session_id,
+                str(e),
+                exc_info=True,
+            )
             return []
