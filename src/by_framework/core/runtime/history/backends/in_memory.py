@@ -7,10 +7,10 @@ Suitable for development and testing.
 
 from typing import Any, Dict, List, Optional
 
-from ..base import BaseHistoryStorage
+from ..base import BaseHistoryBackend
 
 
-class InMemoryHistoryStorage(BaseHistoryStorage):
+class InMemoryHistoryBackend(BaseHistoryBackend):
     """基于内存的存储后端（默认，适用于开发和测试）。
 
     所有数据存储在内存字典中，进程重启后数据会丢失。

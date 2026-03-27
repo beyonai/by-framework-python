@@ -11,10 +11,10 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from by_framework.common.logger import logger
 
-from ..base import BaseHistoryStorage
+from ..base import BaseHistoryBackend
 
 
-class PostgresHistoryStorage(BaseHistoryStorage):
+class PostgresHistoryBackend(BaseHistoryBackend):
     """基于 PostgreSQL 的存储后端。
 
     支持通过 DSN 或环境变量 (BYAI_HISTORY_PG_DSN) 配置连接。
@@ -90,7 +90,7 @@ class PostgresHistoryStorage(BaseHistoryStorage):
             import asyncpg
         except ImportError as err:
             raise RuntimeError(
-                "PostgresHistoryStorage requires `asyncpg`. "
+                "PostgresHistoryBackend requires `asyncpg`. "
                 "Please install it or pass a pre-built connection pool."
             ) from err
         return await asyncpg.create_pool(
@@ -105,7 +105,7 @@ class PostgresHistoryStorage(BaseHistoryStorage):
             return True
         if not self._dsn:
             logger.warning(
-                "PostgresHistoryStorage disabled: missing connection_pool and BYAI_HISTORY_PG_DSN/dsn"
+                "PostgresHistoryBackend disabled: missing connection_pool and BYAI_HISTORY_PG_DSN/dsn"
             )
             return False
 
@@ -118,7 +118,7 @@ class PostgresHistoryStorage(BaseHistoryStorage):
                 self._pool_max_size,
                 self._pool_command_timeout,
             )
-            logger.info("PostgresHistoryStorage connection pool initialized")
+            logger.info("PostgresHistoryBackend connection pool initialized")
         return True
 
     async def _ensure_schema(self) -> None:

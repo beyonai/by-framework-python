@@ -12,6 +12,7 @@ import asyncio
 import inspect
 import uuid
 import warnings
+from typing_extensions import deprecated
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 from by_framework.common.constants import (
@@ -124,15 +125,15 @@ class AgentContext:
         """
         return self._agent_runtime_state.config_manager.list_configs()
 
-    @warnings.deprecated("use agent_runtime_state.config_manager instead")
+    @deprecated("use agent_runtime_state.config_manager instead")
     def set_agent_configs(self, new_configs: list[AgentConfig]) -> None:
         self._agent_runtime_state.config_manager.set_configs(new_configs)
 
-    @warnings.deprecated("use agent_runtime_state.config_manager instead")
+    @deprecated("use agent_runtime_state.config_manager instead")
     def get_agent_config(self, agent_id: str) -> AgentConfig | None:
         return self._agent_runtime_state.config_manager.get_config(agent_id)
 
-    @warnings.deprecated("use agent_runtime_state.config_manager instead")
+    @deprecated("use agent_runtime_state.config_manager instead")
     def list_agent_configs(self) -> list[AgentConfig]:
         return self._agent_runtime_state.config_manager.list_configs()
 

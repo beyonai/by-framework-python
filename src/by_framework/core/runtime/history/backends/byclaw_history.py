@@ -1,27 +1,64 @@
-"""
-In-memory history storage implementation.
-
-Provides a simple in-memory storage backend for session history.
-Suitable for development and testing.
-"""
-
+import os
 from typing import Any, Dict, List, Optional
 
-from ..base import BaseHistoryStorage
+import httpx
+
+from ..base import BaseHistoryBackend
 
 
-class ByClawHistoryStorage(BaseHistoryStorage):
-    """基于内存的存储后端（默认，适用于开发和测试）。
+class ByClawHistoryBackend(BaseHistoryBackend):
+    """基于 ByAI 接口的历史记录存储后端。
 
-    所有数据存储在内存字典中，进程重启后数据会丢失。
+    从外部 ByAI 服务获取会话历史消息。
     """
 
-    def __init__(self):
-        # 结构: {session_id: [message1, message2, ...]}
-        self._storage: Dict[str, List[Dict[str, Any]]] = {}
+    def __init__(self, base_url: Optional[str] = None):
+        """初始化存储后端。
+
+        Args:
+            base_url: ByAI 服务基础 URL。若不提供则从环境变量 BYAI_BASE_URL 获取。
+        """
+        self.base_url = base_url or os.environ.get("BYAI_BASE_URL", "")
 
     async def get_history(
         self, session_id: str, limit: int = 10
     ) -> List[Dict[str, Any]]:
-        messages = self._storage.get(session_id, [])
-        return messages[-limit:]
+        """通过接口获取当前会话的历史消息。
+
+        POST /byaiService/open/api/inner/getMessages
+        """
+
+        url = f"{self.base_url.rstrip('/')}/byaiService/open/api/inner/getMessages"
+        payload = {
+            "sessionId": session_id,
+            "topK": limit,
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(url, json=payload, timeout=10.0)
+                resp.raise_for_status()
+                data = resp.json()
+
+                if data.get("resultCode") != "0":
+                    return []
+
+                result_object = data.get("resultObject") or []
+                formatted_messages = []
+                for item in result_object:
+                    usage = item.get("usage")
+                    # 映射规则：usage=1 -> user, usage=2 -> assistant
+                    role = "user" if usage == 1 else "assistant" if usage == 2 else "unknown"
+                    content = item.get("messageContent") or ""
+                    
+                    formatted_messages.append({
+                        "role": role,
+                        "content": content,
+                        "metadata": item.get("metadata")
+                    })
+                
+                # 返回的消息通常是按时间正序排列的，符合 SDK 要求
+                return formatted_messages
+        except Exception:
+            # 记录错误并返回空，保证 runtime 不崩溃
+            return []

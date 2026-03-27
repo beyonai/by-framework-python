@@ -14,7 +14,16 @@ from by_framework.core.protocol.commands import (
 @pytest.mark.asyncio
 async def test_context_call_agent_with_metadata():
     """Test that AgentContext.call_agent correctly passes metadata to the emitted command."""
-    mock_redis = AsyncMock()
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    # xadd 是真正的异步方法（await self.redis.xadd(...)）
+    mock_redis.xadd = AsyncMock()
+    # pipeline() 是同步方法，返回 Pipeline 对象
+    mock_pipe = MagicMock()
+    mock_pipe.execute = AsyncMock(return_value=[])
+    mock_redis.pipeline.return_value = mock_pipe
+
     ctx = AgentContext(session_id="s1", trace_id="t1", redis_client=mock_redis)
     await ctx.call_agent(
         target_agent_type="test", content="hello", metadata={"ctx": "val"}
@@ -28,7 +37,14 @@ async def test_context_call_agent_with_metadata():
 @pytest.mark.asyncio
 async def test_context_call_agent_emits_message_decodable_as_command():
     """Test that call_agent emits an AskAgentCommand that can be decoded from Redis payload."""
-    mock_redis = AsyncMock()
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.execute = AsyncMock(return_value=[])
+    mock_redis.pipeline.return_value = mock_pipe
+
     ctx = AgentContext(
         session_id="s1",
         trace_id="t1",

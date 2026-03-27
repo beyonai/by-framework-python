@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from by_framework.core.runtime.history.backends.postgres import PostgresHistoryStorage
+from by_framework.core.runtime.history.backends.postgres import PostgresHistoryBackend
 
 
 @pytest.mark.asyncio
@@ -21,7 +21,7 @@ async def test_save_message_executes_insert_with_default_metadata():
     pool = MagicMock()
     pool.acquire.return_value = _AcquireCtx()
 
-    storage = PostgresHistoryStorage(connection_pool=pool)
+    storage = PostgresHistoryBackend(connection_pool=pool)
 
     await storage.save_message("s1", "assistant", "hello", None)
 
@@ -65,7 +65,7 @@ async def test_get_history_returns_latest_messages_in_chronological_order():
     pool = MagicMock()
     pool.acquire.return_value = _AcquireCtx()
 
-    storage = PostgresHistoryStorage(connection_pool=pool)
+    storage = PostgresHistoryBackend(connection_pool=pool)
 
     history = await storage.get_history("session-x", limit=2)
 
@@ -85,8 +85,8 @@ async def test_get_history_returns_latest_messages_in_chronological_order():
 
 @pytest.mark.asyncio
 async def test_no_pool_behaves_as_noop_storage():
-    """Test that PostgresHistoryStorage with None pool is a no-op storage."""
-    storage = PostgresHistoryStorage(connection_pool=None)
+    """Test that PostgresHistoryBackend with None pool is a no-op storage."""
+    storage = PostgresHistoryBackend(connection_pool=None)
 
     history = await storage.get_history("no-pool", limit=5)
     await storage.save_message("no-pool", "user", "hello")
@@ -111,7 +111,7 @@ async def test_dsn_auto_initializes_connection_pool_once():
     pool.acquire.return_value = _AcquireCtx()
 
     pool_factory = AsyncMock(return_value=pool)
-    storage = PostgresHistoryStorage(
+    storage = PostgresHistoryBackend(
         dsn="postgresql://u:p@localhost:5432/db",
         pool_factory=pool_factory,
     )

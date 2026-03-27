@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from by_framework.core.runtime.history import BaseHistoryStorage, HistoryManager
+from by_framework.core.runtime.history import BaseHistoryBackend, HistoryManager
 from by_framework.core.protocol.commands import AskAgentCommand
 from by_framework.core.protocol.event_type import EventType
 from by_framework.core.protocol.message_header import MessageHeader
@@ -36,7 +36,7 @@ def mock_redis():
 @pytest.fixture
 def mock_history_manager():
     with patch(
-        "by_framework.core.runtime.history.manager.HistoryManager.save_message",
+        "by_framework.core.runtime.history.history_manager.HistoryManager.save_message",
         new_callable=AsyncMock,
     ) as mocked:
         yield mocked
@@ -130,10 +130,10 @@ async def test_duplicate_save_prevention(mock_redis, mock_history_manager):
 
 @pytest.mark.asyncio
 async def test_in_memory_storage_isolation():
-    """验证 InMemoryHistoryStorage 的多会话隔离"""
-    from by_framework.core.runtime.history import InMemoryHistoryStorage
+    """验证 InMemoryHistoryBackend 的多会话隔离"""
+    from by_framework.core.runtime.history import InMemoryHistoryBackend
 
-    storage = InMemoryHistoryStorage()
+    storage = InMemoryHistoryBackend()
 
     await storage.save_message("session-A", "user", "Hello A")
     await storage.save_message("session-B", "user", "Hello B")
@@ -150,9 +150,9 @@ async def test_in_memory_storage_isolation():
 @pytest.mark.asyncio
 async def test_history_manager_backend_switch(mock_redis):
     """验证 HistoryManager 动态切换后端逻辑"""
-    from by_framework.core.runtime.history import BaseHistoryStorage
+    from by_framework.core.runtime.history import BaseHistoryBackend
 
-    class MyCustomStorage(BaseHistoryStorage):
+    class MyCustomBackend(BaseHistoryBackend):
 
         def __init__(self):
             self.saved = False
@@ -163,15 +163,15 @@ async def test_history_manager_backend_switch(mock_redis):
         async def save_message(self, session_id, role, content, metadata=None):
             self.saved = True
 
-    custom_storage = MyCustomStorage()
-    HistoryManager.set_default_storage(custom_storage)
+    custom_backend = MyCustomBackend()
+    HistoryManager.set_default_backend(custom_backend)
 
     # 触发保存 (通过实例)
     manager = HistoryManager(session_id="s4")
     await manager.save_message("assistant", "test")
-    assert custom_storage.saved is True
+    assert custom_backend.saved is True
 
     # 恢复默认，避免影响其他测试
-    from by_framework.core.runtime.history import InMemoryHistoryStorage
+    from by_framework.core.runtime.history import InMemoryHistoryBackend
 
-    HistoryManager.set_default_storage(InMemoryHistoryStorage())
+    HistoryManager.set_default_backend(InMemoryHistoryBackend())

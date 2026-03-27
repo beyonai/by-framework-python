@@ -1,11 +1,13 @@
-from .base import BaseHistoryStorage
-from .manager import HistoryManager
-from .backends.in_memory import InMemoryHistoryStorage
-from .backends.postgres import PostgresHistoryStorage
+from .base import BaseHistoryBackend
+from .history_manager import HistoryManager
+from .backends.in_memory import InMemoryHistoryBackend
+from .backends.postgres import PostgresHistoryBackend
+from .backends.byclaw_history import ByClawHistoryBackend
 
 __all__ = [
-    "BaseHistoryStorage",
+    "BaseHistoryBackend",
     "HistoryManager",
-    "InMemoryHistoryStorage",
-    "PostgresHistoryStorage",
+    "InMemoryHistoryBackend",
+    "PostgresHistoryBackend",
+    "ByClawHistoryBackend",
 ]

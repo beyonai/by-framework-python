@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
 
-class BaseHistoryStorage(ABC):
+class BaseHistoryBackend(ABC):
     """历史记录存储后端抽象基类。
 
     所有历史消息存储后端必须实现此接口。
@@ -29,7 +29,6 @@ class BaseHistoryStorage(ABC):
         """
         pass
 
-    @abstractmethod
     async def save_message(
         self,
         session_id: str,
