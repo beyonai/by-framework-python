@@ -49,27 +49,27 @@ class ByClawHistoryBackend(BaseHistoryBackend):
                     )
                     return []
 
-                result_code = data.get("resultCode")
-                if result_code != "0":
+                result_code = data.get("code")
+                if result_code != 0:
                     logger.error(
-                        "ByClawHistoryBackend: Failed to get messages for session %s, resultCode: %s, message: %s",
+                        "ByClawHistoryBackend: Failed to get messages for session %s, code: %s, message: %s",
                         session_id,
                         result_code,
-                        data.get("resultMessage", "Unknown error"),
+                        data.get("msg", "Unknown error"),
                     )
                     return []
 
-                result_object = data.get("resultObject")
-                if not isinstance(result_object, list):
+                messages_data = data.get("data")
+                if not isinstance(messages_data, list):
                     logger.warning(
-                        "ByClawHistoryBackend: resultObject for session %s is not a list, got %s",
+                        "ByClawHistoryBackend: 'data' field for session %s is not a list, got %s",
                         session_id,
-                        type(result_object),
+                        type(messages_data),
                     )
                     return []
 
                 formatted_messages = []
-                for item in result_object:
+                for item in messages_data:
                     if not isinstance(item, dict):
                         continue
 
@@ -91,7 +91,7 @@ class ByClawHistoryBackend(BaseHistoryBackend):
                             "metadata": item.get("metadata"),
                         }
                     )
-                
+
                 # 返回的消息通常是按时间正序排列的，符合 SDK 要求
                 return formatted_messages
         except Exception as e:
