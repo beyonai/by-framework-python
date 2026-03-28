@@ -174,7 +174,7 @@ class AgentContext:
         )
 
     async def emit_chunk(
-        self, event: Union[StreamChunkEvent, str], event_type: Optional[str] = None
+        self, event: Union[StreamChunkEvent, str], event_type: Optional[str] = None, content_type: Optional[str] = None
     ) -> None:
         # 1. 收集内容
         content = ""
@@ -194,6 +194,7 @@ class AgentContext:
             self.current_agent_id,
             message_id=self.current_message_id,
             event_type=event_type,
+            content_type=content_type,
         )
 
         # 3. 检查是否是流结束标识，如果是则触发入库
@@ -218,7 +219,7 @@ class AgentContext:
         self._is_history_saved = True
 
     async def emit_state(
-        self, event: Union[StateChangeEvent, str], event_type: Optional[str] = None
+        self, event: Union[StateChangeEvent, str], event_type: Optional[str] = None, content_type: Optional[str] = None
     ) -> None:
         await self.emitter.emit_state(
             self.session_id,
@@ -227,10 +228,11 @@ class AgentContext:
             self.current_agent_id,
             message_id=self.current_message_id,
             event_type=event_type,
+            content_type=content_type,
         )
 
     async def emit_artifact(
-        self, event: Union[ArtifactEvent, str], event_type: Optional[str] = None
+        self, event: Union[ArtifactEvent, str], event_type: Optional[str] = None, content_type: Optional[str] = None
     ) -> None:
         await self.emitter.emit_artifact(
             self.session_id,
@@ -239,6 +241,7 @@ class AgentContext:
             self.current_agent_id,
             message_id=self.current_message_id,
             event_type=event_type,
+            content_type=content_type,
         )
 
     async def ask_user(self, event: Union[AskUserEvent, str]) -> dict:
