@@ -49,7 +49,29 @@ class TestParseControlCommand(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.reason, "user request")
 
     async def test_unsupported_command_raises_error(self):
-        """Test that non-CancelTaskCommand raises UnsupportedCommandError."""
+        """Test that an unregistered action_type raises UnsupportedCommandError."""
+        data = {
+            "action_type": "UNSUPPORTED_FAKE_COMMAND",
+            "header": {
+                "message_id": "msg-1",
+                "session_id": "sess-1",
+                "trace_id": "trace-1",
+                "target_agent_type": "test_agent",
+                "source_agent_id": "",
+                "parent_message_id": "",
+                "tenant_id": "",
+                "metadata": {},
+            },
+            "body": {},
+        }
+
+        with self.assertRaises(UnsupportedCommandError) as ctx:
+            await parse_control_command(data)
+
+        self.assertIn("UNSUPPORTED_FAKE_COMMAND", str(ctx.exception))
+
+    async def test_ask_agent_command_is_accepted(self):
+        """Test that AskAgentCommand is now accepted on the control stream."""
         data = {
             "action_type": "ASK_AGENT",
             "header": {
@@ -67,11 +89,9 @@ class TestParseControlCommand(unittest.IsolatedAsyncioTestCase):
             },
         }
 
-        with self.assertRaises(UnsupportedCommandError) as ctx:
-            await parse_control_command(data)
-
-        self.assertIn("AskAgentCommand", str(ctx.exception))
-        self.assertEqual(ctx.exception.command_type, "AskAgentCommand")
+        command = await parse_control_command(data)
+        self.assertEqual(command.header.message_id, "msg-1")
+        self.assertEqual(command.content, "Hello")
 
 
 class MockExecution:

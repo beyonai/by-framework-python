@@ -8,28 +8,36 @@ import asyncio
 
 from by_framework.common.exceptions import UnsupportedCommandError
 from by_framework.core.protocol.commands import (
+    AskAgentCommand,
     CancelTaskCommand,
+    ResumeCommand,
     command_from_dict,
 )
 
 
-async def parse_control_command(data_dict: dict) -> CancelTaskCommand:
+async def parse_control_command(data_dict: dict) -> CancelTaskCommand | AskAgentCommand | ResumeCommand:
     """
-    Parse and validate a control command.
+    Parse and validate a control or task command from the worker control stream.
 
     Args:
         data_dict: Parsed JSON data
 
     Returns:
-        CancelTaskCommand instance
+        CancelTaskCommand, AskAgentCommand, or ResumeCommand instance
 
     Raises:
-        UnsupportedCommandError: If command is not a CancelTaskCommand
+        UnsupportedCommandError: If command type is not supported on the control stream
     """
-    command = command_from_dict(data_dict)
-    if not isinstance(command, CancelTaskCommand):
-        raise UnsupportedCommandError(type(command).__name__)
-    return command
+    try:
+        command = command_from_dict(data_dict)
+    except ValueError as e:
+        raise UnsupportedCommandError(str(e)) from e
+    if isinstance(command, CancelTaskCommand):
+        return command
+    if isinstance(command, (AskAgentCommand, ResumeCommand)):
+        # AskAgentCommand/ResumeCommand on worker_ctrl_stream means direct routing
+        return command
+    raise UnsupportedCommandError(type(command).__name__)
 
 
 async def handle_cancel_task(

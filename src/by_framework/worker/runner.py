@@ -162,9 +162,15 @@ class WorkerRunner:
                 try:
                     data_dict = await parse_message_data(msg_data)
                     command = await parse_control_command(data_dict)
-                    await self._handle_control_message(
-                        current_stream_name, msg_id, command
-                    )
+                    if isinstance(command, CancelTaskCommand):
+                        await self._handle_control_message(
+                            current_stream_name, msg_id, command
+                        )
+                    else:
+                        # AskAgentCommand or ResumeCommand directly routed to this worker
+                        await self._process_message_from_dict(
+                            current_stream_name, msg_id, data_dict
+                        )
                 except Exception as e:
                     logger.error("Invalid control message %s: %s", msg_id, e)
                 finally:

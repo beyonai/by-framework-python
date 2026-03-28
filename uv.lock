@@ -103,6 +103,7 @@ source = { editable = "." }
 dependencies = [
     { name = "httpx" },
     { name = "redis" },
+    { name = "typing-extensions" },
 ]
 
 [package.optional-dependencies]
@@ -129,6 +130,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
     { name = "redis", specifier = ">=7.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3.0" },
+    { name = "typing-extensions", specifier = ">=4.0.0" },
 ]
 provides-extras = ["dev", "postgres"]
 

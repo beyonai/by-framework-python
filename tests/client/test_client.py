@@ -12,6 +12,33 @@ from by_framework.core.protocol.commands import (
 
 
 @pytest.mark.asyncio
+async def test_client_send_message_with_target_worker_id():
+    """Test that send_message routes to worker control stream when target_worker_id is provided."""
+    mock_redis = AsyncMock()
+    mock_registry = AsyncMock()
+
+    client = GatewayClient(redis_client=mock_redis, registry=mock_registry)
+    await client.send_message(
+        target_agent_type="langgraph_agent",
+        session_id="s1",
+        content="hello",
+        target_worker_id="worker-42",
+    )
+
+    # Should NOT call registry.get_target_worker
+    mock_registry.get_target_worker.assert_not_called()
+
+    # Should route to worker-specific stream
+    args, _ = mock_redis.xadd.call_args
+    assert args[0].endswith("ctrl:worker:worker-42")
+
+    data = json.loads(args[1]["data"])
+    command = command_from_dict(data)
+    assert isinstance(command, AskAgentCommand)
+    assert command.header.target_agent_type == "langgraph_agent"
+
+
+@pytest.mark.asyncio
 async def test_client_send_message_with_metadata():
     """Test that ByaiGatewayClient.send_message correctly passes metadata to the command."""
     mock_redis = AsyncMock()

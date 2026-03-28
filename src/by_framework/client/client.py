@@ -161,10 +161,16 @@ class GatewayClient(Generic[T]):
         trace_id: Optional[str] = None,
         payload: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        target_worker_id: Optional[str] = None,
     ) -> SendMessageResponse:
         """
         Send a message to the gateway.
-        Message content and params may be processed by registered interceptors.
+
+        Routing logic:
+        - If target_worker_id is provided, the message is sent directly to that
+          worker's control stream (bypassing capability-based routing).
+        - Otherwise, the message is sent to the capability-based control stream
+          and routed to any available worker that declares the target_agent_type.
         """
         # 1. Prepare parameters for interceptors
         params = {
@@ -182,20 +188,22 @@ class GatewayClient(Generic[T]):
         for interceptor in self.interceptors:
             params = interceptor.before_send(params)
 
-        # 3. Core sending logic using processed parameters
-        if self.registry is None:
+        # 3. Resolve worker_id (skip registry lookup if targeting a specific worker)
+        if target_worker_id:
+            worker_id = target_worker_id
+        elif self.registry is None:
             raise WorkerRegistryNotSetError("send messages")
-
-        worker_id = await self.registry.get_target_worker(params["target_agent_type"])
-        if not worker_id:
-            return SendMessageResponse(
-                success=False,
-                status=ExecutionStatus.FAILED,
-                message_id="",
-                trace_id="",
-                target_worker_id="",
-                timestamp=int(time.time() * 1000),
-            )
+        else:
+            worker_id = await self.registry.get_target_worker(params["target_agent_type"])
+            if not worker_id:
+                return SendMessageResponse(
+                    success=False,
+                    status=ExecutionStatus.FAILED,
+                    message_id="",
+                    trace_id="",
+                    target_worker_id="",
+                    timestamp=int(time.time() * 1000),
+                )
 
         if not message_id:
             message_id = f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}"
@@ -233,7 +241,11 @@ class GatewayClient(Generic[T]):
                 },
             )
 
-        stream_name = RedisKeys.ctrl_stream(params["target_agent_type"])
+        # 4. Route to the appropriate stream
+        if target_worker_id:
+            stream_name = RedisKeys.worker_ctrl_stream(worker_id)
+        else:
+            stream_name = RedisKeys.ctrl_stream(params["target_agent_type"])
         await self.redis.xadd(stream_name, command.to_redis_payload())
 
         return SendMessageResponse(
