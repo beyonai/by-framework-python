@@ -123,7 +123,7 @@ class GatewayDataEmitter:
             data=_build_sse_layout(
                 content=event.content,
                 role=event.role,
-                content_type=SseMessageType.text.value,
+                content_type=content_type or SseMessageType.text.value,
                 source_agent_id=source_agent_id,
                 function_call=event.function_call,
                 tool_calls=event.tool_calls,
