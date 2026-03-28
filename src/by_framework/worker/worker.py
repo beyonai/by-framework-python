@@ -18,6 +18,7 @@ from by_framework.common.constants import (
     MESSAGE_ID_PREFIX,
     TASK_GROUP_FIELD_COMPLETED,
     TASK_GROUP_FIELD_TOTAL,
+    TASK_GROUP_TTL_SECONDS,
     RedisKeys,
 )
 from by_framework.common.logger import logger
@@ -296,8 +297,25 @@ class GatewayWorker(ABC):
                 # Check for scatter-gather join
                 if header.task_group_id:
                     group_key = RedisKeys.task_group(header.task_group_id)
+                    results_key = RedisKeys.task_group_results(header.task_group_id)
                     total_str = await self.redis.hget(group_key, TASK_GROUP_FIELD_TOTAL)
                     if total_str is not None:
+                        # Store result in Redis Hash for distributed access
+                        if isinstance(command, ResumeCommand):
+                            result_data = {
+                                "status": command.status,
+                                "reply_data": command.reply_data,
+                                "content": command.content,
+                            }
+                            await self.redis.hset(
+                                results_key,
+                                header.message_id,
+                                json.dumps(result_data),
+                            )
+                            await self.redis.expire(
+                                results_key, TASK_GROUP_TTL_SECONDS
+                            )
+
                         completed = await self.redis.hincrby(
                             group_key, TASK_GROUP_FIELD_COMPLETED, 1
                         )

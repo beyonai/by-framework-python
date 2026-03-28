@@ -30,6 +30,11 @@ class RedisKeys:
         """任务组的进度追踪 Hash Key。"""
         return f"byai_gateway:task_group:{group_id}"
 
+    @staticmethod
+    def task_group_results(group_id: str) -> str:
+        """任务组的所有子任务结果 Hash Key。"""
+        return f"byai_gateway:task_group:{group_id}:results"
+
     # --- 注册中心 (Registry) ---
     # 活跃 Worker 的有序集合 (按心跳时间戳排序)
     ACTIVE_WORKERS = "byai_gateway:registry:active_workers"

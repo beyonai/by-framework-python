@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import uuid
 import warnings
 from typing_extensions import deprecated
@@ -381,3 +382,65 @@ class AgentContext:
             "task_group_id": task_group_id,
             "dispatched_tasks": dispatched,
         }
+
+    async def collect_group_results(
+        self,
+        task_group_id: str,
+        timeout: float = 30.0,
+    ) -> list[dict[str, Any]]:
+        """
+        收集任务组所有子任务的结果。
+
+        当最后一个子任务完成后调用，返回所有子任务的结果列表。
+        如果在超时时间内没有收集到所有结果，返回已收集到的结果。
+
+        Args:
+            task_group_id: dispatch_group 返回的 task_group_id
+            timeout: 等待所有结果的最大超时时间（秒）
+
+        Returns:
+            包含所有子任务结果的列表，每个元素包含:
+            {
+                "message_id": str,
+                "status": str,
+                "reply_data": Any,
+                "content": Optional[str]
+            }
+        """
+        if not task_group_id:
+            return []
+
+        results_key = RedisKeys.task_group_results(task_group_id)
+        group_key = RedisKeys.task_group(task_group_id)
+
+        total_str = await self.redis.hget(group_key, TASK_GROUP_FIELD_TOTAL)
+        if total_str is None:
+            # No group found, try to get whatever results exist
+            total = float("inf")
+        else:
+            total = int(total_str)
+
+        start_time = asyncio.get_running_loop().time()
+        results: list[dict[str, Any]] = []
+
+        while len(results) < total:
+            elapsed = asyncio.get_running_loop().time() - start_time
+            if elapsed >= timeout:
+                break
+
+            raw_results = await self.redis.hgetall(results_key)
+            if raw_results:
+                results = [
+                    {
+                        "message_id": msg_id,
+                        **json.loads(data),
+                    }
+                    for msg_id, data in raw_results.items()
+                ]
+                if len(results) >= total:
+                    break
+
+            # Wait a bit before polling again
+            await asyncio.sleep(0.1)
+
+        return results
