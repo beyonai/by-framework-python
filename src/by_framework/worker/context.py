@@ -262,7 +262,7 @@ class AgentContext:
     async def call_agent(
         self,
         target_agent_type: str,
-        content: str,
+        content: Union[str, List[Dict[str, Any]]],
         payload: Optional[Dict[str, Any]] = None,
         wait_for_reply: bool = True,
         metadata: Optional[Dict[str, Any]] = None,
