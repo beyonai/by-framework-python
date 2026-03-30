@@ -6,7 +6,7 @@ Contains RunningExecution dataclass and execution state management.
 
 import asyncio
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Any
 
 if TYPE_CHECKING:
     from by_framework.worker.context import AgentContext
@@ -24,6 +24,8 @@ class RunningExecution:
     cancel_event: asyncio.Event
     context: Optional["AgentContext"] = None
     cancel_reason: str = ""
+    is_resumed: bool = False
+    existing_data: Optional[dict[str, Any]] = None
 
 
 class ExecutionTracker:

@@ -11,7 +11,10 @@ import traceback
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
+
+if TYPE_CHECKING:
+    from by_framework.worker._execution_tracking import RunningExecution
 
 from by_framework.common.config import WorkerConfig
 from by_framework.common.constants import (
@@ -32,6 +35,7 @@ from by_framework.core.protocol.commands import (
     ResumeCommand,
 )
 from by_framework.core.protocol.events import StateChangeEvent
+from by_framework.core.protocol.event_type import EventType
 from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.core.runtime.filestore.base import FileStorage
 from by_framework.worker.context import AgentContext
@@ -137,14 +141,14 @@ class GatewayWorker(ABC):
 
         callback_command = ResumeCommand(
             header=MessageHeader(
-                message_id=f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}",
+                message_id=header.parent_message_id or f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}",
                 session_id=header.session_id,
                 trace_id=trace_id if trace_id else uuid.uuid4().hex,
                 source_agent_id=target_agent_type
                 if target_agent_type
                 else self.worker_id,
                 target_agent_type=source_agent_id,
-                parent_message_id=message_id if message_id else "",
+                parent_message_id=header.message_id,
                 task_group_id=header.task_group_id or "",
                 tenant_id=tenant_id if tenant_id else "",
             ),
@@ -207,7 +211,7 @@ class GatewayWorker(ABC):
         command: GatewayCommand,
         cancel_event: Optional[asyncio.Event] = None,
         cancel_reason: str = "",
-        execution: Optional[Any] = None,
+        execution: Optional["RunningExecution"] = None,
     ) -> str:
         trace_id = uuid.uuid4().hex
         header = command.header
@@ -223,6 +227,11 @@ class GatewayWorker(ABC):
         # Note: We don't use hasattr check because it doesn't work well with mocks
         workspace_dir = None
 
+        # Determine context parent message id
+        context_parent_id = header.message_id
+        if execution and execution.is_resumed and execution.existing_data:
+            context_parent_id = execution.message_id or header.message_id
+
         context = AgentContext(
             session_id=header.session_id,
             trace_id=header.trace_id if header.trace_id else trace_id,
@@ -230,7 +239,7 @@ class GatewayWorker(ABC):
             current_agent_id=header.target_agent_type
             if header.target_agent_type
             else "",
-            current_message_id=header.message_id,
+            parent_message_id=context_parent_id,
             current_command=command,
             cancel_event=cancel_event,
             cancel_reason=cancel_reason,
@@ -339,6 +348,17 @@ class GatewayWorker(ABC):
                     StateChangeEvent(state=AgentState.RESUMED.value)
                 )
             process_result = await self.process_command(command, context)
+
+            # Determine the execution status to return
+            # 优先从业务返回结果中提取状态（例如 QUEUED, WAITING_USER 等）
+            from by_framework.core.protocol.agent_state import AgentStateLiteral
+            
+            final_status = AgentState.COMPLETED.value
+            if isinstance(process_result, dict) and "status" in process_result:
+                final_status = process_result["status"]
+            elif isinstance(process_result, str) and process_result in AgentStateLiteral.__args__:
+                final_status = process_result
+
             if has_source_agent:
                 await self._enqueue_agent_return(
                     command,
@@ -354,14 +374,20 @@ class GatewayWorker(ABC):
                 await context.emit_state(
                     StateChangeEvent(state=AgentState.COMPLETED.value)
                 )
-            logger.info("[%s] Task completed successfully", self.worker_id)
+            logger.info("[%s] Task completed successfully with status: %s", self.worker_id, final_status)
             # 任务完成时调用插件钩子
             await self.plugin_registry.on_task_complete(context, process_result)
 
-            # 兜底：如果业务没发 appStreamResponse，在这里强制刷入历史
-            await context.flush_to_history()
+            # 在框架层面应用 APP_STREAM_RESPONSE 发送逻辑
+            if not has_source_agent:
+                # 若拥有权限且业务未自行闭合流，则在这里自动发送流结束事件
+                if not getattr(context, "_is_stream_finished", False):
+                    await context.emit_chunk("", event_type=EventType.APP_STREAM_RESPONSE.value)
+            else:
+                # 兜底：如果没权限发流结束，在完成时强制刷入历史
+                await context.flush_to_history()
 
-            return AgentState.COMPLETED.value
+            return final_status
 
         except asyncio.CancelledError as e:
             logger.info("[%s] Task cancellation requested: %s", self.worker_id, str(e))
@@ -375,6 +401,12 @@ class GatewayWorker(ABC):
                     reply_data={"reason": str(e)},
                 )
             await context.emit_state(StateChangeEvent(state=AgentState.CANCELLED.value))
+            
+            if not has_source_agent and not getattr(context, "_is_stream_finished", False):
+                await context.emit_chunk("", event_type=EventType.APP_STREAM_RESPONSE.value)
+            else:
+                await context.flush_to_history()
+                
             return AgentState.CANCELLED.value
 
         except Exception as e:
@@ -389,10 +421,15 @@ class GatewayWorker(ABC):
             await context.emit_state(
                 StateChangeEvent(state=f"{AgentState.FAILED.value}: {str(e)}")
             )
-            logger.error("[%s] Stack trace:", self.worker_id)
             logger.error(traceback.format_exc())
             # 任务出错时调用插件钩子
             await self.plugin_registry.on_task_error(context, e)
+            
+            if not has_source_agent and not getattr(context, "_is_stream_finished", False):
+                await context.emit_chunk("", event_type=EventType.APP_STREAM_RESPONSE.value)
+            else:
+                await context.flush_to_history()
+                
             return AgentState.FAILED.value
         finally:
             # 4. Cleanup

@@ -38,8 +38,10 @@ from by_framework.core.protocol.events import (
     StateChangeEvent,
     StreamChunkEvent,
 )
+from by_framework.core.protocol.commands import ResumeCommand
 from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.core.runtime.filestore.base import FileStorage
+from by_framework.common.logger import logger
 
 if TYPE_CHECKING:
     from by_framework.core.extensions import PluginRegistry
@@ -72,7 +74,7 @@ class AgentContext:
         redis_client: Optional[Redis] = None,
         data_stream_name: Optional[str] = None,
         current_agent_id: str = "",
-        current_message_id: str = "",
+        parent_message_id: str = "",
         current_command: Optional[Any] = None,
         cancel_event: Optional[asyncio.Event] = None,
         cancel_reason: str = "",
@@ -87,13 +89,14 @@ class AgentContext:
         self.trace_id = trace_id
         self.data_stream_name = data_stream_name
         self.current_agent_id = current_agent_id
-        self.current_message_id = current_message_id
+        self.parent_message_id = parent_message_id
         self.current_command = current_command
         self.cancel_event = cancel_event
         self.cancel_reason = cancel_reason
         self.emitter = GatewayDataEmitter(self.redis, data_stream_name)
         self._response_buffer = []  # 用于收集流式回复内容
         self._is_history_saved = False  # 防止重复保存
+        self._is_stream_finished = False  # 标记是否已经发送过 APP_STREAM_RESPONSE
         self.plugin_registry = plugin_registry
 
         # New: AgentRuntimeState for unified state management
@@ -154,28 +157,8 @@ class AgentContext:
         registry = WorkerRegistry(self.redis)
         return await registry.get_all_workers()
 
-    async def _emit_event(
-        self,
-        event_type: str,
-        data: Optional[Dict[str, Any]] = None,
-        state_msg: str = "",
-        artifact_url: str = "",
-        metadata: Optional[Dict[str, Any]] = None,
-    ):
-        await self.emitter.emit_event(
-            session_id=self.session_id,
-            trace_id=self.trace_id,
-            event_type=event_type,
-            source_agent_id=self.current_agent_id,
-            message_id=self.current_message_id,
-            data=data,
-            state_msg=state_msg,
-            artifact_url=artifact_url,
-            metadata=metadata,
-        )
-
     async def emit_chunk(
-        self, event: Union[StreamChunkEvent, str], event_type: Optional[str] = None, content_type: Optional[str] = None
+        self, event: Union[StreamChunkEvent, str], event_type: Optional[str] = None, content_type: Optional[str] = None, message_id: Optional[str] = None, parent_message_id: Optional[str] = None
     ) -> None:
         # 1. 收集内容
         content = ""
@@ -187,18 +170,36 @@ class AgentContext:
         if content:
             self._response_buffer.append(content)
 
+        # 检查是否是流结束标识
+        if event_type == EventType.APP_STREAM_RESPONSE.value:
+            # 权限检查：如果当前任务是由其他 Agent 调用的（即有 source_agent_id），
+            # 且不是恢复命令（ResumeCommand），则说明当前 Agent 需要将结果返回给上一级，
+            # 没有独立结束流的权限。
+            is_agent_return = isinstance(self.current_command, ResumeCommand)
+            has_source_agent = (self.current_command and bool(self.current_command.header.source_agent_id) and not is_agent_return)
+            if has_source_agent:
+                logger.warning(
+                    "[%s] Agent %s attempted to emit APP_STREAM_RESPONSE, but permission is held by its caller. Event dropped.",
+                    self.trace_id, self.current_agent_id
+                )
+                await self.flush_to_history()
+                return
+
+            self._is_stream_finished = True
+
         # 2. 发送原始分片
         await self.emitter.emit_chunk(
             self.session_id,
             self.trace_id,
             event,
             self.current_agent_id,
-            message_id=self.current_message_id,
+            message_id=message_id,
+            parent_message_id=parent_message_id if parent_message_id else self.parent_message_id,
             event_type=event_type,
             content_type=content_type,
         )
 
-        # 3. 检查是否是流结束标识，如果是则触发入库
+        # 3. 如果是流结束标识则触发入库
         if event_type == EventType.APP_STREAM_RESPONSE.value:
             await self.flush_to_history()
 
@@ -214,38 +215,45 @@ class AgentContext:
             metadata={
                 "trace_id": self.trace_id,
                 "agent_id": self.current_agent_id,
-                "message_id": self.current_message_id,
+                "parent_message_id": self.parent_message_id,
             },
         )
         self._is_history_saved = True
 
     async def emit_state(
-        self, event: Union[StateChangeEvent, str], event_type: Optional[str] = None, content_type: Optional[str] = None
+        self, event: Union[StateChangeEvent, str], event_type: Optional[str] = None, content_type: Optional[str] = None, message_id: Optional[str] = None, parent_message_id: Optional[str] = None
     ) -> None:
         await self.emitter.emit_state(
             self.session_id,
             self.trace_id,
             event,
             self.current_agent_id,
-            message_id=self.current_message_id,
+            message_id=message_id,
+            parent_message_id=parent_message_id if parent_message_id else self.parent_message_id,
             event_type=event_type,
             content_type=content_type,
         )
 
     async def emit_artifact(
-        self, event: Union[ArtifactEvent, str], event_type: Optional[str] = None, content_type: Optional[str] = None
+        self,
+        event: Union[ArtifactEvent, str],
+        event_type: Optional[str] = None,
+        content_type: Optional[str] = None,
+        message_id: Optional[str] = None,
+        parent_message_id: Optional[str] = None,
     ) -> None:
         await self.emitter.emit_artifact(
             self.session_id,
             self.trace_id,
             event,
             self.current_agent_id,
-            message_id=self.current_message_id,
+            message_id=message_id,
+            parent_message_id=parent_message_id if parent_message_id else self.parent_message_id,
             event_type=event_type,
             content_type=content_type,
         )
 
-    async def ask_user(self, event: Union[AskUserEvent, str]) -> dict:
+    async def ask_user(self, event: Union[AskUserEvent, str], message_id: Optional[str] = None, parent_message_id: Optional[str] = None) -> dict:
         """
         Suspend execution and ask the user for a prompt.
         Accepts an AskUserEvent or a raw string prompt.
@@ -255,7 +263,8 @@ class AgentContext:
             self.trace_id,
             event,
             self.current_agent_id,
-            message_id=self.current_message_id,
+            message_id=message_id,
+            parent_message_id=parent_message_id if parent_message_id else self.parent_message_id,
         )
         return {"status": AgentState.WAITING_USER.value}
 
@@ -266,12 +275,15 @@ class AgentContext:
         payload: Optional[Dict[str, Any]] = None,
         wait_for_reply: bool = True,
         metadata: Optional[Dict[str, Any]] = None,
+        message_id: Optional[str] = None,
+        parent_message_id: Optional[str] = None,
     ) -> dict:
         """
         Push a control-flow message to another agent.
         If wait_for_reply is True, source_agent_id will be injected for callback routing.
         """
-        message_id = f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+        message_id = message_id or f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+        parent_message_id = parent_message_id if parent_message_id else self.parent_message_id
         merged_payload = dict(payload or {})
         if wait_for_reply:
             merged_payload["wait_for_reply"] = True
@@ -283,7 +295,7 @@ class AgentContext:
                 trace_id=self.trace_id,
                 source_agent_id=self.current_agent_id if wait_for_reply else "",
                 target_agent_type=target_agent_type,
-                parent_message_id=self.current_message_id,
+                parent_message_id=parent_message_id,
                 metadata=metadata or {},
             ),
             content=content,
@@ -299,6 +311,7 @@ class AgentContext:
         return {
             "status": AgentState.QUEUED.value,
             "message_id": message_id,
+            "parent_message_id": parent_message_id,
             "target_agent_type": target_agent_type,
         }
 
@@ -306,6 +319,8 @@ class AgentContext:
         self,
         tasks: list[dict[str, Any]],
         wait_for_reply: bool = True,
+        message_id: Optional[str] = None,
+        parent_message_id: Optional[str] = None,
     ) -> dict:
         """
         Dispatch multiple tasks concurrently as a group.
@@ -347,7 +362,8 @@ class AgentContext:
             payload = task.get("payload", {})
             metadata = task.get("metadata", {})
 
-            message_id = f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+            message_id = message_id or f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+            parent_message_id = parent_message_id if parent_message_id else self.parent_message_id
             merged_payload = dict(payload)
             if wait_for_reply:
                 merged_payload["wait_for_reply"] = True
@@ -359,7 +375,7 @@ class AgentContext:
                     trace_id=self.trace_id,
                     source_agent_id=self.current_agent_id if wait_for_reply else "",
                     target_agent_type=target_agent_type,
-                    parent_message_id=self.current_message_id,
+                    parent_message_id=parent_message_id,
                     task_group_id=task_group_id,
                     metadata=metadata,
                 ),

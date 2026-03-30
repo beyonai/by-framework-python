@@ -72,6 +72,7 @@ class GatewayDataEmitter:
         event_type: str,
         source_agent_id: str = "",
         message_id: str = "",
+        parent_message_id: str = "",
         data: Optional[Dict[str, Any]] = None,
         state_msg: str = "",
         artifact_url: str = "",
@@ -83,6 +84,7 @@ class GatewayDataEmitter:
             event_type=event_type,
             source_agent_id=source_agent_id,
             message_id=message_id,
+            parent_message_id=parent_message_id,
             data=data or {},
             state_msg=state_msg,
             artifact_url=artifact_url,
@@ -109,6 +111,7 @@ class GatewayDataEmitter:
         event: Union[StreamChunkEvent, str],
         source_agent_id: str = "",
         message_id: str = "",
+        parent_message_id: str = "",
         event_type: Optional[str] = None,
         content_type: Optional[str] = None,
     ) -> None:
@@ -120,6 +123,7 @@ class GatewayDataEmitter:
             event_type=event_type or EventType.ANSWER_DELTA.value,
             source_agent_id=source_agent_id,
             message_id=message_id,
+            parent_message_id=parent_message_id,
             data=_build_sse_layout(
                 content=event.content,
                 role=event.role,
@@ -138,6 +142,7 @@ class GatewayDataEmitter:
         event: Union[StateChangeEvent, str],
         source_agent_id: str = "",
         message_id: str = "",
+        parent_message_id: str = "",
         event_type: Optional[str] = None,
         content_type: Optional[str] = None,
     ) -> None:
@@ -149,6 +154,7 @@ class GatewayDataEmitter:
             event_type=event_type or EventType.REASONING_LOG_DELTA.value,
             source_agent_id=source_agent_id,
             message_id=message_id,
+            parent_message_id=parent_message_id,
             data=_build_sse_layout(
                 content=event.state,
                 role=None,
@@ -165,6 +171,7 @@ class GatewayDataEmitter:
         event: Union[ArtifactEvent, str],
         source_agent_id: str = "",
         message_id: str = "",
+        parent_message_id: str = "",
         event_type: Optional[str] = None,
         content_type: Optional[str] = None,
     ) -> None:
@@ -177,6 +184,7 @@ class GatewayDataEmitter:
             event_type=event_type or EventType.REASONING_LOG_DELTA.value,
             source_agent_id=source_agent_id,
             message_id=message_id,
+            parent_message_id=parent_message_id,
             data=_build_sse_layout(
                 content=json.dumps(files_payload, ensure_ascii=False),
                 role=None,
@@ -193,6 +201,7 @@ class GatewayDataEmitter:
         event: Union[AskUserEvent, str],
         source_agent_id: str = "",
         message_id: str = "",
+        parent_message_id: str = "",
     ) -> None:
         if isinstance(event, str):
             event = AskUserEvent(prompt=event)
@@ -214,6 +223,7 @@ class GatewayDataEmitter:
             event_type=EventType.REASONING_LOG_DELTA.value,
             source_agent_id=source_agent_id,
             message_id=message_id,
+            parent_message_id=parent_message_id,
             data=_build_sse_layout(
                 content=json.dumps(input_form, ensure_ascii=False),
                 role="assistant",

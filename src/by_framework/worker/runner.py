@@ -280,6 +280,7 @@ class WorkerRunner:
             if (
                 existing_execution
                 and existing_execution.get("status") in self._terminal_execution_states
+                and not isinstance(command, ResumeCommand)
             ):
                 await self.redis.xack(stream_name, self.group_name, msg_id)
                 logger.info(
@@ -312,6 +313,8 @@ class WorkerRunner:
                     task=current_task,
                     cancel_event=cancel_event,
                     cancel_reason=cancel_reason,
+                    is_resumed=existing_execution is not None,
+                    existing_data=existing_execution,
                 )
                 self._tracker.add_execution(execution)
 
@@ -326,6 +329,7 @@ class WorkerRunner:
                         "execution_id": execution_id,
                         "message_id": header.message_id,
                         "session_id": header.session_id,
+                        "parent_message_id": header.parent_message_id or "",
                         "worker_id": self.worker.worker_id,
                         "target_agent_type": header.target_agent_type,
                         "stream_name": stream_name,

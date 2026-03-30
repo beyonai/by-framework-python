@@ -54,7 +54,7 @@ class GatewayProcessor:
             trace_id=header.trace_id if header.trace_id else trace_id,
             redis_client=self.redis,
             current_agent_id=header.target_agent_type or "",
-            current_message_id=header.message_id,
+            parent_message_id=header.message_id,
             current_command=command,
         )
 

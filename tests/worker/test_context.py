@@ -50,7 +50,7 @@ async def test_context_call_agent_emits_message_decodable_as_command():
         trace_id="t1",
         redis_client=mock_redis,
         current_agent_id="agent-a",
-        current_message_id="msg-parent",
+        parent_message_id="msg-parent",
     )
 
     await ctx.call_agent(

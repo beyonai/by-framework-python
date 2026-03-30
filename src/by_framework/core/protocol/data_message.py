@@ -33,6 +33,7 @@ class DataMessage:
     event_type: str
     source_agent_id: str = ""
     message_id: str = ""
+    parent_message_id: str = ""
     timestamp: int = field(default_factory=lambda: int(time.time() * 1000))
     data: Dict[str, Any] = field(default_factory=dict)
     state_msg: str = ""

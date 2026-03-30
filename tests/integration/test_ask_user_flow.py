@@ -59,7 +59,7 @@ async def test_ask_user_flow(mock_redis):
 
     # Process the message
     result = await worker._handle_message(request_msg)
-    assert result == "COMPLETED"
+    assert result == "WAITING_USER"
 
     # Verify that an ASK_USER event was emitted
     pipe = mock_redis.pipeline.return_value
@@ -97,4 +97,4 @@ async def test_ask_user_return_flow(mock_redis):
     )
 
     result = await worker._handle_message(reply_msg)
-    assert result == "COMPLETED"
+    assert result == "resumed_from_user"
