@@ -13,10 +13,6 @@ except ImportError:
     HAS_ADK = False
 
 
-class DummyWorker:
-    """Fallback class if google-adk is not installed."""
-
-
 @pytest.mark.skipif(not HAS_ADK, reason="google-adk is not installed")
 def test_adk_worker_initialization():
     """Test that AdkWorker can be initialized."""

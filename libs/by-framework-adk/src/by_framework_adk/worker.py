@@ -82,16 +82,12 @@ class AdkWorker(ByaiWorker):
             else "default_user"
         )
 
-        session = None
-        try:
-            # Ensure session exists
-            session = await self._session_service.get_session(
-                app_name=self.app_name,
-                user_id=user_id,
-                session_id=context.session_id,
-            )
-        except Exception:
-            pass
+        # Ensure session exists
+        session = await self._session_service.get_session(
+            app_name=self.app_name,
+            user_id=user_id,
+            session_id=context.session_id,
+        )
 
         if not session:
             # Session doesn't exist, create it
