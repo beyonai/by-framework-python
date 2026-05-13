@@ -100,10 +100,12 @@ class AdkAdapter:
                             # Tool call
                             func_call = part.function_call
                             args = dict(func_call.args) if func_call.args else {}
+                            
+                            call_id = getattr(func_call, "id", None) or func_call.name
                             chunk_event = StreamChunkEvent(
                                 tool_calls=[
                                     {
-                                        "id": event.id or "tool_call",
+                                        "id": call_id,
                                         "type": "function",
                                         "function": {
                                             "name": func_call.name,
@@ -119,11 +121,12 @@ class AdkAdapter:
                         elif getattr(part, "function_response", None):
                             # Tool response
                             func_resp = part.function_response
+                            resp_id = getattr(func_resp, "id", None) or func_resp.name
                             chunk_event = StreamChunkEvent(
                                 role="tool",
                                 tool_responses=[
                                     {
-                                        "tool_call_id": event.id or "tool_call",
+                                        "tool_call_id": resp_id,
                                         "content": str(func_resp.response),
                                     }
                                 ],
