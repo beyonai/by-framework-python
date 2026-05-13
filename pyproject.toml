@@ -36,6 +36,7 @@ members = [
     "libs/by-framework-langgraph",
     "libs/by-framework-trace-langfuse",
     "libs/by-framework-trace-phoenix",
+    "libs/by-framework-adk",
 ]
 
 [tool.uv.sources]
@@ -50,6 +51,7 @@ pythonpath = [
     "libs/by-framework-langgraph/src",
     "libs/by-framework-trace-langfuse/src",
     "libs/by-framework-trace-phoenix/src",
+    "libs/by-framework-adk/src",
 ]
 testpaths = ["tests"]
 

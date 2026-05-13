@@ -1,0 +1,36 @@
+[project]
+name = "by-framework-adk"
+version = "0.0.1"
+description = "ADK integration for by-framework"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "by-framework>=0.2.0",
+    "google-adk",
+    "google-genai",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "isort>=5.13.0",
+    "pyink>=24.0.0",
+    "pylint>=3.0.0",
+    "ruff>=0.3.0",
+]
+
+[tool.uv.sources]
+by-framework = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/by_framework_adk"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "../../src"]
+testpaths = ["tests"]
+asyncio_mode = "auto"
