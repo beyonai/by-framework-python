@@ -1,0 +1,59 @@
+[project]
+name = "by-framework"
+version = "0.2.0"
+description = "分布式 Agent 调度框架"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "redis>=7.0.0",
+    "httpx>=0.28.1",
+    "typing-extensions>=4.0.0",
+    "dill>=0.4.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.21.0",
+    "isort>=5.13.0",
+    "pre-commit>=4.0.0",
+    "pyink>=24.0.0",
+    "pylint>=3.0.0",
+    "ruff>=0.3.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/by_framework"]
+
+[tool.uv.workspace]
+members = [
+    "libs/by-framework-history-postgres",
+    "libs/by-framework-history-byclaw",
+    "libs/by-framework-langgraph",
+    "libs/by-framework-trace-langfuse",
+    "libs/by-framework-trace-phoenix",
+]
+
+[tool.uv.sources]
+by-framework-trace-langfuse = { workspace = true }
+by-framework-trace-phoenix = { workspace = true }
+
+[tool.pytest.ini_options]
+pythonpath = [
+    "src",
+    "libs/by-framework-history-postgres/src",
+    "libs/by-framework-history-byclaw/src",
+    "libs/by-framework-langgraph/src",
+    "libs/by-framework-trace-langfuse/src",
+    "libs/by-framework-trace-phoenix/src",
+]
+testpaths = ["tests"]
+
+# Suppress deprecation warnings
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

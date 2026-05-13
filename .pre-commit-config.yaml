@@ -1,0 +1,34 @@
+repos:
+  # Python formatting and linting via the shared workspace script
+  - repo: local
+    hooks:
+      - id: workspace-format
+        name: workspace format
+        entry: ./scripts/python_quality.sh format
+        language: system
+        types: [python]
+      - id: workspace-lint
+        name: workspace lint
+        entry: ./scripts/python_quality.sh lint
+        language: system
+        types: [python]
+
+  # General
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: "v5.0.0"
+    hooks:
+      - id: trailing-whitespace
+        name: trailing whitespace
+      - id: end-of-file-fixer
+        name: end of file fixer
+      - id: check-yaml
+        name: check yaml
+      - id: check-toml
+        name: check toml
+      - id: check-added-large-files
+        name: check for added large files
+        args: [--maxkb=500]
+        stages: [manual]
+      - id: mixed-line-ending
+        name: mixed line ending
+        args: [--fix=no]

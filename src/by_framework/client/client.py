@@ -1,0 +1,494 @@
+"""
+Gateway client module.
+
+Provides the GatewayClient class for sending messages and cancel requests
+to Gateway workers via Redis streams.
+"""
+
+import json
+import time
+import uuid
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
+
+from by_framework.common.constants import (
+    CANCEL_MESSAGE_ID_PREFIX,
+    EXECUTION_ID_PREFIX,
+    MESSAGE_ID_PREFIX,
+    RedisKeys,
+)
+from by_framework.common.redis_client import Redis, get_redis
+from by_framework.core.protocol.action_type import ActionType
+from by_framework.core.protocol.commands import (
+    AskAgentCommand,
+    CancelMode,
+    CancelTaskCommand,
+    ReloadPluginsCommand,
+    ResumeCommand,
+)
+from by_framework.core.protocol.message_header import MessageHeader
+from by_framework.core.protocol.responses import (
+    CancelTaskResponse,
+    ExecutionStatus,
+    SendMessageResponse,
+)
+from by_framework.core.registry import WorkerRegistry
+from by_framework.errors import WorkerRegistryNotSetError
+
+if TYPE_CHECKING:
+    pass
+
+
+class GatewayInterceptor(Protocol):
+    """Protocol for client-side request interceptors."""
+
+    def before_send(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Executed before the command is built and routed."""
+        ...  # pylint: disable=unnecessary-ellipsis
+
+
+@dataclass(frozen=True)
+class RouteResolution:
+    stream_name: str
+    target_worker_id: str = ""
+
+
+class GatewayClient:
+    """Gateway client for sending messages and cancel requests to Gateway workers.
+
+    Communicates with workers via Redis streams, supporting interceptor pattern
+    for message content processing.
+
+    Args:
+        registry: WorkerRegistry instance for worker discovery
+        redis_client: Redis client instance
+        interceptors: Message interceptor list
+    """
+
+    def __init__(
+        self,
+        registry: Optional[WorkerRegistry] = None,
+        redis_client: Optional[Redis] = None,
+        interceptors: Optional[List[GatewayInterceptor]] = None,
+    ):
+        self.registry = registry
+        self.redis = (
+            redis_client or (registry.redis if registry else None) or get_redis()
+        )
+        self.interceptors = interceptors or []
+
+    def add_interceptor(self, interceptor: GatewayInterceptor):
+        self.interceptors.append(interceptor)
+
+    async def reload_plugins_for_agent_type(
+        self,
+        agent_type: str,
+        reason: str = "",
+        reload_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Fan out a reload command to all online workers of an agent type."""
+        if self.registry is None:
+            raise WorkerRegistryNotSetError("reload plugins for agent type")
+
+        has_online_agent_type, worker_ids = await self.registry.has_online_agent_type(
+            agent_type
+        )
+        if not reload_id:
+            reload_id = f"reload-{uuid.uuid4().hex[:8]}"
+
+        if not has_online_agent_type or not worker_ids:
+            return {
+                "reload_id": reload_id,
+                "agent_type": agent_type,
+                "worker_ids": [],
+                "dispatched_count": 0,
+            }
+
+        for worker_id in worker_ids:
+            command = ReloadPluginsCommand(
+                header=MessageHeader(
+                    message_id=f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}",
+                    session_id=f"reload:{agent_type}",
+                    trace_id=uuid.uuid4().hex,
+                    target_agent_type=agent_type,
+                    metadata=metadata or {},
+                ),
+                reload_id=reload_id,
+                reason=reason,
+            )
+            await self.redis.xadd(
+                RedisKeys.worker_ctrl_stream(worker_id),
+                command.to_redis_payload(),
+            )
+
+        return {
+            "reload_id": reload_id,
+            "agent_type": agent_type,
+            "worker_ids": list(worker_ids),
+            "dispatched_count": len(worker_ids),
+        }
+
+    async def collect_reload_acks(
+        self,
+        reload_id: str,
+        last_id: str = "0-0",
+        block_ms: int = 0,
+        count: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Read reload ACK payloads from the ACK stream."""
+        messages = await self.redis.xread(
+            streams={RedisKeys.plugin_reload_ack_stream(reload_id): last_id},
+            count=count,
+            block=block_ms,
+        )
+        results: List[Dict[str, Any]] = []
+        for _, msg_list in messages or []:
+            for _, fields in msg_list:
+                raw = fields.get(b"data") if isinstance(fields, dict) else None
+                if raw is None and isinstance(fields, dict):
+                    raw = fields.get("data")
+                if raw is None:
+                    continue
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                results.append(dict(json.loads(raw)))
+        return results
+
+    async def _resolve_agent_type_route(
+        self, target_agent_type: str, require_online_worker: bool
+    ) -> RouteResolution:
+        """Resolve agent-type-mode routing.
+
+        Agent type sends always publish to the agent-type stream. When the
+        online check is enabled, we only verify that at least one online worker exists.
+        """
+        if self.registry is None:
+            raise WorkerRegistryNotSetError("send messages")
+
+        if not require_online_worker:
+            return RouteResolution(stream_name=RedisKeys.ctrl_stream(target_agent_type))
+
+        has_online_agent_type, _workers = await self.registry.has_online_agent_type(  # pylint: disable=C0103,unused-variable
+            target_agent_type
+        )
+        if has_online_agent_type:
+            return RouteResolution(stream_name=RedisKeys.ctrl_stream(target_agent_type))
+
+        raise ValueError(f"No online worker found for agent_type '{target_agent_type}'")
+
+    async def _resolve_direct_worker_route(
+        self,
+        target_worker_id: str,
+        require_online_worker: bool,
+    ) -> RouteResolution:
+        """Resolve direct-worker routing for debug or worker-specific control."""
+        if self.registry is not None and require_online_worker:
+            is_online = await self.registry.is_worker_online(target_worker_id)
+            if not is_online:
+                raise LookupError(
+                    f"Target worker '{target_worker_id}' is not online "
+                    "or not registered"
+                )
+        return RouteResolution(
+            stream_name=RedisKeys.worker_ctrl_stream(target_worker_id),
+            target_worker_id=target_worker_id,
+        )
+
+    def _build_gateway_command(
+        self,
+        *,
+        action_type: str,
+        header: MessageHeader,
+        content: Any,
+        extra_payload: Dict[str, Any],
+    ) -> AskAgentCommand | ResumeCommand:
+        """Build a gateway command from parameters."""
+        if action_type == ActionType.RESUME.value:
+            resume_extra_payload = dict(extra_payload)
+            status = resume_extra_payload.pop("status", "")
+            reply_data = resume_extra_payload.pop("reply_data", None)
+            return ResumeCommand(
+                header=header,
+                content=content,
+                status=status,
+                reply_data=reply_data,
+                extra_payload=resume_extra_payload,
+            )
+
+        return AskAgentCommand(
+            header=header,
+            content=content,
+            wait_for_reply=bool(extra_payload.get("wait_for_reply", False)),
+            extra_payload={
+                k: v for k, v in extra_payload.items() if k != "wait_for_reply"
+            },
+        )
+
+    async def cancel_task(
+        self,
+        message_id: str,
+        session_id: str,
+        reason: str = "",
+        target_agent_type: str = "",  # pylint: disable=unused-argument
+        requested_by: str = "client",
+        cancel_mode: str = CancelMode.GRACEFUL,
+    ) -> CancelTaskResponse:
+        """Cascade cancel the specified task and all its subtasks.
+
+        Rebuilds the task tree via parent_message_id chain in session registry,
+        traverses BFS from target message_id, and cancels all non-terminal subtasks.
+        """
+        if self.registry is None:
+            raise ValueError("GatewayClient requires a WorkerRegistry to cancel tasks")
+
+        execution = await self.registry.get_execution_by_message_id(
+            message_id, session_id=session_id
+        )
+        if not execution:
+            return CancelTaskResponse(
+                success=False,
+                message_id=message_id,
+                execution_id="",
+                worker_id="",
+                status=ExecutionStatus.NOT_FOUND,
+                timestamp=int(time.time() * 1000),
+                error=f"execution not found for message_id={message_id}",
+            )
+
+        if execution.get("session_id") != session_id:
+            return CancelTaskResponse(
+                success=False,
+                message_id=message_id,
+                execution_id=execution.get("execution_id", ""),
+                worker_id=execution.get("worker_id", ""),
+                status=ExecutionStatus.NOT_FOUND,
+                timestamp=int(time.time() * 1000),
+                error=f"session mismatch for message_id={message_id}",
+            )
+
+        execution_status = execution.get("status", "")
+
+        # --- Cascade cancel: build task tree and BFS traverse ---
+        all_executions = await self.registry.get_all_session_executions(session_id)
+
+        # Build parent_message_id -> children mapping
+        children_map: dict[str, list[dict]] = {}
+        for ex in all_executions:
+            parent = ex.get("parent_message_id", "")
+            if parent:
+                children_map.setdefault(parent, []).append(ex)
+
+        # BFS: from target message_id, collect all nodes that need to be cancelled
+        terminal_states = {"COMPLETED", "FAILED", "CANCELLED"}
+        queue = [execution]
+        to_cancel: list[dict] = []
+        terminal_ancestors: list[dict] = []
+
+        while queue:
+            current = queue.pop(0)
+            cur_status = current.get("status", "")
+            # Even if current node is completed, still need to traverse its subtasks
+            # (they may still be running)
+            if cur_status not in terminal_states:
+                to_cancel.append(current)
+            else:
+                # Terminal nodes also need cancel_requested flag to prevent
+                # sub-Agent callback waking them up
+                terminal_ancestors.append(current)
+            # Always add child tasks to the queue
+            cur_msg_id = current.get("message_id", "")
+            if cur_msg_id in children_map:
+                queue.extend(children_map[cur_msg_id])
+
+        # Mark cancel_requested on terminal ancestors (without changing their state)
+        for ancestor in terminal_ancestors:
+            await self.registry.mark_cancel_requested(
+                ancestor.get("execution_id", ""), session_id, reason
+            )
+
+        if not to_cancel:
+            return CancelTaskResponse(
+                success=False,
+                message_id=message_id,
+                execution_id=execution.get("execution_id", ""),
+                worker_id=execution.get("worker_id", ""),
+                status=ExecutionStatus.ALREADY_FINISHED,
+                timestamp=int(time.time() * 1000),
+                error=f"execution already in terminal state: {execution_status}",
+            )
+
+        # Mark and send control command for each node to cancel
+        for node in to_cancel:
+            node_execution_id = node.get("execution_id", "")
+            node_worker_id = node.get("worker_id", "")
+            node_message_id = node.get("message_id", "")
+
+            await self.registry.mark_execution_cancelling(
+                node_execution_id, session_id, reason
+            )
+
+            if node_worker_id:
+                cancel_command = CancelTaskCommand(
+                    header=MessageHeader(
+                        message_id=f"{CANCEL_MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}",
+                        session_id=session_id,
+                        trace_id=uuid.uuid4().hex,
+                        target_agent_type=node.get("target_agent_type", ""),
+                        parent_message_id=node_message_id,
+                    ),
+                    target_message_id=node_message_id,
+                    target_execution_id=node_execution_id,
+                    target_worker_id=node_worker_id,
+                    reason=reason,
+                    requested_by=requested_by,
+                    cancel_mode=cancel_mode,
+                )
+                await self.redis.xadd(
+                    RedisKeys.worker_ctrl_stream(node_worker_id),
+                    cancel_command.to_redis_payload(),
+                )
+
+        return CancelTaskResponse(
+            success=True,
+            message_id=message_id,
+            execution_id=execution.get("execution_id", ""),
+            worker_id=execution.get("worker_id", ""),
+            status=ExecutionStatus.CANCEL_REQUESTED,
+            timestamp=int(time.time() * 1000),
+            cancelled_count=len(to_cancel),
+        )
+
+    async def send_message(
+        self,
+        target_agent_type: str,
+        session_id: str,
+        content: Any,
+        user_code: str = "",
+        user_name: str = "",
+        action_type: str = "ASK_AGENT",
+        parent_message_id: str = "",
+        message_id: Optional[str] = None,
+        trace_id: Optional[str] = None,
+        extra_payload: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        target_worker_id: Optional[str] = None,
+        require_online_worker: bool = True,
+    ) -> SendMessageResponse:
+        """
+        Send a message to the gateway.
+
+        Routing logic:
+        - If target_worker_id is provided, the message is sent directly to that
+          worker's control stream (bypassing agent-type-based routing).
+        - Otherwise, the message is sent to the agent-type-based control stream
+          and routed to any available worker that declares the target_agent_type.
+
+        Args:
+            require_online_worker: If True (default), require the target route to
+              have at least one online worker before sending. If False, skips the
+              online check and sends directly to the target stream.
+        """
+        # 1. Prepare parameters for interceptors
+        params = {
+            "target_agent_type": target_agent_type,
+            "session_id": session_id,
+            "user_code": user_code,
+            "user_name": user_name,
+            "content": content,
+            "action_type": action_type,
+            "parent_message_id": parent_message_id,
+            "extra_payload": extra_payload or {},
+            "metadata": metadata or {},
+        }
+
+        # 2. Run interceptors
+        for interceptor in self.interceptors:
+            params = interceptor.before_send(params)
+
+        # 3. Resolve route and optionally probe agent type/liveness
+        try:
+            if target_worker_id:
+                route = await self._resolve_direct_worker_route(
+                    target_worker_id, require_online_worker
+                )
+            else:
+                route = await self._resolve_agent_type_route(
+                    params["target_agent_type"], require_online_worker
+                )
+        except LookupError as err:
+            return SendMessageResponse(
+                success=False,
+                status=ExecutionStatus.FAILED,
+                message_id="",
+                trace_id="",
+                target_worker_id=target_worker_id or "",
+                timestamp=int(time.time() * 1000),
+                error=str(err),
+                error_code=ExecutionStatus.ERR_WORKER_NOT_ONLINE,
+            )
+        except ValueError as err:
+            return SendMessageResponse(
+                success=False,
+                status=ExecutionStatus.FAILED,
+                message_id="",
+                trace_id="",
+                target_worker_id="",
+                timestamp=int(time.time() * 1000),
+                error=str(err),
+                error_code=ExecutionStatus.ERR_AGENT_TYPE_UNAVAILABLE,
+            )
+
+        if not message_id:
+            message_id = f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+        if not trace_id:
+            trace_id = uuid.uuid4().hex
+
+        header = MessageHeader(
+            message_id=message_id,
+            session_id=params["session_id"],
+            trace_id=trace_id,
+            target_agent_type=params["target_agent_type"],
+            parent_message_id=params["parent_message_id"],
+            user_code=params["user_code"],
+            user_name=params["user_name"],
+            metadata=params["metadata"],
+        )
+        command = self._build_gateway_command(
+            action_type=params["action_type"],
+            header=header,
+            content=params["content"],
+            extra_payload=params["extra_payload"],
+        )
+
+        # Initialize execution tracking
+        execution_id = f"{EXECUTION_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+        if self.registry and hasattr(self.registry, "initialize_execution"):
+            try:
+                await self.registry.initialize_execution(
+                    {
+                        "execution_id": execution_id,
+                        "message_id": message_id,
+                        "session_id": params["session_id"],
+                        "trace_id": trace_id,
+                        "parent_message_id": params["parent_message_id"] or "",
+                        "source_agent_type": "client",
+                        "target_agent_type": params["target_agent_type"],
+                        "stream_name": route.stream_name,
+                        "status": "QUEUED",
+                    }
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass  # Fallback if registry fails
+
+        # 4. Route to the appropriate stream
+        await self.redis.xadd(route.stream_name, command.to_redis_payload())
+
+        return SendMessageResponse(
+            success=True,
+            message_id=message_id,
+            trace_id=trace_id,
+            target_worker_id=route.target_worker_id,
+            timestamp=int(time.time() * 1000),
+            status=ExecutionStatus.QUEUED,
+        )

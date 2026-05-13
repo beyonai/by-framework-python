@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - name: Detect changed files
+        id: changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_ref="${{ github.event.pull_request.base.sha }}"
+            head_ref="${{ github.event.pull_request.head.sha }}"
+          else
+            base_ref="${{ github.event.before }}"
+            head_ref="${{ github.sha }}"
+            if [[ "$base_ref" == "0000000000000000000000000000000000000000" ]]; then
+              base_ref="$(git rev-list --max-parents=0 "$head_ref" | tail -n 1)"
+            fi
+          fi
+
+          mapfile -t changed_files < <(git diff --name-only --diff-filter=ACMR "$base_ref" "$head_ref")
+
+          changed_files_args=""
+          has_files="false"
+
+          for file in "${changed_files[@]}"; do
+            [[ -n "$file" ]] || continue
+            has_files="true"
+            changed_files_args+="${file} "
+          done
+
+          {
+            echo "has_files=$has_files"
+            echo "files=${changed_files_args% }"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install workspace dependencies
+        run: make install
+      - name: Run lint checks for changed files
+        if: steps.changes.outputs.has_files == 'true'
+        run: make lint FILES='${{ steps.changes.outputs.files }}'
+      - name: Run full test suite
+        run: make test
