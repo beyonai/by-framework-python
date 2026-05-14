@@ -17,9 +17,34 @@
 
 ---
 
-**by-framework** is a distributed, high-performance Agent scheduling engine built on Redis Streams. It provides Worker orchestration, session-scoped runtime state, and a plugin-based agent capability system — purpose-built for AI agent systems.
+**by-framework** is a distributed, high-performance Agent scheduling engine built on Redis Streams, purpose-built for multi-agent systems.
 
----
+## Challenges in Traditional Architecture
+
+Traditional AI application architectures often face three critical challenges when dealing with Agent scenarios:
+
+- **Full-link Synchronous Blocking $\rightarrow$ Forced "Manual Monitoring"** — Strong coupling between frontend and backend means tasks are interrupted if the page is closed. Users cannot switch devices or tasks, making workflows fragile to network fluctuations or interruptions.
+- **Inability to Support Long-running Tasks $\rightarrow$ System "Constant Accompaniment"** — For reasoning tasks taking minutes or hours, callers must block threads and wait. This leads to gateway timeouts and massive waste of idle compute resources.
+- **Inter-Agent Orchestration Recovery Dilemma** — In complex cascaded calls, if a timeout or interruption occurs, it's nearly impossible to accurately resume state. Developers are forced to build extremely complex persistent state machines.
+
+## The By-Framework Solution
+
+![Architecture Overview](./assets/img/architecture_en.png)
+
+By-Framework addresses these issues through an asynchronous architecture with **separated Control and Data Planes**:
+
+- **Instruction Asynchrony**: The APP sends control instructions to the **Control Queue** via the **Gateway Client**. Being asynchronous, the APP never blocks, and backend threads are released immediately.
+- **Agent Cluster Consumption**: A distributed cluster of **Agents** competitively consumes messages from the control queue. Logical routing (Agent Type) provides native load balancing and elastic scaling.
+- **Data Stream Feedback**: During execution, Agents asynchronously push chunks, state changes, and artifacts to the **Data Queue**. The APP listens via the **Gateway Client** for progress, natively supporting ultra-long tasks.
+- **Native Orchestration & Resumption**: When an Agent needs to call another Agent, it sends a new instruction to the **Control Queue**. This message-based mechanism allows tasks to release resources while waiting and resume context precisely upon receiving a reply.
+
+## Highlights
+
+- 🔌 **Plugin System** — Hot-reloadable plugins with lifecycle hooks, tools, prompts, and sub-agent configs
+- 🤝 **Inter-Agent Orchestration** — Built-in `call_agent`, scatter-gather fan-out, and human-in-the-loop patterns
+- 🧩 **Extension Ecosystem** — Drop-in packages for Langfuse, Phoenix, PostgreSQL, LangGraph, and Google ADK
+- 🛡️ **Production-Ready** — Competitive consumption, graceful shutdown, message persistence, and execution state tracking
+
 
 ## Table of Contents
 

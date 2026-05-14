@@ -13,13 +13,38 @@
 
 [**English**](README.md) | [**中文**](README_zh.md)
 
+**重要链接：** [文档](https://beyonai.github.io/by-framework-docs) · [Java 版本](https://beyonai.github.io/by-framework-java) · [TypeScript 版本](https://beyonai.github.io/by-framework-ts)
+
 </div>
 
----
+**by-framework** 是一个基于 Redis Streams 构建的分布式高性能 Agent 调度引擎，专为多 Agent 系统设计。
 
-**by-framework** 是一个基于 Redis Streams 构建的分布式高性能 Agent 调度引擎。它提供了 Worker 编排、会话级运行时状态管理以及基于插件的 Agent 能力系统——专为 AI Agent 系统设计。
+## 传统架构的困境
 
----
+传统 AI 应用架构在面对 Agent 场景时常面临三大挑战：
+
+- **全链路同步阻塞 $\rightarrow$ 迫使用户“人肉盯看”** — 前端与后端强绑定，页面关闭即任务中断。用户无法跨端切换，工作流极易因网络波动或意外打断而前功尽弃。
+- **无法支撑超长任务 $\rightarrow$ 导致系统“全程陪同”** — 面对数分钟甚至小时级的推理，调用方必须持续阻塞线程等待，不仅面临网关超时截断，更造成了严重的计算资源空转与浪费。
+- **多 Agent 编排的中断恢复困局** — 在复杂级联调用中，一旦出现超时或中断，系统难以精准定位状态并恢复，容易超时或结果错乱。
+
+## By-Framework 的方案
+
+![Architecture Overview](./assets/img/architecture_zh.png)
+
+By-Framework 通过**控制与数据平面分离**的异步架构解决上述问题：
+
+- **指令异步化**：APP 通过 **Gateway Client** 将用户请求转化为控制指令并投入 **Control Queue**（控制队列）。由于是异步解耦，APP 无需阻塞等待，后端线程立即释放。
+- **Agent 集群消费**：分布式的 **Agents** 集群竞争消费控制队列中的消息。通过逻辑寻址（Agent Type）自动实现负载均衡，天然支持动态扩缩容。
+- **过程数据回传**：Agent 在执行过程中，将流式文本（Chunk）、状态变更（State）及产物（Artifact）异步推送到 **Data Queue**（数据队列），APP 通过 **Gateway Client** 实时监听该队列以获取任务进度，从而原生支持超长任务。
+- **原生编排与中断恢复**：当 Agent 需要调用其他 Agent（编排）时，它会将新指令发往 **Control Queue**。这种基于消息的机制允许 Agent 任务在等待期间完全释放资源，并在收到回复指令后精准恢复上下文。
+
+## 亮点
+
+- 🔌 **插件系统** — 支持热加载的插件机制，提供生命周期钩子、工具、提示词和子 Agent 配置
+- 🤝 **多 Agent 编排** — 内置 call_agent、scatter-gather 扇出和人机交互模式
+- 🧩 **扩展生态** — 开箱即用的 Langfuse、Phoenix、PostgreSQL、LangGraph 及 Google ADK 集成包
+- 🛡️ **生产就绪** — 竞争消费、优雅退出、消息持久化与配置快照
+
 
 ## 目录
 
