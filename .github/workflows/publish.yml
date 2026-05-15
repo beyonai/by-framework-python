@@ -9,6 +9,7 @@ on:
       - "by-framework-trace-langfuse-v*"
       - "by-framework-trace-phoenix-v*"
       - "by-framework-langgraph-v*"
+      - "by-framework-adk-v*"
 
 permissions:
   contents: read
@@ -57,6 +58,11 @@ jobs:
               echo "package_dir=libs/by-framework-langgraph" >> "$GITHUB_OUTPUT"
               echo "version=${REF_NAME#by-framework-langgraph-v}" >> "$GITHUB_OUTPUT"
               ;;
+            by-framework-adk-v*)
+              echo "package_name=by-framework-adk" >> "$GITHUB_OUTPUT"
+              echo "package_dir=libs/by-framework-adk" >> "$GITHUB_OUTPUT"
+              echo "version=${REF_NAME#by-framework-adk-v}" >> "$GITHUB_OUTPUT"
+              ;;              
             *)
               echo "Unsupported tag: $REF_NAME" >&2
               exit 1
