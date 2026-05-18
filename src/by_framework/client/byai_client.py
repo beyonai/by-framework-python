@@ -3,6 +3,7 @@
 from typing import List, Optional, Union
 
 from by_framework.common.redis_client import Redis
+from by_framework.core.availability import RoutePolicy
 from by_framework.core.protocol.byai_codec import serialize_byai_content
 from by_framework.core.protocol.message import BaiYingMessage
 from by_framework.core.registry import WorkerRegistry
@@ -43,7 +44,10 @@ class ByaiGatewayClient(GatewayClient):
         extra_payload: Optional[dict] = None,
         metadata: Optional[dict] = None,
         target_worker_id: Optional[str] = None,
-        require_online_worker: bool = True,
+        route_policy: str = RoutePolicy.FAIL_FAST,
+        availability_timeout_ms: int = 30000,
+        region: Optional[str] = None,
+        priority: int = 0,
     ):
         serialized_content = serialize_byai_content(content)
         return await super().send_message(
@@ -59,5 +63,8 @@ class ByaiGatewayClient(GatewayClient):
             extra_payload=extra_payload,
             metadata=metadata,
             target_worker_id=target_worker_id,
-            require_online_worker=require_online_worker,
+            route_policy=route_policy,
+            availability_timeout_ms=availability_timeout_ms,
+            region=region,
+            priority=priority,
         )

@@ -6,6 +6,7 @@ import pytest
 
 from by_framework import ByaiGatewayClient, GatewayClient
 from by_framework.common.constants import RedisKeys
+from by_framework.core.availability import RoutePolicy
 from by_framework.core.protocol.commands import (
     AskAgentCommand,
     CancelTaskCommand,
@@ -53,7 +54,7 @@ async def test_resolve_direct_worker_route():
 
     route = await client._resolve_direct_worker_route(
         "worker-42",
-        require_online_worker=True,
+        check_online=True,
     )
 
     assert asdict(route) == {
@@ -72,7 +73,7 @@ async def test_resolve_agent_type_route():
 
     route = await client._resolve_agent_type_route(
         "langgraph_agent",
-        require_online_worker=True,
+        route_policy=RoutePolicy.FAIL_FAST,
     )
 
     assert asdict(route) == {
@@ -181,8 +182,8 @@ async def test_client_cancel_task_returns_not_found():
 
 
 @pytest.mark.asyncio
-async def test_client_send_message_require_online_worker_no_worker():
-    """Test that send_message returns FAILED when require_online_worker=True
+async def test_client_send_message_fail_fast_no_worker():
+    """Test that send_message returns FAILED with FAIL_FAST
     and no worker exists."""
     mock_redis = AsyncMock()
     mock_registry = AsyncMock()
@@ -193,7 +194,6 @@ async def test_client_send_message_require_online_worker_no_worker():
         target_agent_type="nonexistent_agent",
         session_id="s1",
         content="hello",
-        require_online_worker=True,
     )
 
     assert result.success is False
@@ -206,8 +206,8 @@ async def test_client_send_message_require_online_worker_no_worker():
 
 
 @pytest.mark.asyncio
-async def test_client_send_message_require_online_worker_with_worker():
-    """Test that send_message sends normally when require_online_worker=True
+async def test_client_send_message_fail_fast_with_worker():
+    """Test that send_message sends normally with FAIL_FAST
     and worker exists."""
     mock_redis = AsyncMock()
     mock_registry = AsyncMock()
@@ -218,7 +218,6 @@ async def test_client_send_message_require_online_worker_with_worker():
         target_agent_type="test_agent",
         session_id="s1",
         content="hello",
-        require_online_worker=True,
     )
 
     assert result.success is True
@@ -233,7 +232,7 @@ async def test_client_send_message_require_online_worker_with_worker():
 @pytest.mark.asyncio
 async def test_client_send_message_no_probe():
     """Test that send_message sends to agent-type stream directly when
-    require_online_worker=False."""
+    route_policy=SEND_ANYWAY."""
     mock_redis = AsyncMock()
     mock_registry = AsyncMock()
 
@@ -242,7 +241,7 @@ async def test_client_send_message_no_probe():
         target_agent_type="any_agent",
         session_id="s1",
         content="hello",
-        require_online_worker=False,
+        route_policy=RoutePolicy.SEND_ANYWAY,
     )
 
     assert result.success is True
@@ -267,7 +266,6 @@ async def test_client_send_message_target_worker_id_skips_probe():
         session_id="s1",
         content="hello",
         target_worker_id="worker-42",
-        require_online_worker=True,
     )
 
     assert result.success is True
@@ -293,7 +291,6 @@ async def test_client_send_message_target_worker_id_dead():
         session_id="s1",
         content="hello",
         target_worker_id="dead_worker",
-        require_online_worker=True,
     )
 
     assert result.success is False

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from by_framework.core.availability import RoutePolicy
 from by_framework.core.protocol.byai_types import ByaiContent
 
 from .context import AgentContext
@@ -32,7 +33,10 @@ class ByaiAgentContext(AgentContext):
         metadata: Optional[dict[str, Any]] = None,
         message_id: Optional[str] = None,
         parent_message_id: Optional[str] = None,
-        require_online_worker: bool = True,
+        route_policy: str = RoutePolicy.FAIL_FAST,
+        availability_timeout_ms: int = 30000,
+        region: Optional[str] = None,
+        priority: int = 0,
     ) -> dict:
         return await super().call_agent(
             target_agent_type=target_agent_type,
@@ -42,7 +46,10 @@ class ByaiAgentContext(AgentContext):
             metadata=metadata,
             message_id=message_id,
             parent_message_id=parent_message_id,
-            require_online_worker=require_online_worker,
+            route_policy=route_policy,
+            availability_timeout_ms=availability_timeout_ms,
+            region=region,
+            priority=priority,
         )
 
     async def dispatch_group(

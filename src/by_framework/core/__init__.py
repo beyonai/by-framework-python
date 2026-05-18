@@ -5,6 +5,18 @@ Provides core components including protocol definitions, worker registry,
 and workspace management.
 """
 
+from .availability import (
+    AvailabilityResult,
+    AvailabilityRouter,
+    AvailabilityStatus,
+    DeliveryIntent,
+    PendingDelivery,
+    RoutePolicy,
+    WakeupDecision,
+    WakeupDecisionStatus,
+    WakeupRequest,
+)
+from .delivery_gate import DeliveryGate
 from .protocol import (
     ActionType,
     AgentState,
@@ -35,6 +47,7 @@ from .protocol import (
     unregister_command,
 )
 from .registry import WorkerRegistry
+from .wakeup_controller import WakeupController, WakeupProvider
 from .workspace import WorkspaceManager
 
 __all__ = [
@@ -67,4 +80,16 @@ __all__ = [
     "get_registered_command",
     "WorkerRegistry",
     "WorkspaceManager",
+    "AvailabilityRouter",
+    "AvailabilityStatus",
+    "AvailabilityResult",
+    "DeliveryIntent",
+    "RoutePolicy",
+    "PendingDelivery",
+    "WakeupRequest",
+    "WakeupDecision",
+    "WakeupDecisionStatus",
+    "WakeupController",
+    "WakeupProvider",
+    "DeliveryGate",
 ]

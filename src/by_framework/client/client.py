@@ -18,6 +18,12 @@ from by_framework.common.constants import (
     RedisKeys,
 )
 from by_framework.common.redis_client import Redis, get_redis
+from by_framework.core.availability import (
+    AvailabilityRouter,
+    AvailabilityStatus,
+    DeliveryIntent,
+    RoutePolicy,
+)
 from by_framework.core.protocol.action_type import ActionType
 from by_framework.core.protocol.commands import (
     AskAgentCommand,
@@ -156,7 +162,7 @@ class GatewayClient:
         return results
 
     async def _resolve_agent_type_route(
-        self, target_agent_type: str, require_online_worker: bool
+        self, target_agent_type: str, route_policy: str
     ) -> RouteResolution:
         """Resolve agent-type-mode routing.
 
@@ -166,7 +172,7 @@ class GatewayClient:
         if self.registry is None:
             raise WorkerRegistryNotSetError("send messages")
 
-        if not require_online_worker:
+        if route_policy == RoutePolicy.SEND_ANYWAY:
             return RouteResolution(stream_name=RedisKeys.ctrl_stream(target_agent_type))
 
         has_online_agent_type, _workers = await self.registry.has_online_agent_type(  # pylint: disable=C0103,unused-variable
@@ -180,10 +186,10 @@ class GatewayClient:
     async def _resolve_direct_worker_route(
         self,
         target_worker_id: str,
-        require_online_worker: bool,
+        check_online: bool,
     ) -> RouteResolution:
         """Resolve direct-worker routing for debug or worker-specific control."""
-        if self.registry is not None and require_online_worker:
+        if self.registry is not None and check_online:
             is_online = await self.registry.is_worker_online(target_worker_id)
             if not is_online:
                 raise LookupError(
@@ -373,7 +379,10 @@ class GatewayClient:
         extra_payload: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         target_worker_id: Optional[str] = None,
-        require_online_worker: bool = True,
+        route_policy: str = RoutePolicy.FAIL_FAST,
+        availability_timeout_ms: int = 30000,
+        region: Optional[str] = None,
+        priority: int = 0,
     ) -> SendMessageResponse:
         """
         Send a message to the gateway.
@@ -385,9 +394,7 @@ class GatewayClient:
           and routed to any available worker that declares the target_agent_type.
 
         Args:
-            require_online_worker: If True (default), require the target route to
-              have at least one online worker before sending. If False, skips the
-              online check and sends directly to the target stream.
+            route_policy: Controls online checks and unavailable-agent behavior.
         """
         # 1. Prepare parameters for interceptors
         params = {
@@ -406,16 +413,83 @@ class GatewayClient:
         for interceptor in self.interceptors:
             params = interceptor.before_send(params)
 
+        if not message_id:
+            message_id = f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+        if not trace_id:
+            trace_id = uuid.uuid4().hex
+
+        header = MessageHeader(
+            message_id=message_id,
+            session_id=params["session_id"],
+            trace_id=trace_id,
+            target_agent_type=params["target_agent_type"],
+            parent_message_id=params["parent_message_id"],
+            user_code=params["user_code"],
+            user_name=params["user_name"],
+            metadata=params["metadata"],
+        )
+        command = self._build_gateway_command(
+            action_type=params["action_type"],
+            header=header,
+            content=params["content"],
+            extra_payload=params["extra_payload"],
+        )
+        execution_id = f"{EXECUTION_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+
         # 3. Resolve route and optionally probe agent type/liveness
+        should_dispatch_control = True
         try:
             if target_worker_id:
                 route = await self._resolve_direct_worker_route(
-                    target_worker_id, require_online_worker
+                    target_worker_id,
+                    route_policy != RoutePolicy.SEND_ANYWAY,
                 )
             else:
-                route = await self._resolve_agent_type_route(
-                    params["target_agent_type"], require_online_worker
+                availability = await AvailabilityRouter(
+                    self.redis, self.registry
+                ).prepare_delivery(
+                    DeliveryIntent(
+                        execution_id=execution_id,
+                        message_id=message_id,
+                        session_id=params["session_id"],
+                        trace_id=trace_id,
+                        source="client",
+                        target_agent_type=params["target_agent_type"],
+                        user_code=params["user_code"],
+                        region=region or "",
+                        priority=priority,
+                        policy=route_policy,
+                        timeout_ms=availability_timeout_ms,
+                        command_payload=command.to_dict(),
+                        metadata=params["metadata"],
+                    )
                 )
+                if availability.status not in (
+                    AvailabilityStatus.DELIVER_NOW,
+                    AvailabilityStatus.WAIT_AND_DELIVER,
+                    AvailabilityStatus.FALLBACK_TO_OTHER_AGENT_TYPE,
+                    AvailabilityStatus.QUEUE_PENDING,
+                ):
+                    return SendMessageResponse(
+                        success=False,
+                        status=ExecutionStatus.FAILED,
+                        message_id="",
+                        trace_id="",
+                        target_worker_id="",
+                        timestamp=int(time.time() * 1000),
+                        error=availability.error,
+                        error_code=availability.error_code
+                        or ExecutionStatus.ERR_AGENT_TYPE_UNAVAILABLE,
+                    )
+                if availability.status == AvailabilityStatus.QUEUE_PENDING:
+                    should_dispatch_control = False
+                route = RouteResolution(
+                    stream_name=availability.stream_name,
+                    target_worker_id=availability.target_worker_id,
+                )
+                if availability.selected_agent_type:
+                    params["target_agent_type"] = availability.selected_agent_type
+                    command.header.target_agent_type = availability.selected_agent_type
         except LookupError as err:
             return SendMessageResponse(
                 success=False,
@@ -439,30 +513,7 @@ class GatewayClient:
                 error_code=ExecutionStatus.ERR_AGENT_TYPE_UNAVAILABLE,
             )
 
-        if not message_id:
-            message_id = f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}"
-        if not trace_id:
-            trace_id = uuid.uuid4().hex
-
-        header = MessageHeader(
-            message_id=message_id,
-            session_id=params["session_id"],
-            trace_id=trace_id,
-            target_agent_type=params["target_agent_type"],
-            parent_message_id=params["parent_message_id"],
-            user_code=params["user_code"],
-            user_name=params["user_name"],
-            metadata=params["metadata"],
-        )
-        command = self._build_gateway_command(
-            action_type=params["action_type"],
-            header=header,
-            content=params["content"],
-            extra_payload=params["extra_payload"],
-        )
-
         # Initialize execution tracking
-        execution_id = f"{EXECUTION_ID_PREFIX}{uuid.uuid4().hex[:8]}"
         if self.registry and hasattr(self.registry, "initialize_execution"):
             try:
                 await self.registry.initialize_execution(
@@ -482,7 +533,8 @@ class GatewayClient:
                 pass  # Fallback if registry fails
 
         # 4. Route to the appropriate stream
-        await self.redis.xadd(route.stream_name, command.to_redis_payload())
+        if should_dispatch_control:
+            await self.redis.xadd(route.stream_name, command.to_redis_payload())
 
         return SendMessageResponse(
             success=True,

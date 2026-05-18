@@ -20,6 +20,18 @@ from .common.emitter import (
 )
 from .common.logger import logger, setup_logging
 from .common.redis_client import Redis, close_redis, get_redis, init_redis
+from .core.availability import (
+    AvailabilityResult,
+    AvailabilityRouter,
+    AvailabilityStatus,
+    DeliveryIntent,
+    PendingDelivery,
+    RoutePolicy,
+    WakeupDecision,
+    WakeupDecisionStatus,
+    WakeupRequest,
+)
+from .core.delivery_gate import DeliveryGate
 from .core.extensions import (
     AgentConfig,
     AgentConfigsSnapshot,
@@ -82,6 +94,7 @@ from .core.registry import (
     check_agent_type_online,
     check_worker_online,
 )
+from .core.wakeup_controller import WakeupController, WakeupProvider
 from .core.workspace import WorkspaceManager
 from .worker.app import run_worker
 from .worker.byai_context import ByaiAgentContext, ByaiAgentTask
@@ -171,4 +184,16 @@ __all__ = [
     "ProcessCommandResult",
     "ensure_json_serializable",
     "normalize_process_result",
+    "AvailabilityResult",
+    "AvailabilityRouter",
+    "AvailabilityStatus",
+    "DeliveryIntent",
+    "PendingDelivery",
+    "RoutePolicy",
+    "WakeupDecision",
+    "WakeupDecisionStatus",
+    "WakeupRequest",
+    "DeliveryGate",
+    "WakeupController",
+    "WakeupProvider",
 ]

@@ -9,6 +9,8 @@ are centrally managed in this file. Do not hardcode literal strings in business 
 class RedisKeys:
     """Gateway SDK global Redis Key naming conventions and constants."""
 
+    CONTROL_PLANE_PREFIX = "byai_gateway:control_plane"
+
     # --- Queues and Streams ---
     @staticmethod
     def ctrl_stream(agent_type: str) -> str:
@@ -24,6 +26,61 @@ class RedisKeys:
     def plugin_reload_ack_stream(reload_id: str) -> str:
         """Stream for worker ACKs emitted after handling a plugin reload command."""
         return f"byai_gateway:plugin_reload:{reload_id}:ack"
+
+    @classmethod
+    def control_plane_wakeup_stream(cls) -> str:
+        """Management stream for agent availability wakeup requests."""
+        return f"{cls.CONTROL_PLANE_PREFIX}:mgmt:wakeup"
+
+    @classmethod
+    def control_plane_wakeup_result_stream(cls, execution_id: str) -> str:
+        """Management stream for wakeup controller decisions."""
+        return f"{cls.CONTROL_PLANE_PREFIX}:mgmt:wakeup:result:{execution_id}"
+
+    @classmethod
+    def control_plane_delivery_pending_stream(cls) -> str:
+        """Management stream for pending control-message delivery."""
+        return f"{cls.CONTROL_PLANE_PREFIX}:mgmt:delivery:pending"
+
+    @classmethod
+    def control_plane_deadletter_stream(cls) -> str:
+        """Management stream for failed control-plane work."""
+        return f"{cls.CONTROL_PLANE_PREFIX}:mgmt:deadletter"
+
+    @classmethod
+    def control_plane_agent_availability(cls, agent_type: str) -> str:
+        """Availability state key for an agent type."""
+        return f"{cls.CONTROL_PLANE_PREFIX}:availability:agent_type:{agent_type}"
+
+    @classmethod
+    def control_plane_agent_circuit(cls, agent_type: str) -> str:
+        """Circuit-breaker state key for an agent type."""
+        return f"{cls.CONTROL_PLANE_PREFIX}:circuit:agent_type:{agent_type}"
+
+    @classmethod
+    def control_plane_agent_fallback(cls, agent_type: str) -> str:
+        """Fallback routing state key for an agent type."""
+        return f"{cls.CONTROL_PLANE_PREFIX}:fallback:agent_type:{agent_type}"
+
+    @classmethod
+    def control_plane_user_quota(cls, user_code: str) -> str:
+        """User quota state key for control-plane scheduling."""
+        return f"{cls.CONTROL_PLANE_PREFIX}:quota:user:{user_code}"
+
+    @classmethod
+    def control_plane_tenant_quota(cls, tenant_id: str) -> str:
+        """Backward-compatible alias for user-code based quota state."""
+        return cls.control_plane_user_quota(tenant_id)
+
+    @classmethod
+    def control_plane_wakeup_dedupe(
+        cls, agent_type: str, user_code: str, region: str
+    ) -> str:
+        """Dedupe key for concurrent wakeup requests."""
+        return (
+            f"{cls.CONTROL_PLANE_PREFIX}:wakeup:dedupe:"
+            f"{agent_type}:{user_code}:{region}"
+        )
 
     @staticmethod
     def agent_configs_snapshot(snapshot_key: str) -> str:

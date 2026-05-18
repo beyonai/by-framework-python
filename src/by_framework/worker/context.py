@@ -30,6 +30,12 @@ from by_framework.common.constants import (
 from by_framework.common.emitter import DataLayoutBuilder, GatewayDataEmitter
 from by_framework.common.logger import logger
 from by_framework.common.redis_client import Redis, get_redis
+from by_framework.core.availability import (
+    AvailabilityRouter,
+    AvailabilityStatus,
+    DeliveryIntent,
+    RoutePolicy,
+)
 from by_framework.core.extensions import AgentConfig
 from by_framework.core.protocol.agent_state import AgentState
 from by_framework.core.protocol.commands import AskAgentCommand, ResumeCommand
@@ -43,7 +49,6 @@ from by_framework.core.protocol.events import (
     StreamChunkEvent,
 )
 from by_framework.core.protocol.message_header import MessageHeader
-from by_framework.core.registry import check_agent_type_online
 from by_framework.core.runtime import AgentRuntimeState
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.runtime.filestore.base import FileStorage
@@ -447,34 +452,18 @@ class AgentContext:
         metadata: Optional[Dict[str, Any]] = None,
         message_id: Optional[str] = None,
         parent_message_id: Optional[str] = None,
-        require_online_worker: bool = True,
+        route_policy: str = RoutePolicy.FAIL_FAST,
+        availability_timeout_ms: int = 30000,
+        region: Optional[str] = None,
+        priority: int = 0,
     ) -> dict:
         """Push a control-flow message to another agent.
 
         If wait_for_reply is True, source_agent_type is injected for routing.
 
         Args:
-            require_online_worker: If True (default), require the target
-              agent_type to currently have at least one online worker before
-              sending. If no worker is online, returns immediately with FAILED
-              status.
+            route_policy: Controls online checks and unavailable-agent behavior.
         """
-        if require_online_worker:
-            has_cap, _ = await check_agent_type_online(
-                self.redis, target_agent_type, check_active=True
-            )
-            if not has_cap:
-                return {
-                    "status": AgentState.FAILED.value,
-                    "message_id": "",
-                    "parent_message_id": parent_message_id or "",
-                    "target_agent_type": target_agent_type,
-                    "error": (
-                        f"No online worker found for agent_type '{target_agent_type}'"
-                    ),
-                    "error_code": "AGENT_TYPE_UNAVAILABLE",
-                }
-
         message_id = message_id or self.generate_message_id()
         parent_message_id = parent_message_id if parent_message_id else self.message_id
         merged_extra_payload = dict(extra_payload or {})
@@ -504,11 +493,52 @@ class AgentContext:
                 k: v for k, v in merged_extra_payload.items() if k != "wait_for_reply"
             },
         )
+        execution_id = f"{EXECUTION_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+
+        availability = await AvailabilityRouter(self.redis).prepare_delivery(
+            DeliveryIntent(
+                execution_id=execution_id,
+                message_id=message_id,
+                session_id=self.session_id,
+                trace_id=self.trace_id,
+                source=self.current_agent_id,
+                target_agent_type=target_agent_type,
+                user_code=self.agent_runtime_state.session_manager.user_code,
+                region=region or "",
+                priority=priority,
+                policy=route_policy,
+                timeout_ms=availability_timeout_ms,
+                command_payload=command.to_dict(),
+                metadata=metadata or {},
+            )
+        )
+        if availability.status not in (
+            AvailabilityStatus.DELIVER_NOW,
+            AvailabilityStatus.WAIT_AND_DELIVER,
+            AvailabilityStatus.FALLBACK_TO_OTHER_AGENT_TYPE,
+            AvailabilityStatus.QUEUE_PENDING,
+        ):
+            return {
+                "status": AgentState.FAILED.value,
+                "message_id": "",
+                "parent_message_id": parent_message_id or "",
+                "target_agent_type": target_agent_type,
+                "error": availability.error,
+                "error_code": availability.error_code or "AGENT_TYPE_UNAVAILABLE",
+            }
+        should_dispatch_control = (
+            availability.status != AvailabilityStatus.QUEUE_PENDING
+        )
+        if availability.selected_agent_type:
+            target_agent_type = availability.selected_agent_type
+            command.header.target_agent_type = availability.selected_agent_type
+        delivery_stream = availability.stream_name or RedisKeys.ctrl_stream(
+            target_agent_type
+        )
 
         if self.plugin_registry:
             await self.plugin_registry.on_call_agent_start(self, command)
 
-        execution_id = f"{EXECUTION_ID_PREFIX}{uuid.uuid4().hex[:8]}"
         from by_framework.core.registry import WorkerRegistry
 
         registry = WorkerRegistry(self.redis)
@@ -525,7 +555,7 @@ class AgentContext:
                         if wait_for_reply
                         else "",
                         "target_agent_type": target_agent_type,
-                        "stream_name": RedisKeys.ctrl_stream(target_agent_type),
+                        "stream_name": delivery_stream,
                         "status": "QUEUED",
                     }
                 )
@@ -533,9 +563,8 @@ class AgentContext:
                 pass  # Fallback if registry fails
 
         try:
-            await self.redis.xadd(
-                RedisKeys.ctrl_stream(target_agent_type), command.to_redis_payload()
-            )
+            if should_dispatch_control:
+                await self.redis.xadd(delivery_stream, command.to_redis_payload())
         except Exception as error:
             if self.plugin_registry:
                 await self.plugin_registry.on_call_agent_error(self, command, error)
