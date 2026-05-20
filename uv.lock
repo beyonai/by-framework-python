@@ -312,7 +312,7 @@ wheels = [
 
 [[package]]
 name = "by-framework"
-version = "0.2.1"
+version = "0.2.2.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "dill" },
@@ -350,7 +350,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "by-framework-adk"
-version = "0.0.2"
+version = "0.0.3.dev0"
 source = { editable = "libs/by-framework-adk" }
 dependencies = [
     { name = "by-framework" },
@@ -384,7 +384,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "by-framework-history-byclaw"
-version = "0.0.2"
+version = "0.0.3.dev0"
 source = { editable = "libs/by-framework-history-byclaw" }
 dependencies = [
     { name = "by-framework" },
@@ -414,7 +414,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "by-framework-history-postgres"
-version = "0.0.2"
+version = "0.0.3.dev0"
 source = { editable = "libs/by-framework-history-postgres" }
 dependencies = [
     { name = "asyncpg" },
@@ -446,7 +446,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "by-framework-langgraph"
-version = "0.0.2"
+version = "0.0.3.dev0"
 source = { editable = "libs/by-framework-langgraph" }
 dependencies = [
     { name = "by-framework" },
@@ -492,7 +492,7 @@ provides-extras = ["dev", "langfuse", "phoenix"]
 
 [[package]]
 name = "by-framework-trace-langfuse"
-version = "0.0.2"
+version = "0.0.3.dev0"
 source = { editable = "libs/by-framework-trace-langfuse" }
 dependencies = [
     { name = "by-framework" },
@@ -526,7 +526,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "by-framework-trace-phoenix"
-version = "0.0.2"
+version = "0.0.3.dev0"
 source = { editable = "libs/by-framework-trace-phoenix" }
 dependencies = [
     { name = "arize-phoenix-otel" },

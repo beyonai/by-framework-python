@@ -543,12 +543,15 @@ class ByHttpClient:
         Returns:
             HttpResponse from the server
         """
+        path = Path(file_path)
         parts: list[tuple[str, Any]] = []
         if form_fields:
             for key, value in form_fields.items():
                 parts.append((key, value))
-        parts.append((file_field, str(file_path)))
-        return await self._upload(url, parts, headers=headers)
+
+        with open(path, "rb") as f:
+            parts.append((file_field, (path.name, f)))
+            return await self._upload(url, parts, headers=headers)
 
     async def upload_multiple(
         self,
@@ -572,13 +575,19 @@ class ByHttpClient:
         Returns:
             HttpResponse from the server
         """
+        from contextlib import ExitStack
+
         parts: list[tuple[str, Any]] = []
         if form_fields:
             for key, value in form_fields.items():
                 parts.append((key, value))
-        for path in file_paths:
-            parts.append((file_field, str(path)))
-        return await self._upload(url, parts, headers=headers)
+
+        with ExitStack() as stack:
+            for fp in file_paths:
+                path = Path(fp)
+                f = stack.enter_context(open(path, "rb"))
+                parts.append((file_field, (path.name, f)))
+            return await self._upload(url, parts, headers=headers)
 
     async def upload_with_stream(
         self,
@@ -643,12 +652,24 @@ class ByHttpClient:
 
         logger.debug("[POST] %s (multipart upload, %d parts)", url, len(parts))
 
+        # Convert non-file parts (e.g. standard form fields) to (None, value)
+        # to ensure httpx renders them without filename attribute,
+        # and avoid AsyncClient sync/async conflicts.
+        formatted_parts: list[tuple[str, Any]] = []
+        for key, val in parts:
+            if isinstance(val, tuple):
+                formatted_parts.append((key, val))
+            elif hasattr(val, "read") and callable(val.read):
+                formatted_parts.append((key, val))
+            else:
+                formatted_parts.append((key, (None, str(val))))
+
         try:
             response = await self._client.request(
                 method="POST",
                 url=url,
                 headers=request_headers,
-                files=parts,
+                files=formatted_parts,
             )
 
             logger.debug(

@@ -379,14 +379,17 @@ class DiscoveryHttpClient:
         Returns:
             HttpResponse from the server
         """
+        p = Path(file_path)
         parts: list[tuple[str, Any]] = []
         if form_fields:
             for key, value in form_fields.items():
                 parts.append((key, value))
-        parts.append((file_field, str(file_path)))
-        return await self._upload_with_discovery(
-            service_name, path, parts, headers=headers
-        )
+
+        with open(p, "rb") as f:
+            parts.append((file_field, (p.name, f)))
+            return await self._upload_with_discovery(
+                service_name, path, parts, headers=headers
+            )
 
     async def upload_multiple(
         self,
@@ -412,15 +415,21 @@ class DiscoveryHttpClient:
         Returns:
             HttpResponse from the server
         """
+        from contextlib import ExitStack
+
         parts: list[tuple[str, Any]] = []
         if form_fields:
             for key, value in form_fields.items():
                 parts.append((key, value))
-        for fp in file_paths:
-            parts.append((file_field, str(fp)))
-        return await self._upload_with_discovery(
-            service_name, path, parts, headers=headers
-        )
+
+        with ExitStack() as stack:
+            for fp in file_paths:
+                p = Path(fp)
+                f = stack.enter_context(open(p, "rb"))
+                parts.append((file_field, (p.name, f)))
+            return await self._upload_with_discovery(
+                service_name, path, parts, headers=headers
+            )
 
     async def upload_with_stream(
         self,
@@ -537,6 +546,22 @@ class DiscoveryHttpClient:
             logger.warning(
                 "Node-switching retry in %.1fs for service %s", delay, service_name
             )
+
+            # Reset seek position for any file-like objects in parts before retrying
+            for _, val in parts:
+                if isinstance(val, tuple):
+                    for item in val:
+                        if hasattr(item, "seek") and callable(item.seek):
+                            try:
+                                item.seek(0)
+                            except Exception:
+                                pass
+                elif hasattr(val, "seek") and callable(val.seek):
+                    try:
+                        val.seek(0)
+                    except Exception:
+                        pass
+
             await asyncio.sleep(delay)
             return await self._upload_with_discovery(
                 service_name,
