@@ -63,7 +63,7 @@ jobs:
               echo "package_name=by-framework-adk" >> "$GITHUB_OUTPUT"
               echo "package_dir=libs/by-framework-adk" >> "$GITHUB_OUTPUT"
               echo "version=${REF_NAME#by-framework-adk-v}" >> "$GITHUB_OUTPUT"
-              ;;              
+              ;;
             *)
               echo "Unsupported tag: $REF_NAME" >&2
               exit 1
