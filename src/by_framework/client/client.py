@@ -9,7 +9,8 @@ import json
 import time
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Protocol
+from dataclasses import fields as dataclass_fields
+from typing import (TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional, Protocol)
 
 from by_framework.common.constants import (
     CANCEL_MESSAGE_ID_PREFIX,
@@ -32,6 +33,7 @@ from by_framework.core.protocol.commands import (
     ReloadPluginsCommand,
     ResumeCommand,
 )
+from by_framework.core.protocol.data_message import DataMessage
 from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.core.protocol.responses import (
     CancelTaskResponse,
@@ -57,6 +59,14 @@ class GatewayInterceptor(Protocol):
 class RouteResolution:
     stream_name: str
     target_worker_id: str = ""
+
+
+@dataclass(frozen=True)
+class DataStreamEntry:
+    """A decoded entry from a session data stream."""
+
+    stream_id: str
+    message: DataMessage
 
 
 class GatewayClient:
@@ -85,6 +95,171 @@ class GatewayClient:
 
     def add_interceptor(self, interceptor: GatewayInterceptor):
         self.interceptors.append(interceptor)
+
+    @staticmethod
+    def _decode_redis_value(value: Any) -> Any:
+        """Decode Redis bytes values while preserving already-decoded clients."""
+        if isinstance(value, bytes):
+            return value.decode("utf-8")
+        return value
+
+    @classmethod
+    def _decode_data_stream_entry(
+        cls, stream_id: Any, fields: Dict[Any, Any]
+    ) -> DataStreamEntry:
+        raw = fields.get(b"data")
+        if raw is None:
+            raw = fields.get("data")
+        if raw is None:
+            raise ValueError("data stream entry missing 'data' field")
+
+        payload = json.loads(cls._decode_redis_value(raw))
+        data_message_fields = {field.name for field in dataclass_fields(DataMessage)}
+        return DataStreamEntry(
+            stream_id=cls._decode_redis_value(stream_id),
+            message=DataMessage(
+                **{
+                    key: value
+                    for key, value in payload.items()
+                    if key in data_message_fields
+                }
+            ),
+        )
+
+    async def read_data_messages(
+        self,
+        session_id: str,
+        last_id: str = "0-0",
+        block_ms: int = 0,
+        count: int = 100,
+    ) -> List[DataStreamEntry]:
+        """Read decoded messages from the session data stream.
+
+        Pass the last returned ``stream_id`` as ``last_id`` to continue from
+        the next entry. ``block_ms`` is passed to Redis XREAD; ``0`` means
+        block indefinitely on standard Redis clients.
+        """
+        stream_name = RedisKeys.session_data_stream(session_id)
+        messages = await self.redis.xread(
+            streams={stream_name: last_id},
+            count=count,
+            block=block_ms,
+        )
+
+        results: List[DataStreamEntry] = []
+        for _, msg_list in messages or []:
+            for stream_id, fields in msg_list:
+                results.append(self._decode_data_stream_entry(stream_id, fields))
+        return results
+
+    async def get_data_message_checkpoint(
+        self,
+        session_id: str,
+        consumer_name: str,
+    ) -> str:
+        """Return the last committed data stream ID for a named consumer."""
+        checkpoint = await self.redis.get(
+            RedisKeys.session_data_checkpoint(session_id, consumer_name)
+        )
+        if checkpoint is None:
+            return "0-0"
+        return self._decode_redis_value(checkpoint)
+
+    async def commit_data_message(
+        self,
+        session_id: str,
+        stream_id: str,
+        consumer_name: str,
+    ) -> None:
+        """Commit a data stream ID as processed for a named consumer."""
+        await self.redis.set(
+            RedisKeys.session_data_checkpoint(session_id, consumer_name),
+            stream_id,
+            ex=RedisKeys.DEFAULT_SESSION_TTL,
+        )
+
+    async def read_data_messages_from_checkpoint(
+        self,
+        session_id: str,
+        consumer_name: str,
+        block_ms: int = 0,
+        count: int = 100,
+        auto_commit: bool = False,
+    ) -> List[DataStreamEntry]:
+        """Read messages starting after a named consumer's committed checkpoint."""
+        last_id = await self.get_data_message_checkpoint(session_id, consumer_name)
+        entries = await self.read_data_messages(
+            session_id=session_id,
+            last_id=last_id,
+            block_ms=block_ms,
+            count=count,
+        )
+        if auto_commit and entries:
+            await self.commit_data_message(
+                session_id=session_id,
+                stream_id=entries[-1].stream_id,
+                consumer_name=consumer_name,
+            )
+        return entries
+
+    async def iter_data_messages(
+        self,
+        session_id: str,
+        last_id: str = "$",
+        block_ms: int = 5000,
+        count: int = 100,
+    ) -> AsyncIterator[DataStreamEntry]:
+        """Continuously consume decoded messages from the session data stream.
+
+        The iterator does not stop on its own. Callers should break when their
+        business-level terminal event is observed.
+        """
+        current_id = last_id
+        while True:
+            entries = await self.read_data_messages(
+                session_id=session_id,
+                last_id=current_id,
+                block_ms=block_ms,
+                count=count,
+            )
+            for entry in entries:
+                current_id = entry.stream_id
+                yield entry
+
+    async def consume_data_messages(
+        self,
+        session_id: str,
+        consumer_name: str,
+        block_ms: int = 5000,
+        count: int = 100,
+    ) -> AsyncIterator[DataStreamEntry]:
+        """Continuously consume data stream messages with checkpoint commits.
+
+        Each entry is committed after the caller's loop body completes and asks
+        for the next item. If processing fails or the iterator is closed before
+        the next item, the current entry is not committed and will be retried
+        from the checkpoint on the next consumer run. The iterator does not stop
+        on its own; callers should break on their terminal event.
+        """
+        current_id = await self.get_data_message_checkpoint(
+            session_id=session_id,
+            consumer_name=consumer_name,
+        )
+        while True:
+            entries = await self.read_data_messages(
+                session_id=session_id,
+                last_id=current_id,
+                block_ms=block_ms,
+                count=count,
+            )
+            for entry in entries:
+                yield entry
+                await self.commit_data_message(
+                    session_id=session_id,
+                    stream_id=entry.stream_id,
+                    consumer_name=consumer_name,
+                )
+                current_id = entry.stream_id
 
     async def reload_plugins_for_agent_type(
         self,

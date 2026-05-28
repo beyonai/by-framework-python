@@ -8,6 +8,7 @@ from `GatewayWorker` and running `run_worker`.
 from .client.byai_client import ByaiGatewayClient
 from .client.client import (
     CancelTaskResponse,
+    DataStreamEntry,
     GatewayClient,
     GatewayInterceptor,
     SendMessageResponse,
@@ -140,6 +141,7 @@ __all__ = [
     "GatewayClient",
     "ByaiGatewayClient",
     "GatewayInterceptor",
+    "DataStreamEntry",
     "SendMessageResponse",
     "CancelTaskResponse",
     "run_worker",

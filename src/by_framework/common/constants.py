@@ -93,6 +93,11 @@ class RedisKeys:
         return f"byai_gateway:session:{session_id}:data_stream"
 
     @staticmethod
+    def session_data_checkpoint(session_id: str, consumer_name: str) -> str:
+        """Checkpoint key storing a consumer's last processed data stream ID."""
+        return f"byai_gateway:session:{session_id}:consumer:{consumer_name}:checkpoint"
+
+    @staticmethod
     def task_group(group_id: str) -> str:
         """Task group progress tracking Hash Key."""
         return f"byai_gateway:task_group:{group_id}"

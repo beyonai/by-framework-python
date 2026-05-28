@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from by_framework import ByaiGatewayClient, GatewayClient
+from by_framework import ByaiGatewayClient, DataStreamEntry, GatewayClient
 from by_framework.common.constants import RedisKeys
 from by_framework.core.availability import RoutePolicy
 from by_framework.core.protocol.commands import (
@@ -13,6 +13,7 @@ from by_framework.core.protocol.commands import (
     ReloadPluginsCommand,
     command_from_dict,
 )
+from by_framework.core.protocol.data_message import DataMessage
 from by_framework.core.protocol.message import (BaiYingMessage, BaiYingMessageRole)
 from by_framework.errors import WorkerRegistryNotSetError
 
@@ -481,6 +482,301 @@ async def test_client_collect_reload_acks_reads_ack_stream():
     assert results[0]["status"] == "success"
     assert results[1]["worker_id"] == "worker-2"
     assert results[1]["error"] == "boom"
+
+
+@pytest.mark.asyncio
+async def test_client_read_data_messages_decodes_session_stream():
+    mock_redis = AsyncMock()
+    mock_redis.xread.return_value = [
+        [
+            RedisKeys.session_data_stream("sess-1").encode(),
+            [
+                (
+                    b"1-0",
+                    {
+                        b"data": json.dumps(
+                            {
+                                "trace_id": "trace-1",
+                                "session_id": "sess-1",
+                                "event_type": "answerDelta",
+                                "source_agent_type": "agent-a",
+                                "message_id": "msg-1",
+                                "parent_message_id": "",
+                                "timestamp": 123,
+                                "data": {"content": "hello"},
+                                "state_msg": "",
+                                "artifact_url": "",
+                                "metadata": {"k": "v"},
+                                "future_field": "ignored",
+                            }
+                        ).encode()
+                    },
+                )
+            ],
+        ]
+    ]
+
+    client = GatewayClient(redis_client=mock_redis, registry=AsyncMock())
+    entries = await client.read_data_messages(
+        session_id="sess-1",
+        last_id="0-0",
+        block_ms=10,
+        count=50,
+    )
+
+    assert entries == [
+        DataStreamEntry(
+            stream_id="1-0",
+            message=DataMessage(
+                trace_id="trace-1",
+                session_id="sess-1",
+                event_type="answerDelta",
+                source_agent_type="agent-a",
+                message_id="msg-1",
+                parent_message_id="",
+                timestamp=123,
+                data={"content": "hello"},
+                metadata={"k": "v"},
+            ),
+        )
+    ]
+    mock_redis.xread.assert_awaited_once_with(
+        streams={RedisKeys.session_data_stream("sess-1"): "0-0"},
+        count=50,
+        block=10,
+    )
+
+
+@pytest.mark.asyncio
+async def test_client_iter_data_messages_advances_last_id():
+    mock_redis = AsyncMock()
+    mock_redis.xread.side_effect = [
+        [
+            [
+                RedisKeys.session_data_stream("sess-1"),
+                [
+                    (
+                        "1-0",
+                        {
+                            "data": json.dumps(
+                                {
+                                    "trace_id": "trace-1",
+                                    "session_id": "sess-1",
+                                    "event_type": "answerDelta",
+                                    "data": {"content": "first"},
+                                }
+                            )
+                        },
+                    )
+                ],
+            ]
+        ],
+        [
+            [
+                RedisKeys.session_data_stream("sess-1"),
+                [
+                    (
+                        "2-0",
+                        {
+                            "data": json.dumps(
+                                {
+                                    "trace_id": "trace-1",
+                                    "session_id": "sess-1",
+                                    "event_type": "answerDelta",
+                                    "data": {"content": "second"},
+                                }
+                            )
+                        },
+                    )
+                ],
+            ]
+        ],
+    ]
+
+    client = GatewayClient(redis_client=mock_redis, registry=AsyncMock())
+    iterator = client.iter_data_messages(
+        session_id="sess-1",
+        last_id="0-0",
+        block_ms=1,
+        count=1,
+    )
+
+    first = await iterator.__anext__()
+    second = await iterator.__anext__()
+    await iterator.aclose()
+
+    assert first.stream_id == "1-0"
+    assert first.message.data == {"content": "first"}
+    assert second.stream_id == "2-0"
+    assert second.message.data == {"content": "second"}
+    assert mock_redis.xread.await_args_list[0].kwargs["streams"] == {
+        RedisKeys.session_data_stream("sess-1"): "0-0"
+    }
+    assert mock_redis.xread.await_args_list[1].kwargs["streams"] == {
+        RedisKeys.session_data_stream("sess-1"): "1-0"
+    }
+
+
+@pytest.mark.asyncio
+async def test_client_data_message_checkpoint_defaults_to_start():
+    mock_redis = AsyncMock()
+    mock_redis.get.return_value = None
+
+    client = GatewayClient(redis_client=mock_redis, registry=AsyncMock())
+    checkpoint = await client.get_data_message_checkpoint(
+        session_id="sess-1",
+        consumer_name="frontend",
+    )
+
+    assert checkpoint == "0-0"
+    assert (
+        RedisKeys.session_data_checkpoint("sess-1", "frontend")
+        == "byai_gateway:session:sess-1:consumer:frontend:checkpoint"
+    )
+    mock_redis.get.assert_awaited_once_with(
+        RedisKeys.session_data_checkpoint("sess-1", "frontend")
+    )
+
+
+@pytest.mark.asyncio
+async def test_client_commit_data_message_persists_checkpoint():
+    mock_redis = AsyncMock()
+
+    client = GatewayClient(redis_client=mock_redis, registry=AsyncMock())
+    await client.commit_data_message(
+        session_id="sess-1",
+        stream_id="2-0",
+        consumer_name="frontend",
+    )
+
+    mock_redis.set.assert_awaited_once_with(
+        RedisKeys.session_data_checkpoint("sess-1", "frontend"),
+        "2-0",
+        ex=RedisKeys.DEFAULT_SESSION_TTL,
+    )
+
+
+@pytest.mark.asyncio
+async def test_client_read_data_messages_from_checkpoint_auto_commits_last_entry():
+    mock_redis = AsyncMock()
+    mock_redis.get.return_value = b"1-0"
+    mock_redis.xread.return_value = [
+        [
+            RedisKeys.session_data_stream("sess-1"),
+            [
+                (
+                    "2-0",
+                    {
+                        "data": json.dumps(
+                            {
+                                "trace_id": "trace-1",
+                                "session_id": "sess-1",
+                                "event_type": "answerDelta",
+                                "data": {"content": "second"},
+                            }
+                        )
+                    },
+                ),
+                (
+                    "3-0",
+                    {
+                        "data": json.dumps(
+                            {
+                                "trace_id": "trace-1",
+                                "session_id": "sess-1",
+                                "event_type": "answerDelta",
+                                "data": {"content": "third"},
+                            }
+                        )
+                    },
+                ),
+            ],
+        ]
+    ]
+
+    client = GatewayClient(redis_client=mock_redis, registry=AsyncMock())
+    entries = await client.read_data_messages_from_checkpoint(
+        session_id="sess-1",
+        consumer_name="frontend",
+        auto_commit=True,
+    )
+
+    assert [entry.stream_id for entry in entries] == ["2-0", "3-0"]
+    mock_redis.xread.assert_awaited_once_with(
+        streams={RedisKeys.session_data_stream("sess-1"): "1-0"},
+        count=100,
+        block=0,
+    )
+    mock_redis.set.assert_awaited_once_with(
+        RedisKeys.session_data_checkpoint("sess-1", "frontend"),
+        "3-0",
+        ex=RedisKeys.DEFAULT_SESSION_TTL,
+    )
+
+
+@pytest.mark.asyncio
+async def test_client_consume_data_messages_commits_after_each_processed_entry():
+    mock_redis = AsyncMock()
+    mock_redis.get.return_value = "0-0"
+    mock_redis.xread.side_effect = [
+        [
+            [
+                RedisKeys.session_data_stream("sess-1"),
+                [
+                    (
+                        "1-0",
+                        {
+                            "data": json.dumps(
+                                {
+                                    "trace_id": "trace-1",
+                                    "session_id": "sess-1",
+                                    "event_type": "answerDelta",
+                                    "data": {"content": "first"},
+                                }
+                            )
+                        },
+                    ),
+                    (
+                        "2-0",
+                        {
+                            "data": json.dumps(
+                                {
+                                    "trace_id": "trace-1",
+                                    "session_id": "sess-1",
+                                    "event_type": "answerDelta",
+                                    "data": {"content": "second"},
+                                }
+                            )
+                        },
+                    ),
+                ],
+            ]
+        ],
+        [],
+    ]
+
+    client = GatewayClient(redis_client=mock_redis, registry=AsyncMock())
+    iterator = client.consume_data_messages(
+        session_id="sess-1",
+        consumer_name="frontend",
+        block_ms=1,
+        count=2,
+    )
+
+    first = await iterator.__anext__()
+    assert first.stream_id == "1-0"
+    mock_redis.set.assert_not_awaited()
+
+    second = await iterator.__anext__()
+    assert second.stream_id == "2-0"
+    mock_redis.set.assert_awaited_once_with(
+        RedisKeys.session_data_checkpoint("sess-1", "frontend"),
+        "1-0",
+        ex=RedisKeys.DEFAULT_SESSION_TTL,
+    )
+
+    await iterator.aclose()
+    assert mock_redis.set.await_count == 1
 
 
 @pytest.mark.asyncio

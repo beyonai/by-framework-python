@@ -1,6 +1,6 @@
 [project]
 name = "by-framework-history-byclaw"
-version = "0.0.3.dev0"
+version = "0.0.3"
 description = "ByClaw remote history backend for by-framework"
 readme = "README.md"
 requires-python = ">=3.12"
