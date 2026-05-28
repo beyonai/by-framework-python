@@ -1,11 +1,11 @@
 # pylint: disable=C0114,C0301,R0914,W0718
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Dict, List, Optional
 
 import httpx
-import json
 from by_framework.common.logger import get_logger
 from by_framework.core.discovery import DiscoveryClient
 from by_framework.core.runtime.history.base import BaseHistoryBackend
@@ -154,11 +154,11 @@ class ByClawHistoryBackend(BaseHistoryBackend):
             )
             # 兼容多种字段名：messageContent 是 ByClaw 风格，content 是标准风格
             raw_content = item.get("messageContent") or item.get("content") or ""
-            relatedResources = item.get("relatedResources")
+            related_resources = item.get("relatedResources")
             files = []
-            if relatedResources:
+            if related_resources:
                 try:
-                    res_dict = json.loads(relatedResources)
+                    res_dict = json.loads(related_resources)
                     files = res_dict.get("files") or []
                 except Exception:
                     pass
@@ -170,7 +170,7 @@ class ByClawHistoryBackend(BaseHistoryBackend):
                         "type": "text",
                         "text": raw_content
                     })
-                
+
                 if files:
                     for f in files:
                         content_list.append({
@@ -185,7 +185,6 @@ class ByClawHistoryBackend(BaseHistoryBackend):
                 }
                 transformed.append(message)
 
-            
         return transformed
 
     async def save_message(
