@@ -111,12 +111,24 @@ class TestLoggerIntegration(unittest.TestCase):
         """Test that logs can be written to file."""
         import os
 
+        from by_framework import setup_logging
+
         log_file = "by-framework.log"
-        # Save original logger level
+        # Save original logger level and handlers
         original_level = self.logger.level
+        original_handlers = list(self.logger.handlers)
+
+        # Clear current handlers so setup_logging can configure it with the file handler
+        self.logger.handlers = []
+
         try:
-            # Set logger level to DEBUG so debug logs can be captured by file handler
-            self.logger.setLevel(logging.DEBUG)
+            # Reconfigure logger with file output enabled
+            setup_logging(
+                name="by-framework",
+                level=logging.DEBUG,
+                log_file=log_file,
+            )
+
             self.logger.info("Test log file output")
             self.logger.debug("Debug log entry")
             self.logger.warning("Warning log entry")
@@ -129,14 +141,25 @@ class TestLoggerIntegration(unittest.TestCase):
             self.assertTrue(os.path.getsize(log_file) > 0, "Log file content is empty")
 
             # Verify log content
-            with open(log_file, "r") as f:
+            with open(log_file, "r", encoding="utf-8") as f:
                 content = f.read()
                 self.assertIn("Test log file output", content)
                 self.assertIn("Debug log entry", content)
                 self.assertIn("Warning log entry", content)
         finally:
-            # Restore original logger level
+            # Restore original logger level and handlers
+            # Close handlers configured during this test to release file handles
+            for handler in self.logger.handlers:
+                handler.close()
+            self.logger.handlers = original_handlers
             self.logger.setLevel(original_level)
+
+            # Clean up the log file
+            if os.path.exists(log_file):
+                try:
+                    os.remove(log_file)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
