@@ -427,6 +427,7 @@ async def test_langfuse_plugin_child_task_does_not_become_trace_root():
 
 def test_sdk_tracer_preserves_root_observation_for_trace_name():
     """SDK adapter only clears Langfuse root promotion for nested observations."""
+    pytest.importorskip("langfuse")
     client = FakeSdkClient()
     tracer = langfuse_module._SdkLangfuseTracer(client)  # pylint: disable=protected-access
 
