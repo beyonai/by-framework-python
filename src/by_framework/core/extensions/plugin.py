@@ -16,7 +16,8 @@ from typing import TYPE_CHECKING, Any, List, Type
 from .agent_config import AgentConfig
 
 if TYPE_CHECKING:
-    from by_framework.core.protocol.commands import (AskAgentCommand, CancelTaskCommand)
+    from by_framework.core.protocol.commands import (AskAgentCommand,
+                                                     CancelTaskCommand)
     from by_framework.worker.context import AgentContext
     from by_framework.worker.worker import GatewayWorker
 

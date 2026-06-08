@@ -25,6 +25,8 @@ class MessageHeader:
         user_code: User code, used for multi-user isolation
         user_name: User name
         metadata: Extra metadata dictionary
+        trace_parent_span_id: Parent span ID hex for OpenTelemetry/Phoenix tracing
+        langfuse_parent_observation_id: Parent observation ID for Langfuse tracing
     """
 
     message_id: str
@@ -37,6 +39,8 @@ class MessageHeader:
     user_code: str = ""
     user_name: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    trace_parent_span_id: str = ""
+    langfuse_parent_observation_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -50,6 +54,8 @@ class MessageHeader:
             "user_code": self.user_code,
             "user_name": self.user_name,
             "metadata": dict(self.metadata),
+            "trace_parent_span_id": self.trace_parent_span_id,
+            "langfuse_parent_observation_id": self.langfuse_parent_observation_id,
         }
 
     @classmethod
@@ -65,4 +71,8 @@ class MessageHeader:
             user_code=data.get("user_code", ""),
             user_name=data.get("user_name", ""),
             metadata=dict(data.get("metadata", {})),
+            trace_parent_span_id=data.get("trace_parent_span_id", ""),
+            langfuse_parent_observation_id=data.get(
+                "langfuse_parent_observation_id", ""
+            ),
         )

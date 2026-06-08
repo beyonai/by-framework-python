@@ -18,6 +18,7 @@ from by_framework.common.constants import (
     MESSAGE_ID_PREFIX,
     RedisKeys,
 )
+from by_framework.common.logger import logger
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.availability import (
     AvailabilityRouter,
@@ -42,6 +43,11 @@ from by_framework.core.protocol.responses import (
 )
 from by_framework.core.registry import WorkerRegistry
 from by_framework.errors import WorkerRegistryNotSetError
+from by_framework.observability.span_recorder import (
+    SpanRecorder,
+    TraceSpan,
+    str_to_uint64,
+)
 
 if TYPE_CHECKING:
     pass
@@ -86,12 +92,14 @@ class GatewayClient:
         registry: Optional[WorkerRegistry] = None,
         redis_client: Optional[Redis] = None,
         interceptors: Optional[List[GatewayInterceptor]] = None,
+        span_recorder: Optional[SpanRecorder] = None,
     ):
         self.registry = registry
         self.redis = (
             redis_client or (registry.redis if registry else None) or get_redis()
         )
         self.interceptors = interceptors or []
+        self.span_recorder = span_recorder or SpanRecorder(self.redis)
 
     def add_interceptor(self, interceptor: GatewayInterceptor):
         self.interceptors.append(interceptor)
@@ -516,11 +524,16 @@ class GatewayClient:
             )
 
             if node_worker_id:
+                node_trace_id = (
+                    node.get("trace_id")
+                    or execution.get("trace_id")
+                    or uuid.uuid4().hex
+                )
                 cancel_command = CancelTaskCommand(
                     header=MessageHeader(
                         message_id=f"{CANCEL_MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}",
                         session_id=session_id,
-                        trace_id=uuid.uuid4().hex,
+                        trace_id=node_trace_id,
                         target_agent_type=node.get("target_agent_type", ""),
                         parent_message_id=node_message_id,
                     ),
@@ -599,6 +612,32 @@ class GatewayClient:
         if not trace_id:
             trace_id = uuid.uuid4().hex
 
+        metadata = dict(params.get("metadata", {}) or {})
+        trace_parent_span_id = metadata.pop("trace_parent_span_id", "")
+        langfuse_parent_observation_id = metadata.pop(
+            "langfuse_parent_observation_id", ""
+        )
+        if not trace_parent_span_id:
+            trace_parent_span_id = (
+                f"{str_to_uint64(f'{message_id}:client.dispatch'):016x}"
+            )
+
+        langfuse_client_dispatch = None
+        if not params["parent_message_id"]:
+            langfuse_client_dispatch = self._start_langfuse_client_dispatch_observation(
+                trace_id=trace_id,
+                message_id=message_id,
+                target_agent_type=params["target_agent_type"],
+                session_id=params["session_id"],
+                user_code=params["user_code"],
+                user_name=params["user_name"],
+                content=params["content"],
+                metadata=metadata,
+            )
+            observation_id = getattr(langfuse_client_dispatch, "id", "")
+            if observation_id:
+                langfuse_parent_observation_id = observation_id
+
         header = MessageHeader(
             message_id=message_id,
             session_id=params["session_id"],
@@ -607,7 +646,9 @@ class GatewayClient:
             parent_message_id=params["parent_message_id"],
             user_code=params["user_code"],
             user_name=params["user_name"],
-            metadata=params["metadata"],
+            metadata=metadata,
+            trace_parent_span_id=trace_parent_span_id,
+            langfuse_parent_observation_id=langfuse_parent_observation_id,
         )
         command = self._build_gateway_command(
             action_type=params["action_type"],
@@ -626,6 +667,7 @@ class GatewayClient:
                     route_policy != RoutePolicy.SEND_ANYWAY,
                 )
             else:
+                avail_start_ms = int(time.time() * 1000)
                 availability = await AvailabilityRouter(
                     self.redis, self.registry
                 ).prepare_delivery(
@@ -645,13 +687,42 @@ class GatewayClient:
                         metadata=params["metadata"],
                     )
                 )
+                try:
+                    from by_framework.observability.metrics import record_availability_metrics
+
+                    record_availability_metrics(
+                        agent_type=params["target_agent_type"],
+                        policy=route_policy,
+                        status=availability.status,
+                        routing_ms=float(int(time.time() * 1000) - avail_start_ms),
+                    )
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
                 if availability.status not in (
                     AvailabilityStatus.DELIVER_NOW,
                     AvailabilityStatus.WAIT_AND_DELIVER,
                     AvailabilityStatus.FALLBACK_TO_OTHER_AGENT_TYPE,
                     AvailabilityStatus.QUEUE_PENDING,
                 ):
-                    return SendMessageResponse(
+                    if self.registry and hasattr(
+                        self.registry, "record_failed_route_decision"
+                    ):
+                        await self.registry.record_failed_route_decision(
+                            execution_id=execution_id,
+                            message_id=message_id,
+                            session_id=params["session_id"],
+                            trace_id=trace_id,
+                            target_agent_type=params["target_agent_type"],
+                            parent_message_id=params["parent_message_id"] or "",
+                            source_agent_type="client",
+                            route_policy=route_policy,
+                            route_status=availability.status,
+                            stream_name=availability.stream_name or "",
+                            selected_agent_type=availability.selected_agent_type or "",
+                            availability_error_code=availability.error_code or "",
+                            availability_error=availability.error or "",
+                        )
+                    response = SendMessageResponse(
                         success=False,
                         status=ExecutionStatus.FAILED,
                         message_id="",
@@ -662,6 +733,12 @@ class GatewayClient:
                         error_code=availability.error_code
                         or ExecutionStatus.ERR_AGENT_TYPE_UNAVAILABLE,
                     )
+                    self._end_langfuse_client_dispatch_observation(
+                        langfuse_client_dispatch,
+                        output={"success": False, "error": availability.error},
+                        error=availability.error,
+                    )
+                    return response
                 if availability.status == AvailabilityStatus.QUEUE_PENDING:
                     should_dispatch_control = False
                 route = RouteResolution(
@@ -672,6 +749,11 @@ class GatewayClient:
                     params["target_agent_type"] = availability.selected_agent_type
                     command.header.target_agent_type = availability.selected_agent_type
         except LookupError as err:
+            self._end_langfuse_client_dispatch_observation(
+                langfuse_client_dispatch,
+                output={"success": False, "error": str(err)},
+                error=str(err),
+            )
             return SendMessageResponse(
                 success=False,
                 status=ExecutionStatus.FAILED,
@@ -683,6 +765,11 @@ class GatewayClient:
                 error_code=ExecutionStatus.ERR_WORKER_NOT_ONLINE,
             )
         except ValueError as err:
+            self._end_langfuse_client_dispatch_observation(
+                langfuse_client_dispatch,
+                output={"success": False, "error": str(err)},
+                error=str(err),
+            )
             return SendMessageResponse(
                 success=False,
                 status=ExecutionStatus.FAILED,
@@ -708,16 +795,44 @@ class GatewayClient:
                         "target_agent_type": params["target_agent_type"],
                         "stream_name": route.stream_name,
                         "status": "QUEUED",
+                        "route_policy": route_policy,
+                        "route_status": availability.status
+                        if not target_worker_id
+                        else "DIRECT_WORKER",
+                        "selected_agent_type": availability.selected_agent_type
+                        if not target_worker_id
+                        else "",
+                        "availability_error_code": availability.error_code
+                        if not target_worker_id
+                        else "",
+                        "availability_error": availability.error
+                        if not target_worker_id
+                        else "",
                     }
                 )
             except Exception:  # pylint: disable=broad-exception-caught
                 pass  # Fallback if registry fails
 
         # 4. Route to the appropriate stream
+        dispatch_started_at = int(time.time() * 1000)
         if should_dispatch_control:
             await self.redis.xadd(route.stream_name, command.to_redis_payload())
+        await self._record_client_dispatch_span(
+            trace_id=trace_id,
+            message_id=message_id,
+            session_id=params["session_id"],
+            parent_message_id=params["parent_message_id"] or "",
+            target_agent_type=params["target_agent_type"],
+            target_worker_id=route.target_worker_id,
+            route_policy=route_policy,
+            route_status=availability.status
+            if not target_worker_id
+            else "DIRECT_WORKER",
+            start_ts=dispatch_started_at,
+            end_ts=int(time.time() * 1000),
+        )
 
-        return SendMessageResponse(
+        response = SendMessageResponse(
             success=True,
             message_id=message_id,
             trace_id=trace_id,
@@ -725,3 +840,118 @@ class GatewayClient:
             timestamp=int(time.time() * 1000),
             status=ExecutionStatus.QUEUED,
         )
+        self._end_langfuse_client_dispatch_observation(
+            langfuse_client_dispatch,
+            output={
+                "success": True,
+                "message_id": message_id,
+                "trace_id": trace_id,
+                "target_worker_id": route.target_worker_id,
+                "status": response.status,
+            },
+        )
+        return response
+
+    def _start_langfuse_client_dispatch_observation(
+        self,
+        *,
+        trace_id: str,
+        message_id: str,
+        target_agent_type: str,
+        session_id: str,
+        user_code: str,
+        user_name: str,
+        content: Any,
+        metadata: Dict[str, Any],
+    ) -> Any:
+        try:
+            from by_framework_trace_langfuse import start_client_dispatch_observation
+
+            return start_client_dispatch_observation(
+                trace_id=trace_id,
+                message_id=message_id,
+                target_agent_type=target_agent_type,
+                session_id=session_id,
+                user_code=user_code,
+                user_name=user_name,
+                content=content,
+                metadata=metadata,
+            )
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "Langfuse client.dispatch observation skipped: %s",
+                err,
+                exc_info=True,
+            )
+            return None
+
+    @staticmethod
+    def _end_langfuse_client_dispatch_observation(
+        observation: Any,
+        *,
+        output: Any,
+        error: str = "",
+    ) -> None:
+        if observation is None:
+            return
+        try:
+            if error and hasattr(observation, "update"):
+                observation.update(level="ERROR", status_message=error)
+            observation.end(output=output)
+        except TypeError:
+            try:
+                observation.update(output=output)
+                observation.end()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
+    async def _record_client_dispatch_span(
+        self,
+        *,
+        trace_id: str,
+        message_id: str,
+        session_id: str,
+        parent_message_id: str,
+        target_agent_type: str,
+        target_worker_id: str,
+        route_policy: str,
+        route_status: str,
+        start_ts: int,
+        end_ts: int,
+    ) -> None:
+        try:
+            logger.info(
+                "Recording client dispatch span: message_id=%s, trace_id=%s",
+                message_id,
+                trace_id,
+            )
+            await self.span_recorder.record_span(
+                TraceSpan(
+                    trace_id=trace_id,
+                    span_id=f"{message_id}:client.dispatch",
+                    parent_span_id="",
+                    operation="client.dispatch",
+                    component="client",
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                    status="COMPLETED",
+                    session_id=session_id,
+                    message_id=message_id,
+                    parent_message_id=parent_message_id,
+                    worker_id=target_worker_id,
+                    source_agent_type="client",
+                    target_agent_type=target_agent_type,
+                    route_policy=route_policy,
+                    route_status=route_status,
+                )
+            )
+            logger.info(
+                "Client dispatch span recorded successfully for message_id=%s",
+                message_id,
+            )
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "Failed to record client dispatch span: %s", err, exc_info=True
+            )

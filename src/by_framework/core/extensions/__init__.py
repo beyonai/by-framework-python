@@ -8,15 +8,9 @@ managed through the form of plugins.
 """
 
 from .agent_config import AgentConfig, CallbackType
-from .plugin import (
-    AgentConfigsSnapshot,
-    Plugin,
-    PluginBuildContext,
-    PluginManifest,
-    PluginReloadContext,
-    PluginReloadResult,
-    PromptTemplate,
-)
+from .plugin import (AgentConfigsSnapshot, Plugin, PluginBuildContext,
+                     PluginManifest, PluginReloadContext, PluginReloadResult,
+                     PromptTemplate)
 from .registry import PluginRegistry
 from .trace_provider import TraceProviderFactory
 

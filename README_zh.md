@@ -608,11 +608,34 @@ import logging
 setup_logging(level=logging.INFO, use_json=True)  # JSON 格式便于日志聚合
 ```
 
+### 可观测仪表盘
+
+启动内置仪表盘，用于查看 Worker 健康、Agent 健康、执行状态计数、最近执行、Redis Stream 队列深度、consumer group pending/lag、失败详情、路由决策、派生告警，以及排队/执行/端到端分段延迟：
+
+```bash
+uv run python -m by_framework.observability.dashboard --host 127.0.0.1 --port 8765
+```
+
+打开 `http://127.0.0.1:8765/`。如果本地没有 Redis，可打开
+`http://127.0.0.1:8765/?demo=1` 预览 UI。Prometheus 风格指标位于
+`http://127.0.0.1:8765/metrics`，仪表盘也会在
+`http://127.0.0.1:8765/api/history` 保留短期内存趋势历史。UI 使用拆分后的
+轮询接口（`/api/workers`、`/api/executions`、`/api/queues`、`/api/history`），
+不会每次刷新都请求完整的 `/api/snapshot`。运行时自检数据位于
+`/api/health`，会显示在工具栏中，也会通过 `/metrics` 导出。
+告警阈值可通过 `--queue-backlog-threshold`、
+`--delivery-pending-threshold`、`--consumer-pending-threshold` 和
+`--failed-execution-threshold` 调整。
+
+仪表盘前端使用 React/Vite 构建，源码位于
+`src/by_framework/observability/frontend`，生产构建产物打包在
+`src/by_framework/observability/static`。
+
 ---
 
 ## 路线图
 
-- [ ] Worker 健康与任务流的可观测仪表盘
+- [x] Worker 健康与任务流的可观测仪表盘
 - [ ] 基于 WASM 的沙箱，实现更强隔离
 - [ ] 增强的 LangGraph 多 Agent 编排适配器
 

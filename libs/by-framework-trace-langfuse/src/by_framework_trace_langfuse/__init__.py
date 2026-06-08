@@ -1,5 +1,17 @@
 """Langfuse trace provider package for by-framework."""
 
-from .langfuse import (LangfuseConfig, LangfusePlugin, LangfuseTraceProviderFactory)
+from .langfuse import (
+    LANGFUSE_PARENT_OBSERVATION_METADATA_KEY,
+    LangfuseConfig,
+    LangfusePlugin,
+    LangfuseTraceProviderFactory,
+    start_client_dispatch_observation,
+)
 
-__all__ = ["LangfuseConfig", "LangfusePlugin", "LangfuseTraceProviderFactory"]
+__all__ = [
+    "LANGFUSE_PARENT_OBSERVATION_METADATA_KEY",
+    "LangfuseConfig",
+    "LangfusePlugin",
+    "LangfuseTraceProviderFactory",
+    "start_client_dispatch_observation",
+]

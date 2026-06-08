@@ -96,7 +96,9 @@ class PhoenixPlugin(Plugin):
         # Reinforce instrumentation for LangChain and OpenAI
         # This ensures they are patched even if imported before register()
         try:
-            from openinference.instrumentation.langchain import LangChainInstrumentor
+            import openinference.instrumentation.langchain as lc_otel  # type: ignore
+
+            LangChainInstrumentor = lc_otel.LangChainInstrumentor  # pylint: disable=invalid-name
 
             if not LangChainInstrumentor().is_instrumented_by_opentelemetry:
                 LangChainInstrumentor().instrument(
@@ -106,7 +108,9 @@ class PhoenixPlugin(Plugin):
             pass
 
         try:
-            from openinference.instrumentation.openai import OpenAIInstrumentor
+            import openinference.instrumentation.openai as oa_otel  # type: ignore
+
+            OpenAIInstrumentor = oa_otel.OpenAIInstrumentor  # pylint: disable=invalid-name
 
             if not OpenAIInstrumentor().is_instrumented_by_opentelemetry:
                 OpenAIInstrumentor().instrument(tracer_provider=self._tracer_provider)
@@ -127,9 +131,33 @@ class PhoenixPlugin(Plugin):
         # Build deterministic OTEL TraceId and SpanId from framework IDs
         trace_id_int = self._str_to_uint128(identity["trace_id"])
 
+        current_command = getattr(context, "current_command", None)
+        is_resume = False
+        if current_command is not None:
+            is_resume = "ResumeCommand" in current_command.__class__.__name__
+
+        header = getattr(current_command, "header", None)
+        parent_span_id_hex = ""
+        if header is not None:
+            header_metadata = getattr(header, "metadata", {}) or {}
+            parent_span_id_hex = getattr(
+                header, "trace_parent_span_id", ""
+            ) or header_metadata.get("trace_parent_span_id", "")
+
         parent_context = None
-        if identity["parent_message_id"]:
+        parent_span_id_int = None
+
+        if not identity["parent_message_id"] and is_resume:
+            pass
+        elif parent_span_id_hex:
+            try:
+                parent_span_id_int = int(parent_span_id_hex, 16)
+            except (ValueError, TypeError):
+                pass
+        elif identity["parent_message_id"]:
             parent_span_id_int = self._str_to_uint64(identity["parent_message_id"])
+
+        if parent_span_id_int is not None:
             parent_span_context = SpanContext(
                 trace_id=trace_id_int,
                 span_id=parent_span_id_int,

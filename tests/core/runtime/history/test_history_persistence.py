@@ -5,7 +5,8 @@ import pytest
 from by_framework.core.protocol.commands import AskAgentCommand
 from by_framework.core.protocol.event_type import EventType
 from by_framework.core.protocol.message_header import MessageHeader
-from by_framework.core.runtime.history import (BaseHistoryBackend, HistoryManager)
+from by_framework.core.runtime.history import (BaseHistoryBackend,
+                                               HistoryManager)
 from by_framework.worker.context import AgentContext
 from by_framework.worker.worker import GatewayWorker
 

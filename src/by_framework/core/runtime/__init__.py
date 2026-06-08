@@ -12,10 +12,8 @@ from by_framework.core.runtime.agent_config_manager import AgentConfigManager
 from by_framework.core.runtime.agent_runtime_state import AgentRuntimeState
 from by_framework.core.runtime.file_manager import FileManager
 from by_framework.core.runtime.file_permissions import (
-    FilePermissionPolicy,
-    SessionScopedPermissionPolicy,
-    WorkspaceScopedPermissionPolicy,
-)
+    FilePermissionPolicy, SessionScopedPermissionPolicy,
+    WorkspaceScopedPermissionPolicy)
 from by_framework.core.runtime.session_manager import SessionManager
 
 __all__ = [

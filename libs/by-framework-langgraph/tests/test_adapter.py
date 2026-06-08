@@ -260,6 +260,50 @@ class TestAdapterRun:
         assert observation_calls[0]["name"] == "planner:langgraph"
 
     @pytest.mark.asyncio
+    async def test_uses_context_langfuse_callback_property(self):
+        """Verify AgentContext.langfuse_callback property value is used directly as a handler."""
+        handler = object()
+
+        # pylint: disable=too-few-public-methods,missing-class-docstring,missing-function-docstring
+        class ContextWithCallbackProperty:
+            session_id = "test-session"
+            trace_id = "trace-ctx"
+            message_id = "msg-ctx"
+            parent_message_id = ""
+            current_agent_id = "planner"
+            current_command = SimpleNamespace(
+                header=MessageHeader(
+                    message_id="msg-ctx",
+                    session_id="test-session",
+                    trace_id="trace-ctx",
+                    target_agent_type="planner",
+                )
+            )
+
+            def __init__(self):
+                self.emit_chunk = AsyncMock()
+
+            @property
+            def langfuse_callback(self):
+                return handler
+
+        ctx = ContextWithCallbackProperty()
+        graph = MagicMock()
+        graph.ainvoke = AsyncMock(
+            return_value={"messages": [MagicMock(content="hello")]}
+        )
+        snapshot = MagicMock()
+        snapshot.next = ()
+        graph.get_state.return_value = snapshot
+
+        adapter = LangGraphAdapter(graph, ctx, stream=False)
+        result = await adapter.run(AskAgentCommand(header=_make_header(), content="hi"))
+
+        assert result == "hello"
+        _, kwargs = graph.ainvoke.call_args
+        assert kwargs["config"]["callbacks"] == [handler]
+
+    @pytest.mark.asyncio
     async def test_skips_langfuse_tracing_silently_when_not_configured(
         self, monkeypatch, caplog
     ):

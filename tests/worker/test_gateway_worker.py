@@ -133,6 +133,8 @@ async def test_worker_agent_task_result_maps_to_resume_callback(tmp_path):
             target_agent_type="structured_agent",
             parent_message_id="parent-msg",
             metadata={"caller": "original", "request_id": "req-1"},
+            trace_parent_span_id="parent-span-1",
+            langfuse_parent_observation_id="parent-observation-1",
         ),
         content="hello",
     )
@@ -152,6 +154,8 @@ async def test_worker_agent_task_result_maps_to_resume_callback(tmp_path):
         "request_id": "req-1",
         "tokens": 123,
     }
+    assert callback.header.trace_parent_span_id == "parent-span-1"
+    assert callback.header.langfuse_parent_observation_id == "parent-observation-1"
 
 
 @pytest.mark.asyncio
@@ -191,6 +195,48 @@ async def test_worker_resume_message_round_trips_as_resume_command(tmp_path):
     assert isinstance(worker.last_command, ResumeCommand)
     assert worker.last_command.status == "SUCCESS"
     assert worker.last_command.reply_data == {"answer": 42}
+
+
+@pytest.mark.asyncio
+async def test_worker_received_message_log_uses_header_trace_id(tmp_path):
+    """Received-message logs should show the propagated trace id."""
+    redis_mock = AsyncMock()
+    redis_mock.pipeline = MagicMock(
+        return_value=MagicMock(xadd=MagicMock(), execute=AsyncMock(return_value=[]))
+    )
+    workspace_manager = AsyncMock()
+    workspace_manager.setup_workspace.return_value = {
+        "private": str(tmp_path),
+        "public": str(tmp_path),
+    }
+
+    worker = RecordingWorker(
+        worker_id="test-log-trace",
+        redis_client=redis_mock,
+        registry=AsyncMock(),
+        workspace_manager=workspace_manager,
+    )
+    msg = ResumeCommand(
+        header=MessageHeader(
+            message_id="m-log",
+            session_id="s-log",
+            trace_id="trace-from-header",
+            target_agent_type="recording_agent",
+        ),
+        status="SUCCESS",
+        reply_data={"answer": 42},
+    )
+
+    with patch("by_framework.worker.worker.logger.info") as info_mock:
+        await worker._handle_message(msg)
+
+    received_calls = [
+        call
+        for call in info_mock.call_args_list
+        if call.args and call.args[0] == "[%s] Received message: %s (Trace: %s)"
+    ]
+    assert received_calls
+    assert received_calls[0].args[3] == "trace-from-header"
 
 
 @pytest.mark.asyncio

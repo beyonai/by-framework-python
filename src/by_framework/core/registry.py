@@ -12,9 +12,10 @@ import random
 import time
 import uuid
 import warnings
-from typing import Any, List, Optional
+from typing import Any, List, Optional, TypedDict
 
-from by_framework.common.constants import (EXEC_FIELD_PREFIX, MSG_MAP_PREFIX, RedisKeys)
+from by_framework.common.constants import (EXEC_FIELD_PREFIX, MSG_MAP_PREFIX,
+                                           RedisKeys)
 from by_framework.common.exceptions import ExecutionDataError
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.extensions import AgentConfigsSnapshot, PluginRegistry
@@ -23,6 +24,16 @@ from by_framework.core.protocol.agent_state import is_terminal_state
 logger = logging.getLogger("by_framework.registry")
 SNAPSHOT_PAYLOAD_PREFIX = "dill-base64:"
 PRESENCE_PAYLOAD_VERSION = 1
+
+
+class ExecutionCompletionFields(TypedDict, total=False):
+    """Structured terminal metadata attached for observability."""
+
+    error_type: str
+    error_message: str
+    error_code: str
+    failed_stage: str
+    retryable: bool
 
 
 def _decode_worker_presence(raw: Any) -> tuple[Optional[str], int, bool]:
@@ -477,8 +488,12 @@ class WorkerRegistry:
             "execution_id": execution.get("execution_id", ""),
             "message_id": execution.get("message_id", ""),
             "session_id": execution.get("session_id", ""),
+            "trace_id": execution.get("trace_id", ""),
             "worker_id": execution.get("worker_id", ""),
+            "source_agent_type": execution.get("source_agent_type", ""),
             "target_agent_type": execution.get("target_agent_type", ""),
+            "stream_name": execution.get("stream_name", ""),
+            "redis_message_id": execution.get("redis_message_id", ""),
             "status": execution.get("status", ""),
             "created_at": int(execution.get("created_at", 0) or 0),
             "started_at": int(execution.get("started_at", 0) or 0),
@@ -487,6 +502,16 @@ class WorkerRegistry:
             "parent_message_id": execution.get("parent_message_id", ""),
             "cancel_requested": bool(execution.get("cancel_requested", False)),
             "cancel_reason": execution.get("cancel_reason", ""),
+            "route_policy": execution.get("route_policy", ""),
+            "route_status": execution.get("route_status", ""),
+            "selected_agent_type": execution.get("selected_agent_type", ""),
+            "availability_error_code": execution.get("availability_error_code", ""),
+            "availability_error": execution.get("availability_error", ""),
+            "error_type": execution.get("error_type", ""),
+            "error_message": execution.get("error_message", ""),
+            "error_code": execution.get("error_code", ""),
+            "failed_stage": execution.get("failed_stage", ""),
+            "retryable": bool(execution.get("retryable", False)),
         }
 
     @staticmethod
@@ -793,7 +818,11 @@ class WorkerRegistry:
         )
 
     async def mark_execution_finished(
-        self, execution_id: str, session_id: str, status: str
+        self,
+        execution_id: str,
+        session_id: str,
+        status: str,
+        completion: Optional[ExecutionCompletionFields] = None,
     ):
         """Mark execution as finished status.
 
@@ -801,6 +830,7 @@ class WorkerRegistry:
             execution_id: Execution ID
             session_id: Session ID
             status: Final status
+            completion: Optional structured terminal metadata for observability.
         """
         current = await self.get_execution(execution_id, session_id)
         if current is None:
@@ -811,6 +841,9 @@ class WorkerRegistry:
         now = int(time.time() * 1000)
         current["finished_at"] = now
         current["updated_at"] = now
+        if completion:
+            for key, value in completion.items():
+                current[key] = value
 
         timeline = current.get("timeline", [])
         timeline.append({"status": status, "timestamp": now})
@@ -856,6 +889,49 @@ class WorkerRegistry:
                 )
                 cleanup_pipe.expire(reg_key, RedisKeys.DEFAULT_SESSION_TTL)
                 await cleanup_pipe.execute()
+
+    async def record_failed_route_decision(
+        self,
+        *,
+        execution_id: str,
+        message_id: str,
+        session_id: str,
+        trace_id: str,
+        parent_message_id: str,
+        source_agent_type: str,
+        target_agent_type: str,
+        route_policy: str,
+        route_status: str,
+        stream_name: str,
+        selected_agent_type: str,
+        availability_error_code: str,
+        availability_error: str,
+    ) -> None:
+        """Persist a failed availability routing decision for the dashboard."""
+        try:
+            await self.initialize_execution(
+                {
+                    "execution_id": execution_id,
+                    "message_id": message_id,
+                    "session_id": session_id,
+                    "trace_id": trace_id,
+                    "parent_message_id": parent_message_id,
+                    "source_agent_type": source_agent_type,
+                    "target_agent_type": target_agent_type,
+                    "stream_name": stream_name,
+                    "status": "FAILED",
+                    "route_policy": route_policy,
+                    "route_status": route_status,
+                    "selected_agent_type": selected_agent_type,
+                    "availability_error_code": availability_error_code,
+                    "availability_error": availability_error,
+                    "error_code": availability_error_code,
+                    "error_message": availability_error,
+                    "failed_stage": "availability",
+                }
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
 
     async def get_all_session_executions(self, session_id: str) -> list[dict[str, Any]]:
         """Get all execution records under the specified Session.
@@ -958,12 +1034,13 @@ class WorkerRegistry:
         active_limit: int = 100,
         history_limit: int = 20,
         limit: Optional[int] = None,
+        workers: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """Get worker liveness metadata and recent execution state summary."""
         if limit is not None:
             history_limit = limit
 
-        workers = await self.get_all_workers()
+        workers = workers if workers is not None else await self.get_all_workers()
         worker_info = workers.get(worker_id, {})
         raw_counts = await self.redis.hgetall(RedisKeys.worker_status(worker_id))
         counts = {

@@ -608,11 +608,38 @@ import logging
 setup_logging(level=logging.INFO, use_json=True)  # JSON for log aggregation
 ```
 
+### Observability Dashboard
+
+Serve the built-in dashboard to inspect worker health, agent health, execution
+state counts, recent executions, Redis stream queue depth, consumer-group
+pending/lag, failure details, routing decisions, derived alerts, and segmented
+queue/run/end-to-end task latency:
+
+```bash
+uv run python -m by_framework.observability.dashboard --host 127.0.0.1 --port 8765
+```
+
+Open `http://127.0.0.1:8765/`. For a local UI preview without Redis, open
+`http://127.0.0.1:8765/?demo=1`. Prometheus-style metrics are available at
+`http://127.0.0.1:8765/metrics`, and the dashboard keeps short in-memory trend
+history at `http://127.0.0.1:8765/api/history`. The UI uses split polling
+endpoints (`/api/workers`, `/api/executions`, `/api/queues`, `/api/history`)
+instead of polling the full `/api/snapshot` endpoint on every refresh. Runtime
+self-check data is exposed at `/api/health`, shown in the toolbar, and exported
+through `/metrics`.
+Alert thresholds can be tuned with `--queue-backlog-threshold`,
+`--delivery-pending-threshold`, `--consumer-pending-threshold`, and
+`--failed-execution-threshold`.
+
+The dashboard frontend is built with React/Vite under
+`src/by_framework/observability/frontend`; its production build is packaged in
+`src/by_framework/observability/static`.
+
 ---
 
 ## Roadmap
 
-- [ ] Observability dashboard for Worker health and task streams
+- [x] Observability dashboard for Worker health and task streams
 - [ ] WASM-based sandbox for stronger execution isolation
 - [ ] Enhanced LangGraph multi-agent orchestration adapter
 

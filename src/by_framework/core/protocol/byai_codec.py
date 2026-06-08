@@ -5,13 +5,8 @@ from enum import Enum
 from typing import Any
 
 from .content_codec import ContentCodec, WireContent
-from .message import (
-    BaiYingMessage,
-    BaiYingMessageRole,
-    MessageContent,
-    MessageFile,
-    Resource,
-)
+from .message import (BaiYingMessage, BaiYingMessageRole, MessageContent,
+                      MessageFile, Resource)
 
 
 def serialize_byai_content(content: Any) -> Any:

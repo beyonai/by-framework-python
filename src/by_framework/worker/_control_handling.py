@@ -55,6 +55,7 @@ async def handle_cancel_task(
     redis_client,  # pylint: disable=unused-argument
     group_name: str,  # pylint: disable=unused-argument
     worker,
+    span_recorder=None,
 ) -> None:
     """
     Handle a CancelTaskCommand.
@@ -96,6 +97,35 @@ async def handle_cancel_task(
             running.task.cancel(msg=reason)
         else:
             running.task.cancel()
+
+        # Record a cancel span so the operation is visible in traces.
+        if span_recorder is not None:
+            import time as _time
+
+            from by_framework.observability.span_recorder import TraceSpan
+
+            now_ms = int(_time.time() * 1000)
+            try:
+                await span_recorder.record_span(
+                    TraceSpan(
+                        trace_id=command.header.trace_id,
+                        span_id=f"{running.execution_id}:agent.cancel",
+                        parent_span_id=f"{running.execution_id}:worker.execute",
+                        operation="agent.cancel",
+                        component="worker",
+                        start_ts=now_ms,
+                        end_ts=now_ms,
+                        status="CANCELLED",
+                        session_id=running.session_id,
+                        execution_id=running.execution_id,
+                        message_id=running.message_id,
+                        parent_message_id=running.parent_message_id,
+                        worker_id=running.worker_id,
+                        metadata={"cancel_reason": reason or ""},
+                    )
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
 
 
 async def handle_reload_plugins(command: ReloadPluginsCommand, worker) -> None:

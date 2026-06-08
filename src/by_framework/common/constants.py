@@ -98,6 +98,31 @@ class RedisKeys:
         return f"byai_gateway:session:{session_id}:consumer:{consumer_name}:checkpoint"
 
     @staticmethod
+    def trace_meta(trace_id: str) -> str:
+        """Hash storing trace-level metadata for observability."""
+        return f"by_framework:trace:{trace_id}"
+
+    @staticmethod
+    def trace_spans(trace_id: str) -> str:
+        """List storing trace span JSON payloads ordered by write time."""
+        return f"by_framework:trace:spans:{trace_id}"
+
+    @staticmethod
+    def trace_index_session(session_id: str) -> str:
+        """Sorted Set index from session_id to trace IDs."""
+        return f"by_framework:trace:idx:session:{session_id}"
+
+    @staticmethod
+    def trace_index_worker(worker_id: str) -> str:
+        """Sorted Set index from worker_id to trace IDs."""
+        return f"by_framework:trace:idx:worker:{worker_id}"
+
+    @staticmethod
+    def trace_index_agent(agent_type: str) -> str:
+        """Sorted Set index from agent type to trace IDs."""
+        return f"by_framework:trace:idx:agent:{agent_type}"
+
+    @staticmethod
     def task_group(group_id: str) -> str:
         """Task group progress tracking Hash Key."""
         return f"byai_gateway:task_group:{group_id}"

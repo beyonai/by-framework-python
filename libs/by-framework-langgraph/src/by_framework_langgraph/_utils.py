@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any
 
 from by_framework.core.protocol.commands import ResumeCommand
@@ -52,13 +51,3 @@ def extract_resume_data(command: ResumeCommand) -> str:
         return extract_content_text(command.content)
 
     return ""
-
-
-def str_to_uint128(s: str) -> int:
-    """Convert a string to a 128-bit integer (for OTEL TraceId)."""
-    return int(hashlib.md5(s.encode()).hexdigest(), 16)
-
-
-def str_to_uint64(s: str) -> int:
-    """Convert a string to a 64-bit integer (for OTEL SpanId)."""
-    return int(hashlib.md5(s.encode()).hexdigest()[:16], 16)

@@ -48,7 +48,7 @@ from by_framework.core.protocol.results import (
 )
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.runtime.filestore.base import FileStorage
-from by_framework.worker.context import AgentContext
+from by_framework.worker.context import AgentContext, current_agent_context_var
 from by_framework.worker.heartbeat import WorkerHeartbeat
 
 from .sandbox.hook_sandbox import active_workspace
@@ -316,6 +316,10 @@ class GatewayWorker(ABC):
                 user_code=user_code if user_code else "",
                 user_name=user_name if user_name else "",
                 metadata=merged_metadata,
+                trace_parent_span_id=header.trace_parent_span_id
+                or header.metadata.get("trace_parent_span_id", ""),
+                langfuse_parent_observation_id=header.langfuse_parent_observation_id
+                or header.metadata.get("langfuse_parent_observation_id", ""),
             ),
             status=status,
             content=content,
@@ -449,6 +453,7 @@ class GatewayWorker(ABC):
             content_codec=self.get_content_codec(),
             layout_builder=self.get_data_layout_builder(),
             is_sub_agent=has_source_agent,
+            execution_id=execution.execution_id if execution else "",
         )
         if execution:
             execution.context = context
@@ -458,13 +463,14 @@ class GatewayWorker(ABC):
             "[%s] Received message: %s (Trace: %s)",
             self.worker_id,
             header.message_id,
-            trace_id,
+            context.trace_id,
         )
         logger.info(
             "[%s] Target Agent Type: %s", self.worker_id, header.target_agent_type
         )
         logger.info("[%s] Session ID: %s", self.worker_id, header.session_id)
 
+        ctx_token = current_agent_context_var.set(context)
         token = None
         try:
             # Call plugin hooks at task start
@@ -516,7 +522,9 @@ class GatewayWorker(ABC):
                 if header.task_group_id:
                     group_key = RedisKeys.task_group(header.task_group_id)
                     results_key = RedisKeys.task_group_results(header.task_group_id)
-                    total_str = await self.redis.hget(group_key, TASK_GROUP_FIELD_TOTAL)
+                    total_str = await self.redis.hget(  # type: ignore
+                        group_key, TASK_GROUP_FIELD_TOTAL
+                    )
                     if total_str is not None:
                         # Store result in Redis Hash for distributed access
                         if isinstance(raw_command, ResumeCommand):
@@ -527,14 +535,14 @@ class GatewayWorker(ABC):
                                 "metadata": raw_command.header.metadata,
                                 "extra_payload": raw_command.extra_payload,
                             }
-                            await self.redis.hset(
+                            await self.redis.hset(  # type: ignore
                                 results_key,
                                 header.message_id,
                                 json.dumps(result_data),
                             )
                             await self.redis.expire(results_key, TASK_GROUP_TTL_SECONDS)
 
-                        completed = await self.redis.hincrby(
+                        completed = await self.redis.hincrby(  # type: ignore
                             group_key, TASK_GROUP_FIELD_COMPLETED, 1
                         )
                         if completed < int(total_str):
@@ -695,8 +703,17 @@ class GatewayWorker(ABC):
             else:
                 await context.flush_to_history()
 
-            return AgentTaskResult(status=AgentState.FAILED.value)
+            return AgentTaskResult(
+                status=AgentState.FAILED.value,
+                reply_data={"error": str(e)},
+                metadata={
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "failed_stage": "process_command",
+                },
+            )
         finally:
+            current_agent_context_var.reset(ctx_token)
             # 4. Cleanup
             if token is not None:
                 active_workspace.reset(token)

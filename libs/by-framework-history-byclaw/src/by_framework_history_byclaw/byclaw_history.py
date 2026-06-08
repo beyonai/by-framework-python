@@ -166,17 +166,11 @@ class ByClawHistoryBackend(BaseHistoryBackend):
             if role and (raw_content or files):
                 content_list = []
                 if raw_content:
-                    content_list.append({
-                        "type": "text",
-                        "text": raw_content
-                    })
+                    content_list.append({"type": "text", "text": raw_content})
 
                 if files:
                     for f in files:
-                        content_list.append({
-                            "type": "file",
-                            "file": f
-                        })
+                        content_list.append({"type": "file", "file": f})
 
                 message = {
                     "role": role,

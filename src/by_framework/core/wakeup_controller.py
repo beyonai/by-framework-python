@@ -8,11 +8,9 @@ from typing import Any, Protocol
 
 from by_framework.common.constants import RedisKeys
 from by_framework.common.redis_client import Redis
-from by_framework.core.availability import (
-    WakeupDecision,
-    WakeupDecisionStatus,
-    WakeupRequest,
-)
+from by_framework.core.availability import (WakeupDecision,
+                                            WakeupDecisionStatus,
+                                            WakeupRequest)
 
 
 class WakeupProvider(Protocol):

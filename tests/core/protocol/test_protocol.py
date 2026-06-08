@@ -4,15 +4,12 @@ from dataclasses import dataclass
 import pytest
 
 from by_framework import ActionType, AgentState, DataMessage, RedisKeys
-from by_framework.core.protocol.commands import (
-    AskAgentCommand,
-    BaseCommand,
-    CancelTaskCommand,
-    ResumeCommand,
-    command_from_dict,
-    register_command,
-    unregister_command,
-)
+from by_framework.core.protocol.commands import (AskAgentCommand, BaseCommand,
+                                                 CancelTaskCommand,
+                                                 ResumeCommand,
+                                                 command_from_dict,
+                                                 register_command,
+                                                 unregister_command)
 from by_framework.core.protocol.message_header import MessageHeader
 
 
@@ -120,6 +117,8 @@ def test_cancel_command_serializes_to_header_body_wire_format():
             "user_code": "",
             "user_name": "",
             "metadata": {},
+            "trace_parent_span_id": "",
+            "langfuse_parent_observation_id": "",
         },
         "body": {
             "target_message_id": "msg-task-2",

@@ -57,8 +57,16 @@ async def test_byclaw_history_backend_formats_messages(monkeypatch) -> None:
     history = await backend.get_history("sess-1", limit=2)
 
     assert history == [
-        {"role": "user", "content": [{"type": "text", "text": "hello"}], "metadata": {"n": 1}},
-        {"role": "assistant", "content": [{"type": "text", "text": "world"}], "metadata": {"n": 2}},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "hello"}],
+            "metadata": {"n": 1},
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "world"}],
+            "metadata": {"n": 2},
+        },
     ]
 
 

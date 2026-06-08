@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.ruff_cache/
 .Python
 build/
 develop-eggs/
@@ -68,3 +69,5 @@ Thumbs.db
 .claude/settings.json
 
 core
+
+.coderfleet-uploads/
