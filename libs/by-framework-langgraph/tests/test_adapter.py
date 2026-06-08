@@ -261,7 +261,7 @@ class TestAdapterRun:
 
     @pytest.mark.asyncio
     async def test_uses_context_langfuse_callback_property(self):
-        """Verify AgentContext.langfuse_callback property values are not called."""
+        """Verify AgentContext.langfuse_callback property value is used directly as a handler."""
         handler = object()
 
         # pylint: disable=too-few-public-methods,missing-class-docstring,missing-function-docstring

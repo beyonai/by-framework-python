@@ -730,13 +730,19 @@ async def test_build_trace_observability_snapshot_reconstructs_from_session_regi
     assert snapshot["status"] == "COMPLETED"
     assert snapshot["duration_ms"] >= 0
     assert [span["operation"] for span in snapshot["spans"]] == [
+        "client.dispatch",
         "queue.wait",
         "worker.execute",
         "agent.emit_chunk",
     ]
-    assert snapshot["spans"][0]["component"] == "redis"
-    assert snapshot["spans"][1]["execution_id"] == "exec-root"
-    assert snapshot["spans"][2]["event_type"] == "ANSWER_DELTA"
+    assert snapshot["spans"][0]["component"] == "client"
+    assert snapshot["spans"][1]["component"] == "redis"
+    assert snapshot["spans"][1]["parent_span_id"] == "msg-root:client.dispatch"
+    assert snapshot["spans"][2]["execution_id"] == "exec-root"
+    assert snapshot["spans"][2]["parent_span_id"] == "exec-root:queue.wait"
+    assert snapshot["spans"][3]["event_type"] == "ANSWER_DELTA"
+    assert snapshot["spans"][3]["parent_span_id"] == "exec-root:worker.execute"
+    assert snapshot["tree"][0]["operation"] == "client.dispatch"
     assert snapshot["tree"]
     assert all("offset_ms" in item for item in snapshot["timeline"])
 

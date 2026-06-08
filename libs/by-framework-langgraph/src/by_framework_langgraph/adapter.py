@@ -11,21 +11,16 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import import_module
 from typing import TYPE_CHECKING, Any, Callable, Iterator
-from unittest.mock import Mock
 
 from by_framework.common.logger import logger
 from by_framework.core.protocol.agent_state import AgentState
 from by_framework.core.protocol.commands import ResumeCommand
 from by_framework.core.protocol.events import StreamChunkEvent
+from by_framework.observability.span_recorder import (str_to_uint64, str_to_uint128)
 from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
-from ._utils import (
-    extract_content_text,
-    extract_resume_data,
-    str_to_uint64,
-    str_to_uint128,
-)
+from ._utils import extract_content_text, extract_resume_data
 
 if TYPE_CHECKING:
     from by_framework.core.protocol.commands import GatewayCommand
@@ -385,11 +380,12 @@ class LangGraphAdapter:
     def _langfuse_callback_manager(self, callbacks: list[Any]) -> Iterator[None]:
         """Prepare Langfuse callback and observation for LangChain."""
         # Prefer AgentContext's callback factory so trace and parent ids align.
-        # Ignore MagicMock-generated attributes in tests.
+        # Filter out auto-generated MagicMock attributes when tests use a mock
+        # context — real callback objects always come from a non-test module.
         langfuse_callback_value = getattr(self._context, "langfuse_callback", None)
-        is_real_callback = False
-        if langfuse_callback_value is not None:
-            is_real_callback = not isinstance(langfuse_callback_value, Mock)
+        is_real_callback = langfuse_callback_value is not None and type(
+            langfuse_callback_value
+        ).__module__ not in ("unittest.mock",)
 
         if is_real_callback:
             handler = (
@@ -435,6 +431,8 @@ class LangGraphAdapter:
             metadata=self._default_metadata(),
         ):
             # Prevent the generated OTel span from being promoted to a trace root.
+            # The native LangfusePlugin sets the same attribute on its own path
+            # (via _SdkLangfuseTracer); this covers the LangGraph fallback path.
             try:
                 from opentelemetry import trace
 

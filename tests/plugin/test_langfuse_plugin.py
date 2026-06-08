@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Optional
 
+import by_framework_trace_langfuse.langfuse as langfuse_module
 import pytest
 from by_framework_trace_langfuse import (
     LangfuseConfig,
@@ -15,6 +16,7 @@ from by_framework import (
     AskAgentCommand,
     CancelTaskCommand,
     MessageHeader,
+    ResumeCommand,
 )
 
 
@@ -48,6 +50,7 @@ class FakeTracer:
                 "metadata": request.metadata,
                 "parent_observation_id": request.parent_observation_id,
                 "span_id": request.span_id,
+                "as_root": request.as_root,
             }
         )
         return FakeObservation(id=f"obs-{len(self.start_calls)}")
@@ -88,6 +91,42 @@ class FakeObservationStore:
         self.mapping[(session_id, message_id)] = observation_id
 
 
+class FakeOtelSpan:
+    """Minimal OTel span double for Langfuse SDK adapter tests."""
+
+    def __init__(self):
+        self.attributes: dict[str, Any] = {}
+
+    def set_attribute(self, key: str, value: Any) -> None:
+        self.attributes[key] = value
+
+
+class FakeSdkObservation:
+    """Observation double with an attached OTel span."""
+
+    def __init__(self):
+        self.id = "sdk-obs"
+        self._otel_span = FakeOtelSpan()
+
+
+class FakeSdkClient:
+    """Langfuse client double used by _SdkLangfuseTracer tests."""
+
+    def __init__(self):
+        self.calls: list[dict[str, Any]] = []
+        self.observations: list[FakeSdkObservation] = []
+        self.trace_calls: list[dict[str, Any]] = []
+
+    def start_observation(self, **kwargs: Any) -> FakeSdkObservation:
+        self.calls.append(kwargs)
+        observation = FakeSdkObservation()
+        self.observations.append(observation)
+        return observation
+
+    def trace(self, **kwargs: Any) -> None:
+        self.trace_calls.append(kwargs)
+
+
 def _build_context(
     *,
     message_id: str = "msg-1",
@@ -96,6 +135,9 @@ def _build_context(
     session_id: str = "session-1",
     current_agent_id: str = "planner",
     content: Any = "hello",
+    metadata: Optional[dict[str, Any]] = None,
+    langfuse_parent_observation_id: str = "",
+    trace_parent_span_id: str = "",
 ) -> AgentContext:
     command = AskAgentCommand(
         header=MessageHeader(
@@ -106,6 +148,9 @@ def _build_context(
             parent_message_id=parent_message_id,
             user_code="user-1",
             user_name="Alice",
+            metadata=metadata or {},
+            langfuse_parent_observation_id=langfuse_parent_observation_id,
+            trace_parent_span_id=trace_parent_span_id,
         ),
         content=content,
     )
@@ -174,20 +219,195 @@ async def test_langfuse_plugin_top_level_nests_under_worker_execute():
     worker_execute_call = tracer.start_calls[0]
     agent_call = tracer.start_calls[1]
 
-    client_dispatch_val = str_to_uint64("msg-1:client.dispatch")
-    client_dispatch_id = f"{client_dispatch_val:016x}"
     worker_execute_span_id = str_to_uint64("msg-1:worker.execute")
     agent_task_span_id = str_to_uint64("msg-1:agent.task")
 
-    # worker.execute is its own node, parented to client.dispatch.
+    # worker.execute is its own node. With no propagated client parent it has no
+    # synthetic client root in the worker process.
     assert worker_execute_call["name"] == "worker.execute"
     assert worker_execute_call["span_id"] == worker_execute_span_id
-    assert worker_execute_call["parent_observation_id"] == client_dispatch_id
+    assert worker_execute_call["parent_observation_id"] == ""
+    assert worker_execute_call["as_root"] is False
 
     # Agent task nests under worker.execute, with a distinct span id.
     assert agent_call["span_id"] == agent_task_span_id
     assert agent_call["span_id"] != worker_execute_span_id
     assert agent_call["parent_observation_id"] == "obs-1"  # worker.execute obs id
+    assert agent_call["as_root"] is False
+
+
+@pytest.mark.asyncio
+async def test_langfuse_plugin_top_level_uses_client_dispatch_parent_from_metadata():
+    """Top-level worker spans nest under the client-created Langfuse root."""
+    tracer = FakeTracer()
+    store = FakeObservationStore()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=store)
+    context = _build_context(
+        message_id="msg-1",
+        parent_message_id="",
+        metadata={"langfuse_parent_observation_id": "obs-client-dispatch"},
+    )
+
+    await plugin.on_task_start(context)
+
+    assert len(tracer.start_calls) == 2
+    worker_execute_call = tracer.start_calls[0]
+    agent_call = tracer.start_calls[1]
+
+    assert worker_execute_call["name"] == "worker.execute"
+    assert worker_execute_call["parent_observation_id"] == "obs-client-dispatch"
+    assert worker_execute_call["as_root"] is False
+    assert agent_call["parent_observation_id"] == "obs-1"
+
+
+@pytest.mark.asyncio
+async def test_langfuse_plugin_top_level_parent_from_header_attr():
+    """Top-level worker spans nest under client-created Langfuse root
+    using header attr.
+    """
+    tracer = FakeTracer()
+    store = FakeObservationStore()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=store)
+    context = _build_context(
+        message_id="msg-1",
+        parent_message_id="",
+        langfuse_parent_observation_id="obs-client-dispatch",
+    )
+
+    await plugin.on_task_start(context)
+
+    assert len(tracer.start_calls) == 2
+    worker_execute_call = tracer.start_calls[0]
+    agent_call = tracer.start_calls[1]
+
+    assert worker_execute_call["name"] == "worker.execute"
+    assert worker_execute_call["parent_observation_id"] == "obs-client-dispatch"
+    assert worker_execute_call["as_root"] is False
+    assert agent_call["parent_observation_id"] == "obs-1"
+
+
+@pytest.mark.asyncio
+async def test_child_agent_prefers_root_parent_from_metadata():
+    """Child agent spans nest under root dispatch ID if metadata exists."""
+    tracer = FakeTracer()
+    store = FakeObservationStore()
+    store.mapping[("session-1", "msg-parent")] = "obs-parent-agent"
+    plugin = LangfusePlugin(tracer=tracer, observation_store=store)
+    context = _build_context(
+        message_id="msg-child",
+        parent_message_id="msg-parent",
+        metadata={"langfuse_parent_observation_id": "obs-root-client-dispatch"},
+    )
+
+    await plugin.on_task_start(context)
+
+    assert len(tracer.start_calls) == 2
+    worker_execute_call = tracer.start_calls[0]
+    assert worker_execute_call["parent_observation_id"] == "obs-root-client-dispatch"
+
+
+@pytest.mark.asyncio
+async def test_resume_ignores_parent_observation_id_metadata():
+    """Top-level resumed task spans ignore parent ID in metadata to avoid self loops."""
+    tracer = FakeTracer()
+    store = FakeObservationStore()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=store)
+
+    command = ResumeCommand(
+        header=MessageHeader(
+            message_id="msg-resume",
+            session_id="session-1",
+            trace_id="trace-1",
+            target_agent_type="planner",
+            parent_message_id="",
+            metadata={"langfuse_parent_observation_id": "some-old-stage-id"},
+        ),
+        status="success",
+        reply_data=None,
+    )
+
+    context = AgentContext(
+        session_id="session-1",
+        trace_id="trace-1",
+        redis_client=object(),
+        current_agent_id="planner",
+        message_id="msg-resume",
+        parent_message_id="",
+        current_command=command,
+    )
+
+    await plugin.on_task_start(context)
+
+    assert len(tracer.start_calls) == 2
+    worker_execute_call = tracer.start_calls[0]
+    assert worker_execute_call["parent_observation_id"] == ""
+
+
+@pytest.mark.asyncio
+async def test_langfuse_plugin_child_task_does_not_become_trace_root():
+    """Child task observations stay nested under the parent task trace root."""
+    tracer = FakeTracer()
+    store = FakeObservationStore()
+    store.mapping[("session-1", "msg-parent")] = "obs-parent"
+    plugin = LangfusePlugin(tracer=tracer, observation_store=store)
+    context = _build_context(message_id="msg-child", parent_message_id="msg-parent")
+
+    await plugin.on_task_start(context)
+
+    worker_execute_call = tracer.start_calls[0]
+    agent_call = tracer.start_calls[1]
+
+    assert worker_execute_call["name"] == "worker.execute"
+    assert worker_execute_call["parent_observation_id"] == "obs-parent"
+    assert worker_execute_call["as_root"] is False
+    assert agent_call["as_root"] is False
+
+
+def test_sdk_tracer_preserves_root_observation_for_trace_name():
+    """SDK adapter only clears Langfuse root promotion for nested observations."""
+    client = FakeSdkClient()
+    tracer = langfuse_module._SdkLangfuseTracer(client)  # pylint: disable=protected-access
+
+    root_observation = tracer.start_observation(
+        langfuse_module._ObservationStartRequest(  # pylint: disable=protected-access
+            trace_id="12345678901234567890123456789012",
+            name="client.dispatch:planner",
+            observation_input="hello",
+            metadata={"session_id": "session-1", "user_code": "user-1"},
+            as_root=True,
+        )
+    )
+    nested_observation = tracer.start_observation(
+        langfuse_module._ObservationStartRequest(  # pylint: disable=protected-access
+            trace_id="12345678901234567890123456789012",
+            name="planner",
+            observation_input="hello",
+            metadata={},
+            parent_observation_id="sdk-obs",
+            as_root=False,
+        )
+    )
+
+    assert client.calls[0]["name"] == "client.dispatch:planner"
+    assert (
+        root_observation._otel_span.attributes["langfuse.trace.name"]
+        == "client.dispatch:planner"
+    )
+    assert root_observation._otel_span.attributes["session.id"] == "session-1"
+    assert root_observation._otel_span.attributes["user.id"] == "user-1"
+    assert "langfuse.internal.as_root" not in root_observation._otel_span.attributes
+    assert (
+        nested_observation._otel_span.attributes["langfuse.internal.as_root"] is False
+    )
+
+    # Verify that client.trace was called when as_root is True
+    assert len(client.trace_calls) == 1
+    assert client.trace_calls[0] == {
+        "id": "12345678901234567890123456789012",
+        "name": "client.dispatch:planner",
+        "session_id": "session-1",
+        "user_id": "user-1",
+    }
 
 
 @pytest.mark.asyncio
@@ -278,9 +498,7 @@ def test_langfuse_config_prefers_clean_base_url_value():
     config = LangfuseConfig(
         secret_key="sk-test",
         public_key="pk-test",
-        base_url=LangfuseConfig._clean_env_value(
-            "“http://localhost:3000”"
-        ),  # pylint: disable=protected-access
+        base_url=LangfuseConfig._clean_env_value("“http://localhost:3000”"),  # pylint: disable=protected-access
     )
 
     assert config.base_url == "http://localhost:3000"

@@ -188,6 +188,7 @@ async def test_live_execution_span_makes_worker_execute_current_parent():
             operation="worker.execute",
             attributes={"component": "worker"},
             start_ts=1_000,
+            otel_enabled=True,
         ):
             # ID injection vars must be reset inside the body so child spans do not
             # reuse the parent span id.
@@ -214,3 +215,38 @@ async def test_live_execution_span_makes_worker_execute_current_parent():
     assert child_span.context.trace_id == str_to_uint128(trace_id)
     # The child span has its own span_id and does not collide with the parent.
     assert child_span.context.span_id != worker_span.context.span_id
+
+
+@pytest.mark.asyncio
+async def test_live_execution_span_is_disabled_without_otel_opt_in():
+    """live_execution_otel_span skips span creation when otel_enabled=False."""
+    trace_sdk = pytest.importorskip("opentelemetry.sdk.trace")
+    otel_trace = pytest.importorskip("opentelemetry.trace")
+    in_memory = pytest.importorskip(
+        "opentelemetry.sdk.trace.export.in_memory_span_exporter"
+    )
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+    provider = trace_sdk.TracerProvider()
+    exporter = in_memory.InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    previous = otel_trace._TRACER_PROVIDER
+    otel_trace._TRACER_PROVIDER = provider
+
+    try:
+        async with live_execution_otel_span(
+            trace_id="live-trace-disabled",
+            span_id="exec-disabled:worker.execute",
+            parent_span_id="",
+            operation="worker.execute",
+            attributes={"component": "worker"},
+            start_ts=1_000,
+            otel_enabled=False,
+        ):
+            child = provider.get_tracer("agent").start_span("llm.call")
+            child.end()
+    finally:
+        otel_trace._TRACER_PROVIDER = previous
+
+    spans = {s.name: s for s in exporter.get_finished_spans()}
+    assert "worker.execute" not in spans

@@ -1,5 +1,7 @@
 """Langfuse integration for by-framework task lifecycle events."""
 
+# pylint: disable=protected-access,import-outside-toplevel,too-many-arguments
+
 from __future__ import annotations
 
 import os
@@ -24,6 +26,7 @@ from by_framework.observability.span_recorder import (
 
 LANGFUSE_OBSERVATION_ATTR = "_langfuse_observation"
 WORKER_EXECUTE_OBSERVATION_ATTR = "_langfuse_worker_execute_observation"
+LANGFUSE_PARENT_OBSERVATION_METADATA_KEY = "langfuse_parent_observation_id"
 _QUOTES_TO_STRIP = "\"'“”‘’"
 _FALSE_LIKE_VALUES = {"0", "false", "no", "off", "disabled"}
 
@@ -123,6 +126,7 @@ class _ObservationStartRequest:
     metadata: dict[str, Any]
     parent_observation_id: str = ""
     span_id: Optional[int] = None
+    as_root: bool = False
 
 
 class WorkerRegistryObservationStore:
@@ -197,9 +201,13 @@ class _SdkLangfuseTracer:
         else:
             obs = self._client.start_observation(**kwargs)
 
+        # Prevent nested observations from being promoted to a trace root.
+        # The LangGraph adapter sets the same attribute on its own fallback path
+        # (inside _langfuse_callback_manager); this covers the native plugin path.
         # pylint: disable=protected-access
         if (
-            obs is not None
+            not request.as_root
+            and obs is not None
             and hasattr(obs, "_otel_span")
             and obs._otel_span is not None
         ):
@@ -207,8 +215,57 @@ class _SdkLangfuseTracer:
                 obs._otel_span.set_attribute("langfuse.internal.as_root", False)
             except Exception:  # pylint: disable=broad-exception-caught
                 pass
+        elif request.as_root:
+            if hasattr(self._client, "trace") and callable(self._client.trace):
+                try:
+                    session_id = request.metadata.get("session_id")
+                    user_id = request.metadata.get("user_code") or request.metadata.get(
+                        "user_name"
+                    )
+                    self._client.trace(
+                        id=request.trace_id,
+                        name=request.name,
+                        session_id=str(session_id) if session_id else None,
+                        user_id=str(user_id) if user_id else None,
+                    )
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+            self._set_root_trace_attributes(obs, request)
 
         return obs
+
+    @staticmethod
+    def _set_root_trace_attributes(
+        observation: ObservationHandle | None,
+        request: _ObservationStartRequest,
+    ) -> None:
+        """Set trace-level attributes used by Langfuse's trace list UI."""
+        if (
+            observation is None
+            or not hasattr(observation, "_otel_span")
+            or observation._otel_span is None
+        ):
+            return
+        try:
+            from langfuse._client.attributes import LangfuseOtelSpanAttributes
+
+            observation._otel_span.set_attribute(
+                LangfuseOtelSpanAttributes.TRACE_NAME, request.name
+            )
+            session_id = request.metadata.get("session_id")
+            if session_id:
+                observation._otel_span.set_attribute(
+                    LangfuseOtelSpanAttributes.TRACE_SESSION_ID, str(session_id)
+                )
+            user_id = request.metadata.get("user_code") or request.metadata.get(
+                "user_name"
+            )
+            if user_id:
+                observation._otel_span.set_attribute(
+                    LangfuseOtelSpanAttributes.TRACE_USER_ID, str(user_id)
+                )
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
 
     def shutdown(self) -> None:
         """Flush tracing state using whichever shutdown API the SDK exposes."""
@@ -263,11 +320,9 @@ class LangfusePlugin(Plugin):
 
         trace_id_hex = f"{str_to_uint128(identity.trace_id):032x}"
 
-        # The worker process needs a concrete worker.execute node. Langfuse's
-        # default span filter can drop native by-framework OTel spans, so create a
-        # native Langfuse observation for worker.execute and nest the agent task
-        # below it to restore the client.dispatch -> worker.execute -> agent -> LLM
-        # chain.
+        # The client process owns client.dispatch. Worker observations consume
+        # the propagated Langfuse parent id and continue the chain with
+        # worker.execute -> agent -> LLM.
         execution_anchor = (
             context.execution_id
             if getattr(context, "execution_id", None)
@@ -280,7 +335,20 @@ class LangfusePlugin(Plugin):
 
         # Parent worker.execute to client.dispatch for top-level tasks. For child
         # agents, parent to the stored observation id of the calling task.
-        if identity.parent_message_id:
+        is_resume = (
+            "ResumeCommand" in context.current_command.__class__.__name__
+            if getattr(context, "current_command", None) is not None
+            else False
+        )
+        root_parent_id = metadata.get(LANGFUSE_PARENT_OBSERVATION_METADATA_KEY)
+        if not identity.parent_message_id and is_resume:
+            # For top-level task resumption, do not parent to any observation id
+            # (especially to avoid parenting back to its own first stage which is in metadata).
+            # This lets Langfuse automatically root it under the main trace.
+            worker_execute_parent = ""
+        elif root_parent_id:
+            worker_execute_parent = str(root_parent_id)
+        elif identity.parent_message_id:
             worker_execute_parent = (
                 await observation_store.get_observation_id(
                     identity.session_id, identity.parent_message_id
@@ -288,9 +356,7 @@ class LangfusePlugin(Plugin):
                 or ""
             )
         else:
-            worker_execute_parent = (
-                f"{str_to_uint64(f'{identity.message_id}:client.dispatch'):016x}"
-            )
+            worker_execute_parent = ""
 
         worker_execute_obs = tracer.start_observation(
             _ObservationStartRequest(
@@ -307,7 +373,9 @@ class LangfusePlugin(Plugin):
             _ObservationStartRequest(
                 span_id=str_to_uint64(f"{execution_anchor}:agent.task"),
                 trace_id=trace_id_hex,
-                parent_observation_id=worker_execute_obs.id,
+                parent_observation_id=worker_execute_obs.id
+                if worker_execute_obs is not None
+                else "",
                 name=identity.agent_id,
                 observation_input=command_input,
                 metadata=metadata,
@@ -418,7 +486,8 @@ class LangfusePlugin(Plugin):
     def _build_metadata(cls, identity: _TaskIdentity, context: Any) -> dict[str, Any]:
         command = getattr(context, "current_command", None)
         header = getattr(command, "header", None)
-        return {
+        header_metadata = cls._serialize_value(getattr(header, "metadata", {}))
+        metadata = {
             "message_id": identity.message_id,
             "parent_message_id": identity.parent_message_id,
             "session_id": identity.session_id,
@@ -426,8 +495,24 @@ class LangfusePlugin(Plugin):
             "agent_id": identity.agent_id,
             "user_code": identity.user_code,
             "user_name": identity.user_name,
-            "header_metadata": cls._serialize_value(getattr(header, "metadata", {})),
+            "header_metadata": header_metadata,
         }
+
+        langfuse_parent_observation_id = ""
+        if header is not None:
+            langfuse_parent_observation_id = getattr(
+                header, "langfuse_parent_observation_id", ""
+            ) or (
+                header_metadata.get(LANGFUSE_PARENT_OBSERVATION_METADATA_KEY, "")
+                if isinstance(header_metadata, dict)
+                else ""
+            )
+
+        if langfuse_parent_observation_id:
+            metadata[LANGFUSE_PARENT_OBSERVATION_METADATA_KEY] = str(
+                langfuse_parent_observation_id
+            )
+        return metadata
 
     @staticmethod
     def _serialize_value(value: Any) -> Any:
@@ -457,7 +542,10 @@ class LangfusePlugin(Plugin):
     def _iter_context_observations(context: Any) -> list[ObservationHandle]:
         """Return the agent task and worker.execute observations, innermost first."""
         observations: list[ObservationHandle] = []
-        for attr in (LANGFUSE_OBSERVATION_ATTR, WORKER_EXECUTE_OBSERVATION_ATTR):
+        for attr in (
+            LANGFUSE_OBSERVATION_ATTR,
+            WORKER_EXECUTE_OBSERVATION_ATTR,
+        ):
             observation = getattr(context, attr, None)
             if observation is not None:
                 observations.append(observation)
@@ -486,3 +574,60 @@ class LangfuseTraceProviderFactory(TraceProviderFactory):
         if LangfuseConfig.from_env() is None:
             return None
         return LangfusePlugin()
+
+
+def start_client_dispatch_observation(
+    *,
+    trace_id: str,
+    message_id: str,
+    target_agent_type: str,
+    session_id: str,
+    user_code: str = "",
+    user_name: str = "",
+    content: Any = None,
+    metadata: Optional[dict[str, Any]] = None,
+) -> Optional[ObservationHandle]:
+    """Start the client-side Langfuse root observation for a gateway dispatch."""
+    config = LangfuseConfig.from_env()
+    if config is None:
+        return None
+
+    try:
+        langfuse_module = import_module("langfuse")
+    except ImportError:
+        return None
+
+    langfuse_client_cls = getattr(langfuse_module, "Langfuse")
+    try:
+        client = langfuse_client_cls(
+            public_key=config.public_key,
+            secret_key=config.secret_key,
+            base_url=config.base_url,
+        )
+    except TypeError:
+        client = langfuse_client_cls(
+            public_key=config.public_key,
+            secret_key=config.secret_key,
+            host=config.base_url,
+        )
+
+    trace_id_hex = f"{str_to_uint128(trace_id):032x}"
+    dispatch_metadata = {
+        "message_id": message_id,
+        "session_id": session_id,
+        "trace_id": trace_id,
+        "target_agent_type": target_agent_type,
+        "user_code": user_code,
+        "user_name": user_name,
+        "header_metadata": LangfusePlugin._serialize_value(metadata or {}),
+    }
+    return _SdkLangfuseTracer(client).start_observation(
+        _ObservationStartRequest(
+            span_id=str_to_uint64(f"{message_id}:client.dispatch"),
+            trace_id=trace_id_hex,
+            name=f"client.dispatch:{target_agent_type}",
+            observation_input=LangfusePlugin._serialize_value(content),
+            metadata=dispatch_metadata,
+            as_root=True,
+        )
+    )

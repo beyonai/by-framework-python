@@ -69,6 +69,9 @@ current_agent_context_var: ContextVar[Optional[AgentContext]] = ContextVar(
     "current_agent_context_var", default=None
 )
 
+# Context variable for the current worker id; set by WorkerRunner before processing.
+current_worker_id_var: ContextVar[str] = ContextVar("current_worker_id_var", default="")
+
 
 class AgentContext:
     """Agent runtime context.
@@ -122,6 +125,7 @@ class AgentContext:
         self.current_agent_id = current_agent_id
         self.execution_id = execution_id
         self.span_recorder = span_recorder or SpanRecorder(self.redis)
+        self._chunk_count: int = 0
 
         # Record initial IDs
         self._initial_message_id = message_id
@@ -353,6 +357,7 @@ class AgentContext:
             self._is_stream_finished = True
 
         # 2. Send raw chunk
+        self._chunk_count += 1
         span_started_at = int(time.time() * 1000)
         emitted_message_id = message_id if message_id else self.message_id
         emitted_parent_message_id = (
@@ -546,6 +551,35 @@ class AgentContext:
 
         serialized_content = self._serialize_outbound_content(content)
 
+        metadata = dict(metadata or {})
+        trace_parent_span_id = ""
+        phoenix_span = getattr(self, "_phoenix_span", None)
+        if phoenix_span:
+            try:
+                span_context = phoenix_span.get_span_context()
+                if span_context and span_context.span_id:
+                    trace_parent_span_id = f"{span_context.span_id:016x}"
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+        if not trace_parent_span_id:
+            trace_parent_span_id = self._current_otel_span_id_hex()
+        if not trace_parent_span_id and self.current_command:
+            trace_parent_span_id = getattr(
+                self.current_command.header, "trace_parent_span_id", ""
+            ) or self.current_command.header.metadata.get("trace_parent_span_id", "")
+
+        langfuse_parent_observation_id = ""
+        current_obs = getattr(self, "_langfuse_observation", None)
+        current_obs_id = getattr(current_obs, "id", None) if current_obs else None
+        if current_obs_id:
+            langfuse_parent_observation_id = str(current_obs_id)
+        elif self.current_command:
+            langfuse_parent_observation_id = getattr(
+                self.current_command.header, "langfuse_parent_observation_id", ""
+            ) or self.current_command.header.metadata.get(
+                "langfuse_parent_observation_id", ""
+            )
+
         command = AskAgentCommand(
             header=MessageHeader(
                 message_id=message_id,
@@ -556,7 +590,9 @@ class AgentContext:
                 parent_message_id=parent_message_id,
                 user_code=self.agent_runtime_state.session_manager.user_code,
                 user_name=self.agent_runtime_state.session_manager.user_name,
-                metadata=metadata or {},
+                metadata=metadata,
+                trace_parent_span_id=trace_parent_span_id,
+                langfuse_parent_observation_id=langfuse_parent_observation_id,
             ),
             content=serialized_content,
             wait_for_reply=wait_for_reply,
@@ -754,10 +790,11 @@ class AgentContext:
 
         task_group_id = f"{TASK_GROUP_ID_PREFIX}{uuid.uuid4().hex[:8]}"
         total_tasks = len(tasks)
+        group_dispatch_start_ts = int(time.time() * 1000)
 
         if wait_for_reply:
             group_key = RedisKeys.task_group(task_group_id)
-            await self.redis.hset(
+            await self.redis.hset(  # type: ignore
                 group_key,
                 mapping={
                     TASK_GROUP_FIELD_TOTAL: str(total_tasks),
@@ -776,7 +813,36 @@ class AgentContext:
             target_agent_type = task["target_agent_type"]
             content = task.get("content", "")
             extra_payload = task.get("extra_payload", {})
-            metadata = task.get("metadata", {})
+            metadata = dict(task.get("metadata", {}) or {})
+            trace_parent_span_id = ""
+            phoenix_span = getattr(self, "_phoenix_span", None)
+            if phoenix_span:
+                try:
+                    span_context = phoenix_span.get_span_context()
+                    if span_context and span_context.span_id:
+                        trace_parent_span_id = f"{span_context.span_id:016x}"
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+            if not trace_parent_span_id:
+                trace_parent_span_id = self._current_otel_span_id_hex()
+            if not trace_parent_span_id and self.current_command:
+                trace_parent_span_id = getattr(
+                    self.current_command.header, "trace_parent_span_id", ""
+                ) or self.current_command.header.metadata.get(
+                    "trace_parent_span_id", ""
+                )
+
+            langfuse_parent_observation_id = ""
+            current_obs = getattr(self, "_langfuse_observation", None)
+            current_obs_id = getattr(current_obs, "id", None) if current_obs else None
+            if current_obs_id:
+                langfuse_parent_observation_id = str(current_obs_id)
+            elif self.current_command:
+                langfuse_parent_observation_id = getattr(
+                    self.current_command.header, "langfuse_parent_observation_id", ""
+                ) or self.current_command.header.metadata.get(
+                    "langfuse_parent_observation_id", ""
+                )
             serialized_content = self._serialize_outbound_content(content)
 
             current_message_id = message_id or self.generate_message_id()
@@ -799,6 +865,8 @@ class AgentContext:
                     user_code=self.agent_runtime_state.session_manager.user_code,
                     user_name=self.agent_runtime_state.session_manager.user_name,
                     metadata=metadata,
+                    trace_parent_span_id=trace_parent_span_id,
+                    langfuse_parent_observation_id=langfuse_parent_observation_id,
                 ),
                 content=serialized_content,
                 wait_for_reply=wait_for_reply,
@@ -856,6 +924,37 @@ class AgentContext:
                 }
             )
 
+        # Record aggregate span for the entire group dispatch.
+        group_parent_span_id = (
+            f"{self.execution_id}:worker.execute"
+            if self.execution_id
+            else f"{self.message_id}:worker.execute"
+        )
+        try:
+            await self.span_recorder.record_span(
+                TraceSpan(
+                    trace_id=self.trace_id,
+                    span_id=f"{task_group_id}:agent.dispatch_group",
+                    parent_span_id=group_parent_span_id,
+                    operation="agent.dispatch_group",
+                    component="agent_context",
+                    start_ts=group_dispatch_start_ts,
+                    end_ts=int(time.time() * 1000),
+                    status="COMPLETED",
+                    session_id=self.session_id,
+                    execution_id=self.execution_id,
+                    message_id=self.message_id,
+                    target_agent_type=self.current_agent_id,
+                    metadata={
+                        "task_group_id": task_group_id,
+                        "task_count": total_tasks,
+                        "wait_for_reply": wait_for_reply,
+                    },
+                )
+            )
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            logger.debug("Failed to record dispatch_group span: %s", err)
+
         return {
             "status": "GROUP_QUEUED",
             "task_group_id": task_group_id,
@@ -872,6 +971,18 @@ class AgentContext:
         raise TypeError(
             "AgentContext requires a content codec to serialize non-wire content"
         )
+
+    @staticmethod
+    def _current_otel_span_id_hex() -> str:
+        try:
+            from opentelemetry import trace as otel_trace
+
+            span_context = otel_trace.get_current_span().get_span_context()
+            if span_context and span_context.is_valid and span_context.span_id:
+                return f"{span_context.span_id:016x}"
+        except Exception:  # pylint: disable=broad-exception-caught
+            return ""
+        return ""
 
     @staticmethod
     def _is_wire_content(content: object) -> bool:
@@ -909,8 +1020,8 @@ class AgentContext:
 
         results_key = RedisKeys.task_group_results(task_group_id)
         group_key = RedisKeys.task_group(task_group_id)
-
-        total_str = await self.redis.hget(group_key, TASK_GROUP_FIELD_TOTAL)
+        field = TASK_GROUP_FIELD_TOTAL
+        total_str = await self.redis.hget(group_key, field)  # type: ignore
         if total_str is None:
             # No group found, try to get whatever results exist
             total = float("inf")
@@ -925,7 +1036,7 @@ class AgentContext:
             if elapsed >= timeout:
                 break
 
-            raw_results = await self.redis.hgetall(results_key)
+            raw_results = await self.redis.hgetall(results_key)  # type: ignore
             if raw_results:
                 results = [
                     {

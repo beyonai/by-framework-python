@@ -11,6 +11,7 @@ from by_framework.core.protocol.byai_codec import ByaiContentCodec
 from by_framework.core.protocol.commands import (AskAgentCommand, command_from_dict)
 from by_framework.core.protocol.event_type import EventType
 from by_framework.core.protocol.message import (BaiYingMessage, BaiYingMessageRole)
+from by_framework.observability.span_recorder import str_to_uint64
 
 
 class RecordingCallAgentPlugin(Plugin):
@@ -72,6 +73,113 @@ async def test_context_call_agent_with_metadata():
     data = json.loads(args[1]["data"])
     command = command_from_dict(data)
     assert command.header.metadata == {"ctx": "val"}
+
+
+@pytest.mark.asyncio
+async def test_context_call_agent_propagates_langfuse_observation_id():
+    """Test that call_agent propagates _langfuse_observation id if present."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.execute = AsyncMock(return_value=[])
+    mock_redis.pipeline.return_value = mock_pipe
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.zrangebyscore = AsyncMock(return_value=[b"worker-1"])
+    mock_redis.get = AsyncMock(return_value=b"1")
+
+    ctx = AgentContext(session_id="s1", trace_id="t1", redis_client=mock_redis)
+
+    class DummyObservation:
+        id = "dummy-obs-id-123"
+
+    ctx._langfuse_observation = DummyObservation()
+
+    await ctx.call_agent(
+        target_agent_type="test", content="hello", metadata={"ctx": "val"}
+    )
+    args, _ = mock_redis.xadd.call_args
+    data = json.loads(args[1]["data"])
+    command = command_from_dict(data)
+    assert command.header.langfuse_parent_observation_id == "dummy-obs-id-123"
+    assert command.header.metadata["ctx"] == "val"
+
+
+@pytest.mark.asyncio
+async def test_context_call_agent_propagates_current_otel_span_id(monkeypatch):
+    """External commands receive current OTel span id for generic APM joins."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.execute = AsyncMock(return_value=[])
+    mock_redis.pipeline.return_value = mock_pipe
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.zrangebyscore = AsyncMock(return_value=[b"worker-1"])
+    mock_redis.get = AsyncMock(return_value=b"1")
+
+    ctx = AgentContext(session_id="s1", trace_id="trace-otel", redis_client=mock_redis)
+    span_id = str_to_uint64("exec-parent:worker.execute")
+
+    class FakeSpanContext:
+        is_valid = True
+
+        def __init__(self, span_id_value):
+            self.span_id = span_id_value
+
+    class FakeSpan:
+
+        def get_span_context(self):
+            return FakeSpanContext(span_id)
+
+    monkeypatch.setattr("opentelemetry.trace.get_current_span", FakeSpan)
+
+    await ctx.call_agent(target_agent_type="test", content="hello")
+
+    args, _ = mock_redis.xadd.call_args
+    data = json.loads(args[1]["data"])
+    command = command_from_dict(data)
+    assert command.header.trace_parent_span_id == (f"{span_id:016x}")
+
+
+@pytest.mark.asyncio
+async def test_context_dispatch_group_propagates_langfuse_observation_id():
+    """Test that dispatch_group propagates _langfuse_observation id if present."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_pipe = MagicMock()
+    mock_pipe.execute = AsyncMock(return_value=[])
+    mock_redis.pipeline.return_value = mock_pipe
+
+    ctx = AgentContext(session_id="s1", trace_id="t1", redis_client=mock_redis)
+
+    class DummyObservation:
+        id = "dummy-obs-id-456"
+
+    ctx._langfuse_observation = DummyObservation()
+
+    await ctx.dispatch_group(
+        tasks=[
+            {
+                "target_agent_type": "agent-b",
+                "content": "hello group",
+                "metadata": {"custom": "x"},
+            }
+        ],
+        wait_for_reply=False,
+    )
+
+    args, _ = mock_redis.xadd.call_args
+    data = json.loads(args[1]["data"])
+    command = command_from_dict(data)
+    assert command.header.langfuse_parent_observation_id == "dummy-obs-id-456"
+    assert command.header.metadata["custom"] == "x"
 
 
 @pytest.mark.asyncio
@@ -310,7 +418,9 @@ async def test_context_dispatch_group_serializes_baiying_message_with_codec():
 
 @pytest.mark.asyncio
 async def test_context_dispatch_group_records_dispatch_spans():
-    """Scatter-gather dispatch writes one dispatch span per child task."""
+    """Scatter-gather dispatch writes one dispatch span per child task
+    plus one aggregate.
+    """
     from unittest.mock import MagicMock
 
     mock_redis = MagicMock()
@@ -339,12 +449,17 @@ async def test_context_dispatch_group_records_dispatch_spans():
         ]
     )
 
-    assert span_recorder.record_span.await_count == 2
+    # 2 child dispatch spans + 1 aggregate agent.dispatch_group span
+    assert span_recorder.record_span.await_count == 3
     spans = [call.args[0] for call in span_recorder.record_span.await_args_list]
-    assert [span.operation for span in spans] == ["client.dispatch", "client.dispatch"]
-    assert {span.target_agent_type for span in spans} == {"agent-b", "agent-c"}
-    assert all(span.parent_span_id == "exec-parent:worker.execute" for span in spans)
-    assert all(span.component == "agent_context" for span in spans)
+    dispatch_spans = [s for s in spans if s.operation == "client.dispatch"]
+    group_spans = [s for s in spans if s.operation == "agent.dispatch_group"]
+    assert len(dispatch_spans) == 2
+    assert len(group_spans) == 1
+    assert {s.target_agent_type for s in dispatch_spans} == {"agent-b", "agent-c"}
+    assert all(s.parent_span_id == "exec-parent:worker.execute" for s in dispatch_spans)
+    assert group_spans[0].parent_span_id == "exec-parent:worker.execute"
+    assert group_spans[0].metadata["task_count"] == 2
 
 
 @pytest.mark.asyncio

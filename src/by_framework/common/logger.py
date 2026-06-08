@@ -14,7 +14,10 @@ class ContextFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            from by_framework.worker.context import current_agent_context_var
+            from by_framework.worker.context import (
+                current_agent_context_var,
+                current_worker_id_var,
+            )
 
             ctx = current_agent_context_var.get()
             if ctx is not None:
@@ -38,8 +41,23 @@ class ContextFilter(logging.Filter):
                 ):
                     if not hasattr(record, attr):
                         setattr(record, attr, "")
+
+            # Inject worker_id from dedicated context var set by the runner.
+            if not hasattr(record, "worker_id") or not record.worker_id:
+                record.worker_id = current_worker_id_var.get()
         except Exception:  # pylint: disable=broad-exception-caught
             pass
+
+        # Inject OTel span_id when tracing is active (lazy import, no hard dep).
+        if not getattr(record, "span_id", ""):
+            try:
+                from opentelemetry import trace as _otel_trace
+
+                span_ctx = _otel_trace.get_current_span().get_span_context()
+                record.span_id = f"{span_ctx.span_id:016x}" if span_ctx.is_valid else ""
+            except Exception:  # pylint: disable=broad-exception-caught
+                record.span_id = ""
+
         return True
 
 
@@ -70,6 +88,7 @@ class JSONFormatter(logging.Formatter):
             "execution_id",
             "agent_type",
             "task_group_id",
+            "span_id",
         ):
             val = getattr(record, key, None)
             if val:
@@ -86,7 +105,7 @@ def setup_logging(
     name: str = "by-framework",
     level: int = logging.INFO,
     use_json: bool = False,
-    log_file: str | None = "by-framework.log",
+    log_file: str | None = None,
 ) -> logging.Logger:
     """
     Set up unified logging configuration

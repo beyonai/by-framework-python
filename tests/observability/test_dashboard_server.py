@@ -190,6 +190,38 @@ def test_flow_endpoint_returns_backend_data_flow_model():
     assert payload["data_flow"]["edges"][0]["source"] == "client"
 
 
+def test_dashboard_auth_token_protects_api_routes():
+    """Dashboard API routes require the configured bearer token."""
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler(auth_token="secret-token")
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        connection.request("GET", "/api/health")
+        denied = connection.getresponse()
+        denied_payload = json.loads(denied.read().decode("utf-8"))
+
+        connection.request(
+            "GET",
+            "/api/health",
+            headers={"Authorization": "Bearer secret-token"},
+        )
+        allowed = connection.getresponse()
+        allowed_payload = json.loads(allowed.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert denied.status == 401
+    assert denied_payload["error"] == "unauthorized"
+    assert allowed.status == 200
+    assert allowed_payload["status"] == "ok"
+
+
 def test_trace_endpoints_return_demo_trace_data():
     """Trace APIs expose trace detail, timeline, and trace summaries."""
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
@@ -391,11 +423,7 @@ def test_trace_fallback_api_routing(monkeypatch):
             "127.0.0.1", server.server_address[1], timeout=5
         )
         connection.request("GET", "/api/trace/trace-fallback-api-123")
-        response = (
-            connection.getcall()
-            if hasattr(connection, "getcall")
-            else connection.getresponse()
-        )
+        response = connection.getresponse()
         payload = json.loads(response.read().decode("utf-8"))
     finally:
         server.shutdown()

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from by_framework.observability.snapshot import _escape_label
+
 try:
-    from prometheus_client import REGISTRY, Counter, Histogram
+    from prometheus_client import REGISTRY, Counter, Histogram  # type: ignore
 
     PROMETHEUS_AVAILABLE = True
 except ImportError:
@@ -61,6 +63,12 @@ if PROMETHEUS_AVAILABLE:
         ["agent_type"],
         buckets=(50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000),
     )
+    availability_routing_ms = Histogram(
+        "by_framework_availability_routing_ms",
+        "Time spent in AvailabilityRouter.prepare_delivery before message dispatch.",
+        ["agent_type", "policy", "status"],
+        buckets=(10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000),
+    )
 else:
     execution_status_total = DummyMetric(
         "by_framework_execution_status_total",
@@ -76,6 +84,11 @@ else:
         "by_framework_queue_wait_ms",
         "Queue waiting time in Redis Streams in milliseconds.",
         ["agent_type"],
+    )
+    availability_routing_ms = DummyMetric(
+        "by_framework_availability_routing_ms",
+        "Time spent in AvailabilityRouter.prepare_delivery before message dispatch.",
+        ["agent_type", "policy", "status"],
     )
 
 
@@ -101,13 +114,82 @@ def record_execution_metrics(
         pass
 
 
+def record_availability_metrics(
+    *,
+    agent_type: str,
+    policy: str,
+    status: str,
+    routing_ms: float,
+) -> None:
+    """Record AvailabilityRouter latency metrics safely."""
+    try:
+        availability_routing_ms.labels(
+            agent_type=agent_type, policy=policy, status=status
+        ).observe(routing_ms)
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+
 def generate_latest_metrics() -> str:
     """Generate latest prometheus metrics exposition representation."""
     if not PROMETHEUS_AVAILABLE or REGISTRY is None:
         return ""
     try:
-        from prometheus_client import generate_latest
+        from prometheus_client import generate_latest  # type: ignore
 
         return generate_latest(REGISTRY).decode("utf-8")
     except Exception:  # pylint: disable=broad-exception-caught
         return ""
+
+
+def build_observability_diagnostics_metrics(diagnostics: dict[str, Any]) -> str:
+    """Render trace exporter self-diagnostics as Prometheus text."""
+    dropped_spans_total = int(diagnostics.get("dropped_spans_total", 0))
+    export_failures_total = int(diagnostics.get("export_failures_total", 0))
+
+    lines = [
+        (
+            "# HELP by_framework_observability_dropped_spans_total "
+            "Trace spans dropped before export."
+        ),
+        "# TYPE by_framework_observability_dropped_spans_total counter",
+        f"by_framework_observability_dropped_spans_total {dropped_spans_total}",
+        (
+            "# HELP by_framework_observability_dropped_spans_by_reason_total "
+            "Trace spans dropped by reason."
+        ),
+        "# TYPE by_framework_observability_dropped_spans_by_reason_total counter",
+    ]
+    for reason, count in sorted(
+        dict(diagnostics.get("dropped_spans_by_reason", {})).items()
+    ):
+        lines.append(
+            "by_framework_observability_dropped_spans_by_reason_total"
+            f'{{reason="{_escape_label(str(reason))}"}} {int(count)}'
+        )
+    lines.extend(
+        [
+            (
+                "# HELP by_framework_observability_export_failures_total "
+                "Trace exporter failures."
+            ),
+            "# TYPE by_framework_observability_export_failures_total counter",
+            f"by_framework_observability_export_failures_total {export_failures_total}",
+            (
+                "# HELP by_framework_observability_export_failures_by_exporter_total "
+                "Trace exporter failures by exporter."
+            ),
+            (
+                "# TYPE by_framework_observability_export_failures_by_exporter_total "
+                "counter"
+            ),
+        ]
+    )
+    for exporter, count in sorted(
+        dict(diagnostics.get("export_failures_by_exporter", {})).items()
+    ):
+        lines.append(
+            "by_framework_observability_export_failures_by_exporter_total"
+            f'{{exporter="{_escape_label(str(exporter))}"}} {int(count)}'
+        )
+    return "\n".join(lines) + "\n"

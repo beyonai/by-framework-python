@@ -1819,7 +1819,15 @@ def _build_trace_from_session_snapshot(
     spans = []
     worker_span_by_message = {}
     for execution in session_snapshot.get("executions", []):
-        queue_span, worker_span = _execution_to_trace_spans(trace_id, execution)
+        parent_message_id = str(execution.get("parent_message_id", ""))
+        dispatch_parent_span_id = worker_span_by_message.get(parent_message_id, "")
+        dispatch_span, queue_span, worker_span = _execution_to_trace_spans(
+            trace_id,
+            execution,
+            dispatch_parent_span_id=dispatch_parent_span_id,
+        )
+        if dispatch_span is not None:
+            spans.append(dispatch_span)
         if queue_span is not None:
             spans.append(queue_span)
         if worker_span is not None:
@@ -1866,64 +1874,100 @@ async def _read_stored_trace_spans(redis: Redis, trace_id: str) -> list[dict[str
 
 
 def _execution_to_trace_spans(
-    trace_id: str, execution: dict[str, Any]
-) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    trace_id: str,
+    execution: dict[str, Any],
+    *,
+    dispatch_parent_span_id: str = "",
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
     created_at = int(execution.get("created_at", 0) or 0)
     started_at = int(execution.get("started_at", 0) or 0)
     finished_at = int(execution.get("finished_at", 0) or 0)
     updated_at = int(execution.get("updated_at", 0) or 0)
     status = str(execution.get("status", "") or "UNKNOWN")
     execution_id = str(execution.get("execution_id", ""))
+    message_id = str(execution.get("message_id", ""))
+    session_id = str(execution.get("session_id", ""))
+    parent_message_id = str(execution.get("parent_message_id", ""))
+    source_agent_type = str(execution.get("source_agent_type", ""))
+    target_agent_type = str(execution.get("target_agent_type", ""))
+    route_policy = str(execution.get("route_policy", ""))
+    route_status = str(execution.get("route_status", ""))
+    dispatch_start = created_at or started_at or updated_at
+    dispatch_span = None
+    if dispatch_start and message_id:
+        dispatch_span = _trace_span(
+            trace_id=trace_id,
+            span_id=f"{message_id}:client.dispatch",
+            parent_span_id=dispatch_parent_span_id,
+            operation="client.dispatch",
+            component="client" if not dispatch_parent_span_id else "agent_context",
+            start_ts=dispatch_start,
+            end_ts=dispatch_start,
+            status="COMPLETED",
+            session_id=session_id,
+            execution_id=execution_id,
+            message_id=message_id,
+            parent_message_id=parent_message_id,
+            source_agent_type=source_agent_type or "client",
+            target_agent_type=target_agent_type,
+            route_policy=route_policy,
+            route_status=route_status,
+        )
     queue_span = None
     if created_at and started_at and started_at >= created_at:
         queue_span = _trace_span(
             trace_id=trace_id,
             span_id=f"{execution_id}:queue.wait",
-            parent_span_id="",
+            parent_span_id=dispatch_span["span_id"] if dispatch_span else "",
             operation="queue.wait",
             component="redis",
             start_ts=created_at,
             end_ts=started_at,
             status="COMPLETED",
-            session_id=str(execution.get("session_id", "")),
+            session_id=session_id,
             execution_id=execution_id,
-            message_id=str(execution.get("message_id", "")),
-            parent_message_id=str(execution.get("parent_message_id", "")),
-            source_agent_type=str(execution.get("source_agent_type", "")),
-            target_agent_type=str(execution.get("target_agent_type", "")),
+            message_id=message_id,
+            parent_message_id=parent_message_id,
+            source_agent_type=source_agent_type,
+            target_agent_type=target_agent_type,
             queue_wait_ms=max(0, started_at - created_at),
-            route_policy=str(execution.get("route_policy", "")),
-            route_status=str(execution.get("route_status", "")),
+            route_policy=route_policy,
+            route_status=route_status,
         )
     worker_start = started_at or created_at or updated_at
     worker_end = finished_at or updated_at or worker_start
     worker_span = None
     if worker_start:
+        parent_span_id = ""
+        if queue_span:
+            parent_span_id = queue_span["span_id"]
+        elif dispatch_span:
+            parent_span_id = dispatch_span["span_id"]
         worker_span = _trace_span(
             trace_id=trace_id,
             span_id=f"{execution_id}:worker.execute",
-            parent_span_id=queue_span["span_id"] if queue_span else "",
+            parent_span_id=parent_span_id,
             operation="worker.execute",
             component="worker",
             start_ts=worker_start,
             end_ts=max(worker_start, worker_end),
             status=status,
-            session_id=str(execution.get("session_id", "")),
+            session_id=session_id,
             execution_id=execution_id,
-            message_id=str(execution.get("message_id", "")),
-            parent_message_id=str(execution.get("parent_message_id", "")),
+            message_id=message_id,
+            parent_message_id=parent_message_id,
             worker_id=str(execution.get("worker_id", "")),
-            source_agent_type=str(execution.get("source_agent_type", "")),
-            target_agent_type=str(execution.get("target_agent_type", "")),
+            source_agent_type=source_agent_type,
+            target_agent_type=target_agent_type,
             error_type=str(execution.get("error_type", "")),
             error_message=str(execution.get("error_message", "")),
             error_code=str(execution.get("error_code", "")),
             failed_stage=str(execution.get("failed_stage", "")),
             retryable=bool(execution.get("retryable", False)),
-            route_policy=str(execution.get("route_policy", "")),
-            route_status=str(execution.get("route_status", "")),
+            route_policy=route_policy,
+            route_status=route_status,
         )
-    return queue_span, worker_span
+    return dispatch_span, queue_span, worker_span
 
 
 def _event_to_trace_span(

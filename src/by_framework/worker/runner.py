@@ -8,7 +8,7 @@ import asyncio
 import hashlib
 import time
 import uuid
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from by_framework.common.config import WorkerConfig
 from by_framework.common.constants import (
@@ -30,9 +30,11 @@ from by_framework.core.registry import ExecutionCompletionFields
 from by_framework.observability.span_recorder import (
     SpanRecorder,
     TraceSpan,
+    build_observability_config,
     live_execution_otel_span,
 )
 from by_framework.util.generate_message_id import generate_message_id
+from by_framework.worker.context import current_worker_id_var
 from by_framework.worker.worker import GatewayWorker
 
 from ._control_handling import (
@@ -77,6 +79,7 @@ class WorkerRunner:
         self.span_recorder = span_recorder or SpanRecorder(
             self.redis, enable_otel=False
         )
+        self._otel_enabled = build_observability_config().otel_enabled
         self._lock_token = None
         self._heartbeat_task = None
         self._control_task = None
@@ -221,6 +224,7 @@ class WorkerRunner:
                 redis_client=self.redis,
                 group_name=self.group_name,
                 worker=self.worker,
+                span_recorder=self.span_recorder,
             )
         finally:
             await self.redis.xack(stream_name, self.group_name, msg_id)
@@ -285,6 +289,16 @@ class WorkerRunner:
             command_from_dict,
         )
 
+        # Set worker_id context var so ContextFilter can inject it into log records.
+        current_worker_id_var.set(self.worker.worker_id)
+
+        # Error-recovery state: populated as processing advances so the except block
+        # can record a failed span even when the exception occurred mid-way.
+        err_execution_id = ""
+        err_header: Any = None
+        err_start_ts = 0
+        err_session_id = ""
+
         try:
             logger.info("[%s] Processing message: %s", self.worker.worker_id, msg_id)
             command = command_from_dict(data_dict)
@@ -293,6 +307,8 @@ class WorkerRunner:
                 raise UnsupportedCommandError(type(command).__name__)
 
             header = command.header
+            err_header = header
+            err_session_id = header.session_id
             # Null check for message_id in header
             if not header.message_id:
                 header.message_id = generate_message_id()
@@ -324,6 +340,7 @@ class WorkerRunner:
             execution_id = (existing_execution or {}).get(
                 "execution_id"
             ) or f"{EXECUTION_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+            err_execution_id = execution_id
             cancel_reason = (existing_execution or {}).get("cancel_reason", "")
             cancel_requested = bool(
                 (existing_execution or {}).get("cancel_requested", False)
@@ -390,6 +407,7 @@ class WorkerRunner:
             # within the agent (e.g. LangGraph/Langfuse LLM calls) nest under
             # worker.execute via normal OTel context propagation.
             execution_started_at = int(time.time() * 1000)
+            err_start_ts = execution_started_at
             async with live_execution_otel_span(
                 trace_id=header.trace_id,
                 span_id=f"{execution_id}:worker.execute",
@@ -404,6 +422,7 @@ class WorkerRunner:
                     "target_agent_type": header.target_agent_type,
                 },
                 start_ts=execution_started_at,
+                otel_enabled=self._otel_enabled,
             ) as execute_span:
                 task_result = await self.worker._handle_message(
                     command,
@@ -419,6 +438,11 @@ class WorkerRunner:
                 execute_span.set_status(
                     final_status,
                     error_message=str(completion_fields.get("error_message", "")),
+                )
+                # Extract chunk count from the AgentContext if available.
+                running_exec = self._tracker.get_execution(execution_id)
+                chunk_count = int(
+                    getattr(getattr(running_exec, "context", None), "_chunk_count", 0)
                 )
 
             # Mark finished
@@ -467,6 +491,7 @@ class WorkerRunner:
                 route_status=str((existing_execution or {}).get("route_status", "")),
                 start_ts=execution_started_at,
                 end_ts=execution_finished_at,
+                chunk_count=chunk_count,
             )
 
             await self.redis.xack(stream_name, self.group_name, msg_id)
@@ -476,7 +501,44 @@ class WorkerRunner:
             logger.error("Unsupported command in message %s", msg_id)
             await self.redis.xack(stream_name, self.group_name, msg_id)
         except Exception as e:  # pylint: disable=broad-exception-caught
-            logger.error("Error processing message %s: %s", msg_id, e)
+            logger.error("Error processing message %s: %s", msg_id, e, exc_info=True)
+            # Record a failed span so the execution is visible in traces.
+            if err_execution_id and err_start_ts and err_header:
+                try:
+                    await self._record_worker_execute_span(
+                        trace_id=err_header.trace_id,
+                        execution_id=err_execution_id,
+                        message_id=err_header.message_id,
+                        parent_message_id=err_header.parent_message_id or "",
+                        session_id=err_session_id,
+                        worker_id=self.worker.worker_id,
+                        target_agent_type=err_header.target_agent_type,
+                        status="FAILED",
+                        completion_fields={
+                            "error_message": str(e),
+                            "error_type": type(e).__name__,
+                        },
+                        route_policy="",
+                        route_status="",
+                        start_ts=err_start_ts,
+                        end_ts=int(time.time() * 1000),
+                    )
+                except Exception:  # pylint: disable=broad-exception-caught
+                    pass
+            # Mark execution as FAILED so the next Redis re-delivery is immediately
+            # acked by the terminal-replay guard (line ~316), preventing infinite retry.
+            if err_execution_id and err_session_id:
+                err_registry = getattr(self.worker, "registry", None)
+                if err_registry and hasattr(err_registry, "mark_execution_finished"):
+                    try:
+                        await err_registry.mark_execution_finished(
+                            err_execution_id,
+                            err_session_id,
+                            "FAILED",
+                            {"error_message": str(e), "error_type": type(e).__name__},
+                        )
+                    except Exception:  # pylint: disable=broad-exception-caught
+                        pass
         finally:
             # Clean up tracking
             message_id = data_dict.get("header", {}).get("message_id", "")
@@ -518,6 +580,7 @@ class WorkerRunner:
         route_status: str,
         start_ts: int,
         end_ts: int,
+        chunk_count: int = 0,
     ) -> None:
         try:
             await self.span_recorder.record_span(
@@ -543,6 +606,7 @@ class WorkerRunner:
                     retryable=bool(completion_fields.get("retryable", False)),
                     route_policy=route_policy,
                     route_status=route_status,
+                    chunk_count=chunk_count,
                 )
             )
         except Exception as err:  # pylint: disable=broad-exception-caught

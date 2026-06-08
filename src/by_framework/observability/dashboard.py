@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import os
 import threading
@@ -388,6 +389,7 @@ def make_handler(
     queue_backlog_threshold: int = 100,
     alert_policy: AlertPolicy | None = None,
     runtime_state: DashboardRuntimeState | None = None,
+    auth_token: str = "",
 ) -> type[BaseHTTPRequestHandler]:
     """Build a request handler bound to the dashboard routes."""
 
@@ -397,6 +399,7 @@ def make_handler(
         queue_backlog_threshold=queue_backlog_threshold
     )
     state = runtime_state or DashboardRuntimeState(started_at_ms=_now_ms())
+    required_token = auth_token or os.environ.get("BY_FRAMEWORK_DASHBOARD_TOKEN", "")
     # Cache /metrics snapshots to avoid a full Redis scan on every Prometheus scrape.
     _metrics_cache: dict[str, Any] = {"snapshot": None, "time": 0.0}
 
@@ -409,6 +412,12 @@ def make_handler(
             parsed = urlparse(self.path)
             path = parsed.path
             request_started_ms = _now_ms()
+            if self._requires_auth(path) and not self._is_authorized():
+                self._send_json(
+                    {"error": "unauthorized", "status": "error"},
+                    status=HTTPStatus.UNAUTHORIZED,
+                )
+                return
             if path == "/api/health":
                 self._send_json(state.to_payload())
                 return
@@ -887,11 +896,18 @@ def make_handler(
                             )
                             _metrics_cache["snapshot"] = snapshot
                             _metrics_cache["time"] = time.time()
-                    from by_framework.observability.metrics import generate_latest_metrics
+                    from by_framework.observability.metrics import (
+                        build_observability_diagnostics_metrics,
+                        generate_latest_metrics,
+                    )
+                    from by_framework.observability.span_recorder import get_observability_diagnostics
 
                     body, content_type = serialize_text(
                         build_prometheus_metrics(snapshot)
                         + build_dashboard_runtime_metrics(state)
+                        + build_observability_diagnostics_metrics(
+                            get_observability_diagnostics()
+                        )
                         + generate_latest_metrics()
                     )
                 except Exception as err:  # pylint: disable=broad-exception-caught
@@ -926,6 +942,20 @@ def make_handler(
 
         def log_message(self, format: str, *args: Any) -> None:
             """Keep dashboard request logging quiet by default."""
+
+        def _requires_auth(self, path: str) -> bool:
+            return bool(required_token) and (
+                path.startswith("/api/") or path == "/metrics"
+            )
+
+        def _is_authorized(self) -> bool:
+            if not required_token:
+                return True
+            header = self.headers.get("Authorization", "")
+            prefix = "Bearer "
+            if not header.startswith(prefix):
+                return False
+            return hmac.compare_digest(header[len(prefix) :].strip(), required_token)
 
         def _send_json(
             self,
@@ -1014,8 +1044,13 @@ def serve(
     redis_client: Any = None,
     queue_backlog_threshold: int = 100,
     alert_policy: AlertPolicy | None = None,
+    auth_token: str = "",
 ) -> None:
     """Start the observability dashboard HTTP server."""
+    if host not in ("127.0.0.1", "localhost", "::1") and not auth_token:
+        logger.warning(
+            "Observability dashboard is bound to %s without an auth token.", host
+        )
     runner = DashboardAsyncRunner()
     server = ThreadingHTTPServer(
         (host, port),
@@ -1024,6 +1059,7 @@ def serve(
             redis_client=redis_client,
             queue_backlog_threshold=queue_backlog_threshold,
             alert_policy=alert_policy,
+            auth_token=auth_token,
         ),
     )
     print(f"by-framework observability dashboard: http://{host}:{port}")
@@ -1052,25 +1088,30 @@ def parse_args() -> argparse.Namespace:
         "--queue-backlog-threshold",
         type=int,
         default=100,
-        help="队列积压告警阈值（消息数），默认 100",
+        help="Queue backlog alert threshold in messages. Default: 100.",
     )
     parser.add_argument(
         "--delivery-pending-threshold",
         type=int,
         default=0,
-        help="控制面待投递消息告警阈值，默认 0",
+        help="Control-plane pending delivery alert threshold. Default: 0.",
     )
     parser.add_argument(
         "--consumer-pending-threshold",
         type=int,
         default=0,
-        help="消费者组 pending 消息告警阈值，默认 0",
+        help="Consumer group pending message alert threshold. Default: 0.",
     )
     parser.add_argument(
         "--failed-execution-threshold",
         type=int,
         default=0,
-        help="失败执行数告警阈值，默认 0",
+        help="Failed execution alert threshold. Default: 0.",
+    )
+    parser.add_argument(
+        "--auth-token",
+        default=os.environ.get("BY_FRAMEWORK_DASHBOARD_TOKEN", ""),
+        help="Bearer token required for dashboard API and metrics routes.",
     )
     return parser.parse_args()
 
@@ -1096,6 +1137,7 @@ def main() -> None:
             consumer_pending_threshold=args.consumer_pending_threshold,
             failed_execution_threshold=args.failed_execution_threshold,
         ),
+        auth_token=args.auth_token,
     )
 
 

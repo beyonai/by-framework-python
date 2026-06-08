@@ -16,6 +16,19 @@ from by_framework.core.protocol.commands import (
 from by_framework.core.protocol.data_message import DataMessage
 from by_framework.core.protocol.message import (BaiYingMessage, BaiYingMessageRole)
 from by_framework.errors import WorkerRegistryNotSetError
+from by_framework.observability.span_recorder import str_to_uint64
+
+
+class FakeObservation:
+    """Observation double used for client-side Langfuse dispatch tests."""
+
+    id = "obs-client-dispatch"
+
+    def __init__(self):
+        self.ended_with = None
+
+    def end(self, **kwargs):
+        self.ended_with = kwargs
 
 
 @pytest.mark.asyncio
@@ -44,6 +57,43 @@ async def test_client_send_message_with_target_worker_id():
     command = command_from_dict(data)
     assert isinstance(command, AskAgentCommand)
     assert command.header.target_agent_type == "langgraph_agent"
+
+
+@pytest.mark.asyncio
+async def test_client_send_message_writes_langfuse_parent_to_header_metadata():
+    """Client-side Langfuse dispatch root is propagated to workers via metadata."""
+    mock_redis = AsyncMock()
+    mock_registry = AsyncMock()
+    observation = FakeObservation()
+
+    client = GatewayClient(redis_client=mock_redis, registry=mock_registry)
+    client._start_langfuse_client_dispatch_observation = (  # pylint: disable=protected-access
+        lambda **kwargs: observation
+    )
+
+    await client.send_message(
+        target_agent_type="langgraph_agent",
+        session_id="s1",
+        content="hello",
+        target_worker_id="worker-42",
+        message_id="msg-client",
+        trace_id="trace-client",
+        metadata={"request_id": "req-1"},
+    )
+
+    args, _ = mock_redis.xadd.call_args
+    command = command_from_dict(json.loads(args[1]["data"]))
+
+    assert command.header.metadata == {
+        "request_id": "req-1",
+    }
+    assert command.header.langfuse_parent_observation_id == "obs-client-dispatch"
+    expected_span_id = "msg-client:client.dispatch"
+    assert command.header.trace_parent_span_id == (
+        f"{str_to_uint64(expected_span_id):016x}"
+    )
+    assert observation.ended_with["output"]["success"] is True
+    assert observation.ended_with["output"]["message_id"] == "msg-client"
 
 
 @pytest.mark.asyncio
@@ -199,6 +249,7 @@ async def test_client_cancel_task_routes_to_worker_control_stream():
         "execution_id": "exec-1",
         "message_id": "msg-1",
         "session_id": "sess-1",
+        "trace_id": "trace-original",
         "worker_id": "worker-1",
         "target_agent_type": "langgraph_agent",
         "status": "RUNNING",
@@ -226,6 +277,7 @@ async def test_client_cancel_task_routes_to_worker_control_stream():
     command = command_from_dict(raw)
     assert isinstance(command, CancelTaskCommand)
     assert command.target_message_id == "msg-1"
+    assert command.header.trace_id == root_exec["trace_id"]
 
 
 @pytest.mark.asyncio

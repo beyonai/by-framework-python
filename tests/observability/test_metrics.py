@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from by_framework.observability.metrics import (
     PROMETHEUS_AVAILABLE,
+    build_observability_diagnostics_metrics,
     generate_latest_metrics,
     get_registry,
     record_execution_metrics,
+)
+from by_framework.observability.span_recorder import (
+    TraceSpan,
+    get_observability_diagnostics,
+    reset_observability_diagnostics,
 )
 
 
@@ -43,3 +49,36 @@ def test_get_registry():
         assert registry is not None
     else:
         assert registry is None
+
+
+def test_build_observability_diagnostics_metrics_exports_drop_and_failure_counts():
+    """Trace exporter self-diagnostics are exported as Prometheus text."""
+    reset_observability_diagnostics()
+
+    # Mutate diagnostics through public record behavior.
+    from by_framework.observability.span_recorder import SpanRecorder
+
+    recorder = SpanRecorder(exporters=[])
+    span = TraceSpan(
+        trace_id="trace-diag",
+        span_id="span-1",
+        parent_span_id="",
+        operation="agent.emit_chunk",
+        component="agent_context",
+        start_ts=1,
+        end_ts=2,
+        status="COMPLETED",
+    )
+
+    import asyncio
+
+    asyncio.run(recorder.record_span(span))
+    diagnostics = get_observability_diagnostics()
+
+    metrics = build_observability_diagnostics_metrics(diagnostics)
+
+    assert "by_framework_observability_dropped_spans_total 1" in metrics
+    assert (
+        'by_framework_observability_dropped_spans_by_reason_total{reason="disabled"} 1'
+        in metrics
+    )

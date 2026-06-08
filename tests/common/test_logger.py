@@ -25,23 +25,23 @@ class TestLogger:
         assert lg.level == logging.DEBUG
 
     def test_logger_handlers(self):
-        """Test that logger has the correct handlers configured."""
+        """Default setup_logging has only a console handler (log_file=None)."""
         lg = setup_logging()
+        assert len(lg.handlers) == 1
+
+        has_console_handler = any("StreamHandler" in str(type(h)) for h in lg.handlers)
+        assert has_console_handler, "Console handler not configured"
+
+    def test_logger_handlers_with_file(self, tmp_path):
+        """Passing log_file adds a rotating file handler alongside the console one."""
+        log_path = str(tmp_path / "test.log")
+        lg = setup_logging(name="by-framework-file-test", log_file=log_path)
         assert len(lg.handlers) == 2
 
-        # Check if there is a console handler and file handler
-        has_console_handler = False
-        has_file_handler = False
-
-        for handler in lg.handlers:
-            handler_type = str(type(handler))
-            if "StreamHandler" in handler_type:
-                has_console_handler = True
-            elif "RotatingFileHandler" in handler_type:
-                has_file_handler = True
-
-        assert has_console_handler, "Console handler not configured"
-        assert has_file_handler, "File handler not configured"
+        has_console = any("StreamHandler" in str(type(h)) for h in lg.handlers)
+        has_file = any("RotatingFileHandler" in str(type(h)) for h in lg.handlers)
+        assert has_console, "Console handler not configured"
+        assert has_file, "File handler not configured"
 
     def test_logger_formatter(self):
         """Test that log format is correctly configured."""
