@@ -1,6 +1,6 @@
 [project]
 name = "by-framework-trace-phoenix"
-version = "0.0.3.dev0"
+version = "0.0.3.dev1"
 description = "Arize Phoenix trace provider for by-framework"
 readme = "README.md"
 requires-python = ">=3.12"
