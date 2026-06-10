@@ -385,8 +385,17 @@ class RedisSpanExporter:
         payload = span.to_payload()
         trace_id = str(payload["trace_id"])
         start_ts = int(payload.get("start_ts", 0) or 0)
+        end_ts = int(payload.get("end_ts", start_ts) or start_ts)
         meta_key = RedisKeys.trace_meta(trace_id)
         spans_key = RedisKeys.trace_spans(trace_id)
+        existing_start_ts = await self._read_hash_int(meta_key, "start_ts")
+        existing_updated_at = await self._read_hash_int(meta_key, "updated_at")
+        trace_start_ts = (
+            min(value for value in (existing_start_ts, start_ts) if value > 0)
+            if existing_start_ts or start_ts
+            else 0
+        )
+        updated_at = max(existing_updated_at, end_ts)
         pipe = self.redis.pipeline()
         if isawaitable(pipe):
             pipe = await pipe
@@ -418,14 +427,8 @@ class RedisSpanExporter:
                 "root_message_id",
                 str(payload.get("message_id", "")),
             )
-        await self._call_pipeline(pipe, "hset", meta_key, "start_ts", start_ts)
-        await self._call_pipeline(
-            pipe,
-            "hset",
-            meta_key,
-            "updated_at",
-            int(payload.get("end_ts", start_ts) or start_ts),
-        )
+        await self._call_pipeline(pipe, "hset", meta_key, "start_ts", trace_start_ts)
+        await self._call_pipeline(pipe, "hset", meta_key, "updated_at", updated_at)
         await self._call_pipeline(
             pipe, "rpush", spans_key, json.dumps(payload, ensure_ascii=False)
         )
@@ -467,6 +470,20 @@ class RedisSpanExporter:
         result = getattr(pipe, method_name)(*args)
         if isawaitable(result):
             await result
+
+    async def _read_hash_int(self, name: str, field_name: str) -> int:
+        hget = getattr(self.redis, "hget", None)
+        if not callable(hget):
+            return 0
+        try:
+            value = hget(name, field_name)  # pylint: disable=not-callable
+            if isawaitable(value):
+                value = await value
+            if isinstance(value, bytes):
+                value = value.decode("utf-8")
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
 
 
 class OTelSpanExporter:

@@ -9,6 +9,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 from by_framework import RedisKeys
+from by_framework.metrics import MetricsReadResult, MetricsWindow
 from by_framework.trace import (
     EventRecord,
     ExecutionRecord,
@@ -94,6 +95,45 @@ class SlowTraceSource:
         )
 
 
+class RecordingMetricsClient:
+    """Metrics client fake that records requested correlation windows."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def explain_window(self, *, start_ts, end_ts, buffer_ms=5000, limit=120):
+        self.calls.append(
+            {
+                "start_ts": start_ts,
+                "end_ts": end_ts,
+                "buffer_ms": buffer_ms,
+                "limit": limit,
+            }
+        )
+        return MetricsReadResult(
+            window=MetricsWindow(
+                start_ts=start_ts - buffer_ms,
+                end_ts=end_ts + buffer_ms,
+            ),
+            samples=[
+                {
+                    "generated_at": start_ts,
+                    "queue_depth_total": 3,
+                    "consumer_pending_total": 0,
+                }
+            ],
+            summary={"sample_count": 1, "queue_depth_total": {"max": 3}},
+        )
+
+
+class FailingMetricsClient:
+    """Metrics client fake that fails reads."""
+
+    async def explain_window(self, *, start_ts, end_ts, buffer_ms=5000, limit=120):
+        del start_ts, end_ts, buffer_ms, limit
+        raise RuntimeError("metrics unavailable")
+
+
 class QueryPipeline:
     """Minimal Redis pipeline used by trace writer tests."""
 
@@ -146,6 +186,9 @@ class QueryRedis:
 
     async def hgetall(self, name):
         return self.data.get(name, {})
+
+    async def hget(self, name, key):
+        return self.data.get(name, {}).get(key)
 
     async def rpush(self, name, value):
         self.data.setdefault(name, []).append(value)
@@ -714,6 +757,80 @@ async def test_trace_read_client_lists_traces_from_session_registry_fallback():
 
     assert [result.trace.trace_id for result in traces] == ["trace-fallback"]
     assert traces[0].spans[0].span_id == "worker"
+
+
+@pytest.mark.asyncio
+async def test_trace_explain_correlates_metrics_by_trace_time_window():
+    """Trace explanation includes metrics for the trace start/end window."""
+    redis = QueryRedis()
+    metrics_client = RecordingMetricsClient()
+    writer = TraceWriteClient(redis)
+    await writer.record_trace(
+        TraceRecord(
+            trace_id="trace-explain",
+            session_id="session-explain",
+            start_ts=100,
+            end_ts=200,
+            status="COMPLETED",
+        )
+    )
+    await writer.record_span(
+        SpanRecord(
+            trace_id="trace-explain",
+            span_id="worker",
+            operation="worker.execute",
+            component="worker",
+            start_ts=120,
+            end_ts=180,
+        )
+    )
+
+    explanation = await TraceReadClient(
+        redis_client=redis,
+        metrics_client=metrics_client,
+    ).explain_trace(
+        "trace-explain",
+        session_id="session-explain",
+        metrics_buffer_ms=10,
+    )
+
+    assert explanation["time_window"] == {
+        "start_ts": 100,
+        "end_ts": 200,
+        "duration_ms": 100,
+    }
+    assert metrics_client.calls == [
+        {"start_ts": 100, "end_ts": 200, "buffer_ms": 10, "limit": 120}
+    ]
+    assert explanation["related_metrics"]["summary"]["queue_depth_total"]["max"] == 3
+
+
+@pytest.mark.asyncio
+async def test_trace_explain_keeps_trace_result_when_metrics_read_fails():
+    """Metrics correlation is best-effort and does not fail trace explain."""
+    redis = QueryRedis()
+    writer = TraceWriteClient(redis)
+    await writer.record_span(
+        SpanRecord(
+            trace_id="trace-metrics-fail",
+            span_id="client",
+            operation="client.dispatch",
+            component="client",
+            start_ts=100,
+            end_ts=150,
+        )
+    )
+
+    explanation = await TraceReadClient(
+        redis_client=redis,
+        metrics_client=FailingMetricsClient(),
+    ).explain_trace("trace-metrics-fail")
+
+    assert explanation["span_count"] == 1
+    assert explanation["related_metrics"]["status"] == "partial"
+    assert explanation["related_metrics"]["diagnostics"][0]["code"] == (
+        "metrics_source_failed"
+    )
 
 
 @pytest.mark.asyncio
