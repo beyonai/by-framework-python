@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from importlib import import_module
 from typing import Any, Optional, Protocol, runtime_checkable
 
+from by_framework.common.logger import get_logger
 from by_framework.core.extensions import (
     AgentConfig,
     Plugin,
@@ -27,6 +28,8 @@ from by_framework.trace.span_recorder import (
     str_to_uint64,
     str_to_uint128,
 )
+
+logger = get_logger(__name__)
 
 LANGFUSE_OBSERVATION_ATTR = "_langfuse_observation"
 LANGFUSE_CALL_PARENT_OBSERVATION_ATTR = "_langfuse_call_parent_observation"
@@ -371,6 +374,8 @@ class LangfusePlugin(Plugin):
 
     async def on_task_start(self, context: Any) -> None:  # pylint: disable=too-many-locals
         tracer = self._get_tracer()
+        if tracer is None:
+            return
         observation_store = self._get_observation_store(context)
         identity = self._build_task_identity(context)
 
@@ -532,6 +537,8 @@ class LangfusePlugin(Plugin):
     async def on_call_agent_start(self, context: Any, command: Any) -> None:
         """Create a call observation and pass it as the child task parent."""
         tracer = self._get_tracer()
+        if tracer is None:
+            return
         header = getattr(command, "header", None)
         if header is None:
             return
@@ -618,6 +625,8 @@ class LangfusePlugin(Plugin):
         """Create a return observation and pass it as the resume parent."""
         del context, command
         tracer = self._get_tracer()
+        if tracer is None:
+            return
         header = getattr(callback_command, "header", None)
         if header is None:
             return
@@ -730,7 +739,7 @@ class LangfusePlugin(Plugin):
                 return parent_id
         return ""
 
-    def _get_tracer(self) -> LangfuseTracer:
+    def _get_tracer(self) -> Optional[LangfuseTracer]:
         tracer = self._tracer or self._build_default_tracer()
         self._tracer = tracer
         return tracer
@@ -744,13 +753,14 @@ class LangfusePlugin(Plugin):
         )
         return self._observation_store
 
-    def _build_default_tracer(self) -> LangfuseTracer:
+    def _build_default_tracer(self) -> Optional[LangfuseTracer]:
         config = LangfuseConfig.from_env()
         if config is None:
-            raise RuntimeError(
-                "LangfusePlugin requires LANGFUSE_SECRET_KEY, "
-                "LANGFUSE_PUBLIC_KEY, and LANGFUSE_BASE_URL to be set."
+            logger.error(
+                "LangfusePlugin: LANGFUSE_SECRET_KEY, LANGFUSE_PUBLIC_KEY, and "
+                "LANGFUSE_BASE_URL are not set — Langfuse tracing disabled."
             )
+            return None
 
         try:
             langfuse_module = import_module("langfuse")
