@@ -136,7 +136,11 @@ class RedisKeys:
     # Set of known workers used for registry enumeration.
     KNOWN_WORKERS = "byai_gateway:registry:workers"
     WORKER_DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5
-    WORKER_DEFAULT_LEASE_TTL_SECONDS = 15
+    # 6× the heartbeat interval gives enough margin even when the main event
+    # loop is briefly occupied by an LLM call.  The dedicated heartbeat thread
+    # makes starvation practically impossible, but the larger TTL is a second
+    # line of defence and also gives Worker 2 time to claim after a crash.
+    WORKER_DEFAULT_LEASE_TTL_SECONDS = 30
 
     # Default TTL (7 days) for cleaning up session-related aggregate Keys
     DEFAULT_SESSION_TTL = 7 * 24 * 3600

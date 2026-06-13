@@ -43,7 +43,16 @@ from by_framework.core.protocol.responses import (
 )
 from by_framework.core.registry import WorkerRegistry
 from by_framework.errors import WorkerRegistryNotSetError
-from by_framework.trace.span_recorder import (SpanRecorder, TraceSpan, str_to_uint64)
+from by_framework.trace.span_recorder import (
+    ObservabilityConfig,
+    SpanRecorder,
+    TraceSpan,
+    build_observability_config,
+    sanitize_io_value,
+    str_to_uint64,
+)
+from by_framework.trace.trace_schema import TraceRecord
+from by_framework.trace.trace_writer import TraceWriteClient
 
 if TYPE_CHECKING:
     pass
@@ -89,13 +98,20 @@ class GatewayClient:
         redis_client: Optional[Redis] = None,
         interceptors: Optional[List[GatewayInterceptor]] = None,
         span_recorder: Optional[SpanRecorder] = None,
+        obs_config: Optional[ObservabilityConfig] = None,
     ):
         self.registry = registry
         self.redis = (
             redis_client or (registry.redis if registry else None) or get_redis()
         )
         self.interceptors = interceptors or []
-        self.span_recorder = span_recorder or SpanRecorder(self.redis)
+        self._obs_config = obs_config or build_observability_config()
+        self.span_recorder = span_recorder or SpanRecorder(
+            self.redis, config=self._obs_config
+        )
+        self._trace_writer = TraceWriteClient(
+            self.redis, ttl_seconds=self._obs_config.ttl_seconds
+        )
         self._langfuse_dispatch_fn = self._resolve_langfuse_dispatch_fn()
 
     @staticmethod
@@ -617,6 +633,20 @@ class GatewayClient:
             message_id = f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}"
         if not trace_id:
             trace_id = uuid.uuid4().hex
+        trace_start_ts = int(time.time() * 1000)
+        is_root_dispatch = not params.get("parent_message_id", "")
+
+        # Write trace root start so the trace is visible even before the worker
+        # picks up the task.  Only written for root dispatches (no parent).
+        if is_root_dispatch:
+            await self._write_trace_root_start(
+                trace_id=trace_id,
+                message_id=message_id,
+                session_id=str(params.get("session_id", "")),
+                target_agent_type=str(params.get("target_agent_type", "")),
+                content=params.get("content"),
+                start_ts=trace_start_ts,
+            )
 
         metadata = dict(params.get("metadata", {}) or {})
         trace_parent_span_id = metadata.pop("trace_parent_span_id", "")
@@ -743,6 +773,13 @@ class GatewayClient:
                         output={"success": False, "error": availability.error},
                         error=availability.error,
                     )
+                    if is_root_dispatch:
+                        await self._write_trace_root_end(
+                            trace_id=trace_id,
+                            status="FAILED",
+                            end_ts=int(time.time() * 1000),
+                            error=availability.error or "",
+                        )
                     return response
                 if availability.status == AvailabilityStatus.QUEUE_PENDING:
                     should_dispatch_control = False
@@ -759,6 +796,13 @@ class GatewayClient:
                 output={"success": False, "error": str(err)},
                 error=str(err),
             )
+            if is_root_dispatch:
+                await self._write_trace_root_end(
+                    trace_id=trace_id,
+                    status="FAILED",
+                    end_ts=int(time.time() * 1000),
+                    error=str(err),
+                )
             return SendMessageResponse(
                 success=False,
                 status=ExecutionStatus.FAILED,
@@ -775,6 +819,13 @@ class GatewayClient:
                 output={"success": False, "error": str(err)},
                 error=str(err),
             )
+            if is_root_dispatch:
+                await self._write_trace_root_end(
+                    trace_id=trace_id,
+                    status="FAILED",
+                    end_ts=int(time.time() * 1000),
+                    error=str(err),
+                )
             return SendMessageResponse(
                 success=False,
                 status=ExecutionStatus.FAILED,
@@ -959,3 +1010,52 @@ class GatewayClient:
             logger.warning(
                 "Failed to record client dispatch span: %s", err, exc_info=True
             )
+
+    async def _write_trace_root_start(
+        self,
+        *,
+        trace_id: str,
+        message_id: str,
+        session_id: str,
+        target_agent_type: str,
+        content: Any,
+        start_ts: int,
+    ) -> None:
+        """Write trace root start — best-effort, never propagates errors."""
+        try:
+            await self._trace_writer.record_trace(
+                TraceRecord(
+                    trace_id=trace_id,
+                    name=target_agent_type,
+                    session_id=session_id,
+                    root_message_id=message_id,
+                    root_agent_type=target_agent_type,
+                    input=sanitize_io_value(content, self._obs_config),
+                    status="QUEUED",
+                    start_ts=start_ts,
+                )
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
+    async def _write_trace_root_end(
+        self,
+        *,
+        trace_id: str,
+        status: str,
+        end_ts: int,
+        error: str = "",
+    ) -> None:
+        """Write trace root end on routing failure — best-effort."""
+        try:
+            meta: dict = {"error": error} if error else {}
+            await self._trace_writer.record_trace(
+                TraceRecord(
+                    trace_id=trace_id,
+                    status=status,
+                    end_ts=end_ts,
+                    metadata=meta,
+                )
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass

@@ -10,10 +10,13 @@ import pytest
 from by_framework import RedisKeys
 from by_framework.trace import span_recorder as span_module
 from by_framework.trace.span_recorder import (
+    DEFAULT_IO_VALUE_MAX_LENGTH,
+    ObservabilityConfig,
     OTelSpanExporter,
     RedisSpanExporter,
     SpanRecorder,
     TraceSpan,
+    sanitize_io_value,
 )
 
 
@@ -229,3 +232,44 @@ async def test_span_recorder_records_export_failures():
     diagnostics = span_module.get_observability_diagnostics()
     assert diagnostics["export_failures_total"] == 1
     assert diagnostics["export_failures_by_exporter"]["FailingExporter"] == 1
+
+
+def test_sanitize_io_value_truncates_long_strings():
+    """sanitize_io_value truncates strings exceeding io_value_max_length."""
+    config = ObservabilityConfig(io_value_max_length=10)
+    result = sanitize_io_value("A" * 20, config)
+    assert result == "AAAAAAAAAA...[TRUNCATED]"
+
+
+def test_sanitize_io_value_passes_short_strings():
+    """sanitize_io_value leaves strings within the limit unchanged."""
+    config = ObservabilityConfig(io_value_max_length=100)
+    result = sanitize_io_value("hello", config)
+    assert result == "hello"
+
+
+def test_sanitize_io_value_redacts_when_flag_set():
+    """sanitize_io_value replaces the entire value with [REDACTED] when configured."""
+    config = ObservabilityConfig(redact_inputs=True)
+    assert sanitize_io_value("secret prompt", config) == "[REDACTED]"
+    assert sanitize_io_value({"key": "value"}, config) == "[REDACTED]"
+
+
+def test_sanitize_io_value_handles_dicts_and_lists():
+    """sanitize_io_value recursively sanitizes nested dicts and lists."""
+    config = ObservabilityConfig(io_value_max_length=5)
+    result = sanitize_io_value({"msg": "hello world"}, config)
+    assert result == {"msg": "hello...[TRUNCATED]"}
+
+    result_list = sanitize_io_value(["abcdefghij"], config)
+    assert result_list == ["abcde...[TRUNCATED]"]
+
+
+def test_observability_config_has_redact_inputs_and_io_max_length():
+    """ObservabilityConfig exposes redact_inputs and io_value_max_length fields."""
+    cfg = ObservabilityConfig(redact_inputs=True, io_value_max_length=1024)
+    assert cfg.redact_inputs is True
+    assert cfg.io_value_max_length == 1024
+    default = ObservabilityConfig()
+    assert default.redact_inputs is False
+    assert default.io_value_max_length == DEFAULT_IO_VALUE_MAX_LENGTH

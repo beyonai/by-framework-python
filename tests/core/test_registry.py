@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from by_framework import AgentConfig, PluginRegistry, RedisKeys, WorkerRegistry
+from by_framework.core import registry as registry_module
 
 OLD_ACTIVE_WORKERS = "byai_gateway:registry:active_workers"
 
@@ -27,6 +28,28 @@ def test_worker_execution_key_builders():
     assert RedisKeys.worker_active_snapshots("worker-1") == (
         "byai_gateway:registry:worker:active_snapshots:worker-1"
     )
+
+
+def test_local_ip_prefers_hostname_mapping_when_non_loopback():
+    with (
+        patch.object(registry_module.socket, "gethostname", return_value="worker-host"),
+        patch.object(registry_module.socket, "gethostbyname", return_value="10.0.0.12"),
+        patch.object(
+            registry_module, "_get_default_route_ip_address", return_value="10.0.0.99"
+        ),
+    ):
+        assert registry_module._get_local_ip_address() == "10.0.0.12"
+
+
+def test_local_ip_falls_back_to_route_when_hostname_is_loopback():
+    with (
+        patch.object(registry_module.socket, "gethostname", return_value="localhost"),
+        patch.object(registry_module.socket, "gethostbyname", return_value="127.0.0.1"),
+        patch.object(
+            registry_module, "_get_default_route_ip_address", return_value="10.0.0.99"
+        ),
+    ):
+        assert registry_module._get_local_ip_address() == "10.0.0.99"
     assert RedisKeys.worker_history_snapshots("worker-1") == (
         "byai_gateway:registry:worker:history_snapshots:worker-1"
     )
@@ -215,6 +238,78 @@ class MockRedis:
                 removed += 1
         return removed
 
+    async def eval(self, script, numkeys, *keys_and_args):
+        """Simulate Lua registry scripts in Python for unit tests.
+
+        Dispatches by argv count:
+          3 args → _HEARTBEAT_CAS_SCRIPT  (token, new_value, ttl)
+          2 args → _REFRESH_LOCK_SCRIPT   (token, ttl)
+          1 arg  → _RELEASE_LOCK_SCRIPT   (token_or_empty)
+        """
+        keys = list(keys_and_args[:numkeys])
+        args = list(keys_and_args[numkeys:])
+        lease_key = keys[0]
+
+        def _parse_token(raw):
+            if raw is None:
+                return None
+            try:
+                data = json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+                if not isinstance(data, dict):
+                    return None if data == 1 else str(data)
+                return data.get("token")
+            except Exception:  # pylint: disable=broad-exception-caught
+                return "__unparseable__"
+
+        if len(args) == 3:
+            # _HEARTBEAT_CAS_SCRIPT
+            token_arg, new_value, ttl = str(args[0]), args[1], int(args[2])
+            raw = self.kv.get(lease_key)
+            if token_arg != "":
+                if raw is None:
+                    self.kv[lease_key] = new_value
+                    self.expires[lease_key] = ttl
+                    return 1
+                stored = _parse_token(raw)
+                if stored == "__unparseable__":
+                    return -1
+                if stored is None or str(stored) != token_arg:
+                    return 0
+                self.kv[lease_key] = new_value
+                self.expires[lease_key] = ttl
+                return 1
+            if raw is not None:
+                stored = _parse_token(raw)
+                if stored == "__unparseable__" or stored is not None:
+                    return 0
+            self.kv[lease_key] = new_value
+            self.expires[lease_key] = ttl
+            return 1
+
+        if len(args) == 2:
+            # _REFRESH_LOCK_SCRIPT
+            token, ttl = str(args[0]), int(args[1])
+            raw = self.kv.get(lease_key)
+            stored = _parse_token(raw)
+            if stored is None or stored == "__unparseable__" or str(stored) != token:
+                return 0
+            self.expires[lease_key] = ttl
+            return 1
+
+        # len(args) == 1: _RELEASE_LOCK_SCRIPT
+        token_arg = str(args[0])
+        raw = self.kv.get(lease_key)
+        if raw is None:
+            return 1 if token_arg == "" else 0
+        if token_arg == "":
+            self.kv.pop(lease_key, None)
+            return 1
+        stored = _parse_token(raw)
+        if stored == "__unparseable__" or stored is None or str(stored) != token_arg:
+            return 0
+        self.kv.pop(lease_key, None)
+        return 1
+
     def pipeline(self):
         return MockPipeline(self)
 
@@ -272,16 +367,36 @@ async def test_register_worker_membership_only_updates_membership_sets():
 
 
 @pytest.mark.asyncio
+async def test_register_worker_membership_replaces_stale_agent_type_indexes():
+    """Test worker_id reuse removes stale agent-type reverse indexes."""
+    redis_mock = MockRedis()
+    registry = WorkerRegistry(redis_mock)
+
+    await registry.register_worker_membership("worker-1", ["agent-a", "agent-stale"])
+    await registry.register_worker_membership("worker-1", ["agent-a", "agent-b"])
+
+    assert redis_mock.data[RedisKeys.worker_declared_agent_types("worker-1")] == {
+        "agent-a",
+        "agent-b",
+    }
+    assert redis_mock.data[RedisKeys.agent_type_members("agent-a")] == {"worker-1"}
+    assert redis_mock.data[RedisKeys.agent_type_members("agent-b")] == {"worker-1"}
+    assert redis_mock.data[RedisKeys.agent_type_members("agent-stale")] == set()
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_worker_only_updates_presence():
     """Test that heartbeat marks liveness without mutating agent-type membership."""
     redis_mock = MockRedis()
     registry = WorkerRegistry(redis_mock)
+    registry._ip_address = "10.0.0.7"
 
     await registry.heartbeat_worker("worker-1")
 
     presence = json.loads(redis_mock.kv[RedisKeys.worker_online_lease("worker-1")])
     assert presence["token"] is None
     assert presence["last_seen"] > 0
+    assert presence["ip_address"] == "10.0.0.7"
     assert OLD_ACTIVE_WORKERS not in redis_mock.data
     assert redis_mock.data[RedisKeys.KNOWN_WORKERS] == {"worker-1"}
     assert redis_mock.expires[RedisKeys.worker_online_lease("worker-1")] == (
@@ -291,19 +406,36 @@ async def test_heartbeat_worker_only_updates_presence():
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_without_token_does_not_overwrite_claimed_lease():
+    """Test legacy/no-token heartbeat cannot steal an owned worker ID lease."""
+    redis_mock = MockRedis()
+    owner = WorkerRegistry(redis_mock)
+    stale = WorkerRegistry(redis_mock)
+
+    token = await owner.claim_worker_id("worker-1")
+
+    assert await stale.heartbeat_worker("worker-1") is False
+    presence = json.loads(redis_mock.kv[RedisKeys.worker_online_lease("worker-1")])
+    assert presence["token"] == token
+
+
+@pytest.mark.asyncio
 async def test_worker_online_lease_uses_claim_token_as_owner():
     """Test online lease ownership prevents stale workers mutating new owners."""
     redis_mock = MockRedis()
     registry = WorkerRegistry(redis_mock)
+    registry._ip_address = "10.0.0.8"
 
     token1 = await registry.claim_worker_id("worker-1")
     presence1 = json.loads(redis_mock.kv[RedisKeys.worker_online_lease("worker-1")])
     assert presence1["token"] == token1
+    assert presence1["ip_address"] == "10.0.0.8"
 
     await registry.heartbeat_worker("worker-1")
     presence1 = json.loads(redis_mock.kv[RedisKeys.worker_online_lease("worker-1")])
     assert presence1["token"] == token1
     assert presence1["last_seen"] > 0
+    assert presence1["ip_address"] == "10.0.0.8"
 
     redis_mock.kv.pop(RedisKeys.worker_online_lease("worker-1"))
     registry2 = WorkerRegistry(redis_mock)
@@ -407,6 +539,7 @@ async def test_get_all_workers_uses_presence_last_seen_for_alive_workers():
     """Test worker listing uses presence JSON instead of active worker zset."""
     redis_mock = MockRedis()
     registry = WorkerRegistry(redis_mock)
+    registry._ip_address = "10.0.0.9"
 
     await registry.register_worker_membership("worker-1", ["super_assistant"])
     await registry.heartbeat_worker("worker-1")
@@ -417,6 +550,7 @@ async def test_get_all_workers_uses_presence_last_seen_for_alive_workers():
     assert set(workers) == {"worker-1"}
     assert workers["worker-1"]["agent_types"] == ["super_assistant"]
     assert workers["worker-1"]["last_seen"] > 0
+    assert workers["worker-1"]["ip_address"] == "10.0.0.9"
     assert OLD_ACTIVE_WORKERS not in redis_mock.data
 
 

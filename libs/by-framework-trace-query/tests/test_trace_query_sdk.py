@@ -891,3 +891,94 @@ async def test_dashboard_trace_endpoints_use_trace_read_sdk_shape():
     assert traces_response.status == 200
     assert traces_payload["traces"][0]["trace_id"] == "trace-dashboard"
     assert traces_payload["traces"][0]["span_count"] == trace_payload["span_count"]
+
+
+@pytest.mark.asyncio
+async def test_trace_write_client_records_trace_root_start():
+    """TraceWriteClient persists start_ts and QUEUED status for trace root."""
+    redis = QueryRedis()
+    writer = TraceWriteClient(redis)
+    await writer.record_trace(
+        TraceRecord(
+            trace_id="trace-root-start",
+            name="planner",
+            session_id="session-x",
+            root_message_id="msg-1",
+            root_agent_type="planner",
+            input={"text": "hello"},
+            status="QUEUED",
+            start_ts=1000,
+        )
+    )
+
+    meta = {
+        k.decode() if isinstance(k, bytes) else k: decode_redis_value(v)
+        for k, v in (
+            await redis.hgetall(RedisKeys.trace_meta("trace-root-start"))
+        ).items()
+    }
+    assert meta["trace_id"] == "trace-root-start"
+    assert meta["status"] == "QUEUED"
+    assert int(meta["start_ts"]) == 1000
+    assert meta["root_agent_type"] == "planner"
+    assert meta["root_message_id"] == "msg-1"
+    assert meta.get("input") == {"text": "hello"}
+
+
+@pytest.mark.asyncio
+async def test_trace_write_client_records_trace_root_end():
+    """TraceWriteClient persists end_ts, status and output when root finishes."""
+    redis = QueryRedis()
+    writer = TraceWriteClient(redis)
+    # Simulate the start record written by the client
+    await writer.record_trace(
+        TraceRecord(
+            trace_id="trace-root-end",
+            name="planner",
+            root_agent_type="planner",
+            status="QUEUED",
+            start_ts=1000,
+        )
+    )
+    # Simulate the end record written by the worker
+    await writer.record_trace(
+        TraceRecord(
+            trace_id="trace-root-end",
+            status="COMPLETED",
+            end_ts=5000,
+            output={"answer": "42"},
+        )
+    )
+
+    meta = {
+        k.decode() if isinstance(k, bytes) else k: decode_redis_value(v)
+        for k, v in (
+            await redis.hgetall(RedisKeys.trace_meta("trace-root-end"))
+        ).items()
+    }
+    assert meta["status"] == "COMPLETED"
+    assert int(meta["end_ts"]) == 5000
+    assert meta.get("output") == {"answer": "42"}
+
+
+@pytest.mark.asyncio
+async def test_trace_read_client_returns_start_ts_from_trace_record():
+    """TraceReadClient propagates start_ts written by the client into the result."""
+    redis = QueryRedis()
+    writer = TraceWriteClient(redis)
+    await writer.record_trace(
+        TraceRecord(
+            trace_id="trace-ts-check",
+            name="scheduler",
+            session_id="sess-ts",
+            root_agent_type="scheduler",
+            status="QUEUED",
+            start_ts=2000,
+        )
+    )
+    from by_framework_trace_query.client import TraceReadClient as TRC
+
+    client = TRC(redis_client=redis)
+    result = await client.get_trace("trace-ts-check", session_id="sess-ts")
+    assert result.trace.start_ts == 2000
+    assert result.trace.root_agent_type == "scheduler"

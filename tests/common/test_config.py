@@ -99,8 +99,10 @@ class TestWorkerConfig(unittest.TestCase):
         self.assertEqual(config.max_concurrency, 50)
         self.assertEqual(config.fetch_count, 10)
         self.assertEqual(config.heartbeat_interval_seconds, 5)
-        self.assertEqual(config.heartbeat_lease_ttl_seconds, 15)
+        self.assertEqual(config.heartbeat_lease_ttl_seconds, 30)
         self.assertEqual(config.lock_ttl_seconds, 60)
+        self.assertEqual(config.worker_id_claim_max_wait_seconds, 90)
+        self.assertEqual(config.worker_id_claim_retry_interval_seconds, 3.0)
         self.assertEqual(config.stream_block_ms, 2000)
 
     def test_frozen_immutability(self):

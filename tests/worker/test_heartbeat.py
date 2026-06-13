@@ -26,6 +26,17 @@ class MockRegistry:
     async def heartbeat_worker(self, worker_id: str, lease_ttl_seconds: int = 15):
         self.heartbeat_calls.append((worker_id, lease_ttl_seconds))
         self.worker_id = worker_id
+        return True
+
+
+class FailingAfterStartRegistry(MockRegistry):
+    """Registry that allows startup, then fails periodic heartbeat."""
+
+    async def heartbeat_worker(self, worker_id: str, lease_ttl_seconds: int = 15):
+        if self.heartbeat_calls:
+            self.heartbeat_calls.append((worker_id, lease_ttl_seconds))
+            raise RuntimeError("redis unavailable")
+        return await super().heartbeat_worker(worker_id, lease_ttl_seconds)
 
 
 class TestWorkerHeartbeat(unittest.IsolatedAsyncioTestCase):
@@ -44,7 +55,7 @@ class TestWorkerHeartbeat(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(heartbeat.worker_id, "worker-1")
         self.assertEqual(heartbeat.agent_types, ["agent-a", "agent-b"])
         self.assertEqual(heartbeat.interval, 15)
-        self.assertEqual(heartbeat.lease_ttl_seconds, 15)
+        self.assertEqual(heartbeat.lease_ttl_seconds, 30)
         self.assertIsNone(heartbeat._task)
 
     async def test_start_initial_registration(self):
@@ -61,7 +72,7 @@ class TestWorkerHeartbeat(unittest.IsolatedAsyncioTestCase):
         # Should have registered membership and initial heartbeat
         self.assertEqual(len(mock_registry.membership_calls), 1)
         self.assertEqual(mock_registry.membership_calls[0][0], "worker-1")
-        self.assertEqual(mock_registry.heartbeat_calls, [("worker-1", 15)])
+        self.assertEqual(mock_registry.heartbeat_calls, [("worker-1", 30)])
 
         # Task should be created
         self.assertIsNotNone(heartbeat._task)
@@ -142,8 +153,8 @@ class TestWorkerHeartbeat(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(heartbeat._task)
 
-    async def test_heartbeat_loop_registers_periodically(self):
-        """Test that heartbeat loop only refreshes liveness after startup."""
+    async def test_heartbeat_loop_repairs_membership_periodically(self):
+        """Test heartbeat loop refreshes liveness and repairs membership."""
         mock_registry = MockRegistry()
         heartbeat = WorkerHeartbeat(
             worker_id="worker-1",
@@ -157,12 +168,18 @@ class TestWorkerHeartbeat(unittest.IsolatedAsyncioTestCase):
         # Wait for a couple of heartbeat cycles
         await asyncio.sleep(0.035)
 
-        # Membership is static and should only be written once.
-        self.assertEqual(len(mock_registry.membership_calls), 1)
+        # Membership is reconciled periodically so Redis set loss can self-heal.
+        self.assertGreaterEqual(len(mock_registry.membership_calls), 2)
+        self.assertTrue(
+            all(
+                call == ("worker-1", ["agent-a"])
+                for call in mock_registry.membership_calls
+            )
+        )
         # Liveness should be refreshed repeatedly.
         self.assertGreaterEqual(len(mock_registry.heartbeat_calls), 2)
         self.assertTrue(
-            all(call == ("worker-1", 15) for call in mock_registry.heartbeat_calls)
+            all(call == ("worker-1", 30) for call in mock_registry.heartbeat_calls)
         )
 
         await heartbeat.stop()
@@ -190,6 +207,24 @@ class TestWorkerHeartbeat(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "Error 1"):
             await heartbeat.start()
         self.assertEqual(error_count, 1)
+
+    async def test_heartbeat_exits_after_failure_deadline(self):
+        """Test sustained heartbeat failures trigger the watcher task."""
+        mock_registry = FailingAfterStartRegistry()
+        heartbeat = WorkerHeartbeat(
+            worker_id="worker-1",
+            agent_types=["agent-a"],
+            registry=mock_registry,
+            interval=0.01,
+            lease_ttl_seconds=0.03,
+        )
+
+        await heartbeat.start()
+
+        with self.assertRaisesRegex(RuntimeError, "lock was stolen"):
+            await asyncio.wait_for(heartbeat.task, timeout=0.5)
+
+        await heartbeat.stop()
 
 
 if __name__ == "__main__":

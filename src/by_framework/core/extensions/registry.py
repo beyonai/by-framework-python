@@ -19,13 +19,20 @@ import dill
 from by_framework.common.logger import logger
 
 from .agent_config import AgentConfig
-from .plugin import (AgentConfigsSnapshot, Plugin, PluginBuildContext,
-                     PluginReloadContext, PluginReloadResult)
+from .plugin import (
+    AgentConfigsSnapshot,
+    Plugin,
+    PluginBuildContext,
+    PluginReloadContext,
+    PluginReloadResult,
+)
 
 if TYPE_CHECKING:
-    from by_framework.core.protocol.commands import (AskAgentCommand,
-                                                     CancelTaskCommand,
-                                                     ResumeCommand)
+    from by_framework.core.protocol.commands import (
+        AskAgentCommand,
+        CancelTaskCommand,
+        ResumeCommand,
+    )
     from by_framework.worker.context import AgentContext
     from by_framework.worker.worker import GatewayWorker
 

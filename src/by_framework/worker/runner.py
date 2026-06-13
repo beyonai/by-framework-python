@@ -32,7 +32,10 @@ from by_framework.trace.span_recorder import (
     TraceSpan,
     build_observability_config,
     live_execution_otel_span,
+    sanitize_io_value,
 )
+from by_framework.trace.trace_schema import TraceRecord
+from by_framework.trace.trace_writer import TraceWriteClient
 from by_framework.util.generate_message_id import generate_message_id
 from by_framework.worker.context import current_worker_id_var
 from by_framework.worker.worker import GatewayWorker
@@ -76,13 +79,18 @@ class WorkerRunner:
         # OTel for worker.execute is emitted via a live wrapping span (see
         # _process_message_from_dict); this recorder only feeds the Redis
         # dashboard, so disable its own OTel exporter to avoid double export.
+        self._obs_config = build_observability_config()
         self.span_recorder = span_recorder or SpanRecorder(
-            self.redis, enable_otel=False
+            self.redis, enable_otel=False, config=self._obs_config
         )
-        self._otel_enabled = build_observability_config().otel_enabled
+        self._trace_writer = TraceWriteClient(
+            self.redis, ttl_seconds=self._obs_config.ttl_seconds
+        )
+        self._otel_enabled = self._obs_config.otel_enabled
         self._lock_token = None
         self._heartbeat_task = None
         self._control_task = None
+        self._metrics_collector_task: Optional[asyncio.Task] = None
         self._running_tasks: set[asyncio.Task] = set()
         self._tracker = ExecutionTracker()
 
@@ -525,6 +533,17 @@ class WorkerRunner:
                 tokens=token_usage,
             )
 
+            # Finalize trace root when the root execution completes so the
+            # trace record has a stable end_ts / status / output.
+            if not (header.parent_message_id or ""):
+                await self._write_trace_root_end(
+                    trace_id=header.trace_id,
+                    status=final_status,
+                    end_ts=execution_finished_at,
+                    output=task_result.reply_data,
+                    error=str(completion_fields.get("error_message", "")),
+                )
+
             await self.redis.xack(stream_name, self.group_name, msg_id)
             logger.info("[%s] Message processed: %s", self.worker.worker_id, msg_id)
 
@@ -557,6 +576,14 @@ class WorkerRunner:
                     )
                 except Exception:  # pylint: disable=broad-exception-caught
                     pass
+            # Finalize trace root on unexpected failure.
+            if err_header and not (err_header.parent_message_id or ""):
+                await self._write_trace_root_end(
+                    trace_id=err_header.trace_id,
+                    status="FAILED",
+                    end_ts=int(time.time() * 1000),
+                    error=str(e),
+                )
             # Mark execution as FAILED so the next Redis re-delivery is immediately
             # acked by the terminal-replay guard (line ~316), preventing infinite retry.
             if err_execution_id and err_session_id:
@@ -647,19 +674,99 @@ class WorkerRunner:
         except Exception as err:  # pylint: disable=broad-exception-caught
             logger.debug("Failed to record worker execute span: %s", err)
 
+    async def _write_trace_root_end(
+        self,
+        *,
+        trace_id: str,
+        status: str,
+        end_ts: int,
+        output: Any = None,
+        error: str = "",
+    ) -> None:
+        """Finalize trace root record — best-effort, never propagates errors."""
+        try:
+            sanitized_output = (
+                sanitize_io_value(output, self._obs_config)
+                if output is not None
+                else None
+            )
+            meta: dict = {"error": error} if error else {}
+            await self._trace_writer.record_trace(
+                TraceRecord(
+                    trace_id=trace_id,
+                    status=status,
+                    end_ts=end_ts,
+                    output=sanitized_output,
+                    metadata=meta,
+                )
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
+    async def _claim_worker_id_with_retry(
+        self,
+        max_wait_seconds: Optional[float] = None,
+        retry_interval_seconds: Optional[float] = None,
+    ) -> str:
+        """Claim the worker ID, retrying if another instance holds it.
+
+        Retries are useful for crash-recovery: if Worker 1 just died its lease
+        will expire within one TTL period.  Worker 2 keeps trying until the
+        lease is gone or max_wait_seconds is exhausted.
+        """
+        if max_wait_seconds is None:
+            max_wait_seconds = WorkerConfig.worker_id_claim_max_wait_seconds
+        if retry_interval_seconds is None:
+            retry_interval_seconds = WorkerConfig.worker_id_claim_retry_interval_seconds
+
+        deadline = time.monotonic() + max_wait_seconds
+        attempt = 0
+        while True:
+            try:
+                return await self.worker.registry.claim_worker_id(
+                    self.worker.worker_id,
+                    ttl_seconds=self.worker.heartbeat_lease_ttl_seconds,
+                )
+            except ValueError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                wait = min(
+                    retry_interval_seconds * (2 ** min(attempt, 3)), remaining, 10.0
+                )
+                logger.info(
+                    "[%s] Worker ID already claimed; will retry in %.1fs "
+                    "(%.0fs remaining)",
+                    self.worker.worker_id,
+                    wait,
+                    remaining,
+                )
+                await asyncio.sleep(wait)
+                attempt += 1
+
     async def start(self):
         """Start the worker runner main loop."""
         self._running_tasks = set()
         try:
             if hasattr(self.worker.registry, "claim_worker_id"):
-                self._lock_token = await self.worker.registry.claim_worker_id(
-                    self.worker.worker_id
-                )
+                self._lock_token = await self._claim_worker_id_with_retry()
 
             await self.setup_streams()
             await self.setup_control_streams()
             await self.worker.start_heartbeat()
+            heartbeat_task = self.worker.heartbeat_task
             self._control_task = asyncio.create_task(self._control_loop())
+            try:
+                from by_framework.metrics.collector import MetricsCollector
+
+                self._metrics_collector_task = asyncio.create_task(
+                    MetricsCollector(
+                        self.redis,
+                        worker_id=self.worker.worker_id,
+                    ).run()
+                )
+            except Exception as metrics_collector_err:  # pylint: disable=broad-exception-caught
+                logger.debug("MetricsCollector not started: %s", metrics_collector_err)
             logger.info(
                 "[%s] Runner started with max_concurrency=%d, waiting for tasks...",
                 self.worker.worker_id,
@@ -667,6 +774,10 @@ class WorkerRunner:
             )
 
             while True:
+                if heartbeat_task and heartbeat_task.done():
+                    exc = heartbeat_task.exception()
+                    if exc:
+                        raise exc
                 await self._run_once()
                 await asyncio.sleep(CONTROL_LOOP_SLEEP_SECONDS)
         finally:
@@ -674,6 +785,10 @@ class WorkerRunner:
 
     async def _shutdown(self):
         """Graceful shutdown sequence."""
+        if self._metrics_collector_task:
+            self._metrics_collector_task.cancel()
+            await asyncio.gather(self._metrics_collector_task, return_exceptions=True)
+            self._metrics_collector_task = None
         if self._running_tasks:
             await asyncio.gather(*self._running_tasks, return_exceptions=True)
         if self._control_task:
@@ -690,7 +805,9 @@ class WorkerRunner:
                 self.worker.worker_id,
                 self._lock_token,
             )
-        elif hasattr(self.worker.registry, "mark_worker_inactive"):
+        elif not hasattr(self.worker.registry, "claim_worker_id") and hasattr(
+            self.worker.registry, "mark_worker_inactive"
+        ):
             await self.worker.registry.mark_worker_inactive(self.worker.worker_id)
             released_worker_id = True
 

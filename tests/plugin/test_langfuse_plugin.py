@@ -10,6 +10,7 @@ from by_framework_trace_langfuse import (
     LangfuseConfig,
     LangfusePlugin,
     LangfuseTraceProviderFactory,
+    build_langchain_callback,
 )
 
 from by_framework import (
@@ -19,6 +20,7 @@ from by_framework import (
     MessageHeader,
     ResumeCommand,
 )
+from by_framework.trace.span_recorder import str_to_uint128
 
 
 @dataclass
@@ -138,6 +140,52 @@ class FakeSdkClient:
 
     def trace(self, **kwargs: Any) -> None:
         self.trace_calls.append(kwargs)
+
+
+def test_build_langchain_callback_uses_trace_context_for_current_sdk(monkeypatch):
+    """Langfuse v4 CallbackHandler accepts trace_context, not trace_id kwargs."""
+    captured: dict[str, object] = {}
+
+    class FakeCallbackHandler:  # pylint: disable=too-few-public-methods
+
+        def __init__(self, *, public_key=None, trace_context=None):
+            captured["public_key"] = public_key
+            captured["trace_context"] = trace_context
+            self._runs: dict[str, Any] = {}
+
+        def on_chain_start(self, serialized, inputs, *, run_id, **kwargs):
+            del serialized, inputs, kwargs
+            observation = SimpleNamespace(_otel_span=FakeOtelSpan())
+            observation._otel_span.set_attribute("langfuse.internal.as_root", True)
+            self._runs[run_id] = observation
+
+    monkeypatch.setitem(
+        sys.modules,
+        "langfuse.langchain",
+        SimpleNamespace(CallbackHandler=FakeCallbackHandler),
+    )
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "http://localhost:3000")
+
+    trace_id_val = "trace-langfuse"
+    handler = build_langchain_callback(
+        trace_id=trace_id_val,
+        parent_observation_id="obs-parent",
+    )
+
+    assert isinstance(handler, FakeCallbackHandler)
+    assert captured == {
+        "public_key": "pk-test",
+        "trace_context": {
+            "trace_id": f"{str_to_uint128(trace_id_val):032x}",
+            "parent_span_id": "obs-parent",
+        },
+    }
+
+    handler.on_chain_start(None, {}, run_id="langgraph-root")
+    root_observation = handler._runs["langgraph-root"]  # pylint: disable=protected-access
+    assert root_observation._otel_span.attributes["langfuse.internal.as_root"] is False
 
 
 def _build_context(

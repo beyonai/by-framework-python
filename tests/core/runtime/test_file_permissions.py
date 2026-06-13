@@ -1,7 +1,9 @@
 import pytest
 
-from by_framework.core.runtime import (SessionScopedPermissionPolicy,
-                                       WorkspaceScopedPermissionPolicy)
+from by_framework.core.runtime import (
+    SessionScopedPermissionPolicy,
+    WorkspaceScopedPermissionPolicy,
+)
 from by_framework.core.runtime.file_manager import FileManager
 from by_framework.core.runtime.file_paths import FileAccessContext
 

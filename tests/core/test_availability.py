@@ -5,24 +5,21 @@ import pytest
 
 from by_framework import AgentContext, GatewayClient
 from by_framework.common.constants import RedisKeys
-from by_framework.core.availability import (PendingDelivery, RoutePolicy,
-                                            WakeupDecisionStatus,
-                                            WakeupRequest)
+from by_framework.core.availability import (
+    PendingDelivery,
+    RoutePolicy,
+    WakeupDecisionStatus,
+    WakeupRequest,
+)
 from by_framework.core.delivery_gate import DeliveryGate
 from by_framework.core.protocol.commands import command_from_dict
 from by_framework.core.wakeup_controller import WakeupController
 
 
 def test_control_plane_types_are_exported_from_top_level_package():
-    from by_framework import \
-        DeliveryGate as \
-        ExportedDeliveryGate  # pylint: disable=import-outside-toplevel
-    from by_framework import \
-        RoutePolicy as \
-        ExportedRoutePolicy  # pylint: disable=import-outside-toplevel
-    from by_framework import \
-        WakeupController as \
-        ExportedWakeupController  # pylint: disable=import-outside-toplevel
+    from by_framework import DeliveryGate as ExportedDeliveryGate  # pylint: disable=import-outside-toplevel
+    from by_framework import RoutePolicy as ExportedRoutePolicy  # pylint: disable=import-outside-toplevel
+    from by_framework import WakeupController as ExportedWakeupController  # pylint: disable=import-outside-toplevel
 
     assert ExportedRoutePolicy.WAKE_AND_QUEUE == "WAKE_AND_QUEUE"
     assert ExportedWakeupController is WakeupController

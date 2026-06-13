@@ -5,6 +5,7 @@ from .langfuse import (
     LangfuseConfig,
     LangfusePlugin,
     LangfuseTraceProviderFactory,
+    build_langchain_callback,
     start_client_dispatch_observation,
 )
 
@@ -13,5 +14,6 @@ __all__ = [
     "LangfuseConfig",
     "LangfusePlugin",
     "LangfuseTraceProviderFactory",
+    "build_langchain_callback",
     "start_client_dispatch_observation",
 ]

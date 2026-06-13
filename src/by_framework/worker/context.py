@@ -55,12 +55,7 @@ from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.core.runtime import AgentRuntimeState
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.runtime.filestore.base import FileStorage
-from by_framework.trace.span_recorder import (
-    SpanRecorder,
-    TraceSpan,
-    str_to_uint64,
-    str_to_uint128,
-)
+from by_framework.trace.span_recorder import (SpanRecorder, TraceSpan, str_to_uint64)
 
 if TYPE_CHECKING:
     from by_framework.core.extensions import PluginRegistry
@@ -1138,62 +1133,3 @@ class AgentContext:
             await asyncio.sleep(0.1)
 
         return results
-
-    @property
-    def langfuse_callback(self) -> Optional[Any]:
-        """Return the Langfuse CallbackHandler bound to the current context.
-
-        Returns:
-            A langfuse.langchain.CallbackHandler instance, or None when disabled or
-        unavailable.
-        """
-        try:
-
-            def clean(val):
-                return val.strip().strip("'\"“”‘’") if val else ""
-
-            enabled = clean(os.environ.get("BYAI_LANGFUSE_ENABLED", ""))
-            if enabled and enabled.lower() in {"0", "false", "no", "off", "disabled"}:
-                return None
-
-            secret_key = clean(os.environ.get("LANGFUSE_SECRET_KEY", ""))
-            public_key = clean(os.environ.get("LANGFUSE_PUBLIC_KEY", ""))
-            base_url = clean(os.environ.get("LANGFUSE_BASE_URL", ""))
-
-            if secret_key and public_key and base_url:
-                langfuse_module = import_module("langfuse.langchain")
-                callback_handler_cls = getattr(langfuse_module, "CallbackHandler")
-
-                # Prefer the plugin-level root observation for correct nesting.
-                parent_obs = getattr(self, "_langfuse_observation", None)
-                if parent_obs and hasattr(parent_obs, "id") and parent_obs.id:
-                    parent_id = parent_obs.id
-                else:
-                    raw_parent_id = (
-                        f"{self.execution_id}:worker.execute"
-                        if self.execution_id
-                        else f"{self.message_id}:worker.execute"
-                    )
-                    parent_id = f"{str_to_uint64(raw_parent_id):016x}"
-
-                trace_id_hex = f"{str_to_uint128(self.trace_id):032x}"
-
-                try:
-                    return callback_handler_cls(
-                        public_key=public_key,
-                        secret_key=secret_key,
-                        base_url=base_url,
-                        trace_id=trace_id_hex,
-                        parent_observation_id=parent_id,
-                    )
-                except TypeError:
-                    return callback_handler_cls(
-                        public_key=public_key,
-                        secret_key=secret_key,
-                        host=base_url,
-                        trace_id=trace_id_hex,
-                        parent_observation_id=parent_id,
-                    )
-        except Exception:  # pylint: disable=broad-exception-caught
-            pass
-        return None

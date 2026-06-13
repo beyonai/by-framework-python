@@ -1,7 +1,6 @@
 """Tests for adapter and worker modules."""
 
 import sys
-from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -40,7 +39,7 @@ def _make_mock_context(session_id: str = "test-session"):
             metadata={"source": "test"},
         )
     )
-    ctx._langfuse_observation = SimpleNamespace(id="obs-framework")  # pylint: disable=protected-access
+    ctx.get_trace_parent_observation_id.return_value = "obs-framework"
     return ctx
 
 
@@ -187,7 +186,7 @@ class TestAdapterRun:
     async def test_includes_langfuse_callbacks_and_parent_trace_context(
         self, monkeypatch
     ):
-        """Verify adapter wires Langfuse callback handler into LangGraph config."""
+        """Verify adapter gets Langfuse callback from the trace provider package."""
         ctx = _make_mock_context()
         graph = MagicMock()
         graph.ainvoke = AsyncMock(
@@ -197,45 +196,18 @@ class TestAdapterRun:
         snapshot.next = ()
         graph.get_state.return_value = snapshot
 
-        observation_calls: list[dict] = []
-        callback_instances: list[object] = []
+        callback_handler = object()
+        callback_calls: list[dict[str, str]] = []
 
-        @contextmanager
-        def fake_observation_scope(**kwargs):
-            observation_calls.append(kwargs)
-            yield SimpleNamespace(id="obs-langgraph")
+        def fake_build_langchain_callback(**kwargs):
+            callback_calls.append(kwargs)
+            return callback_handler
 
-        class FakeCallbackHandler:  # pylint: disable=too-few-public-methods
-            """Minimal callback handler stub for adapter config assertions."""
-
-            def __init__(self):
-                callback_instances.append(self)
-
-        fake_langfuse_client = SimpleNamespace(
-            start_as_current_observation=fake_observation_scope
-        )
-
-        monkeypatch.setitem(
-            sys.modules,
-            "langfuse",
-            SimpleNamespace(get_client=MagicMock(return_value=fake_langfuse_client)),
-        )
-        monkeypatch.setitem(
-            sys.modules,
-            "langfuse.langchain",
-            SimpleNamespace(CallbackHandler=FakeCallbackHandler),
-        )
         monkeypatch.setitem(
             sys.modules,
             "by_framework_trace_langfuse",
-            SimpleNamespace(LangfuseConfig=MagicMock()),
+            SimpleNamespace(build_langchain_callback=fake_build_langchain_callback),
         )
-        sys.modules[
-            "by_framework_trace_langfuse"
-        ].LangfuseConfig.from_env.return_value = object()
-        monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
-        monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
-        monkeypatch.setenv("LANGFUSE_BASE_URL", "http://localhost:3000")
 
         adapter = LangGraphAdapter(graph, ctx, stream=False)
 
@@ -255,25 +227,26 @@ class TestAdapterRun:
         assert config["metadata"]["by_framework_message_id"] == "msg-ctx"
         assert config["metadata"]["langgraph_thread_id"] == "test-session"
         # Callbacks list includes the Langfuse handler(s) plus the token accumulator.
-        assert all(cb in config["callbacks"] for cb in callback_instances)
+        assert callback_handler in config["callbacks"]
         assert any(
             type(cb).__name__ == "_TokenAccumulatingCallbackHandler"
             for cb in config["callbacks"]
         )
-        assert len(observation_calls) == 1
-        assert observation_calls[0]["trace_context"] == {
-            "trace_id": "trace-ctx",
-            "parent_span_id": "obs-framework",
-        }
-        assert observation_calls[0]["name"] == "planner:langgraph"
+        assert callback_calls == [
+            {
+                "trace_id": "trace-ctx",
+                "parent_observation_id": "obs-framework",
+            }
+        ]
 
     @pytest.mark.asyncio
-    async def test_uses_context_langfuse_callback_property(self):
-        """Verify AgentContext.langfuse_callback property is used directly."""
-        handler = object()
+    async def test_skips_langfuse_callback_when_provider_package_missing(
+        self, monkeypatch
+    ):
+        """LangGraph stays provider-agnostic when trace-langfuse is not installed."""
 
         # pylint: disable=too-few-public-methods,missing-class-docstring,missing-function-docstring
-        class ContextWithCallbackProperty:
+        class ContextWithoutProvider:
             session_id = "test-session"
             trace_id = "trace-ctx"
             message_id = "msg-ctx"
@@ -291,11 +264,15 @@ class TestAdapterRun:
             def __init__(self):
                 self.emit_chunk = AsyncMock()
 
-            @property
-            def langfuse_callback(self):
-                return handler
+        def fake_import_module(name):
+            if name == "by_framework_trace_langfuse":
+                raise ImportError(name)
+            raise AssertionError(f"unexpected import: {name}")
 
-        ctx = ContextWithCallbackProperty()
+        monkeypatch.setattr(
+            "by_framework_langgraph.adapter.import_module", fake_import_module
+        )
+        ctx = ContextWithoutProvider()
         graph = MagicMock()
         graph.ainvoke = AsyncMock(
             return_value={"messages": [MagicMock(content="hello")]}
@@ -310,7 +287,6 @@ class TestAdapterRun:
         assert result == "hello"
         _, kwargs = graph.ainvoke.call_args
         callbacks = kwargs["config"]["callbacks"]
-        assert handler in callbacks
         assert any(
             type(cb).__name__ == "_TokenAccumulatingCallbackHandler" for cb in callbacks
         )
@@ -335,11 +311,8 @@ class TestAdapterRun:
         monkeypatch.setitem(
             sys.modules,
             "by_framework_trace_langfuse",
-            SimpleNamespace(LangfuseConfig=MagicMock()),
+            SimpleNamespace(build_langchain_callback=MagicMock(return_value=None)),
         )
-        sys.modules[
-            "by_framework_trace_langfuse"
-        ].LangfuseConfig.from_env.return_value = None
 
         adapter = LangGraphAdapter(graph, ctx, stream=False)
 
@@ -382,11 +355,8 @@ class TestAdapterRun:
         monkeypatch.setitem(
             sys.modules,
             "by_framework_trace_langfuse",
-            SimpleNamespace(LangfuseConfig=MagicMock()),
+            SimpleNamespace(build_langchain_callback=MagicMock(return_value=None)),
         )
-        sys.modules[
-            "by_framework_trace_langfuse"
-        ].LangfuseConfig.from_env.return_value = None
 
         adapter = LangGraphAdapter(graph, ctx, stream=False)
 
@@ -530,7 +500,6 @@ class TestTokenAccumulatingCallbackHandler:
     def test_callback_injected_in_tracing_scope(self):
         """_langfuse_callback_manager injects _TokenAccumulatingCallbackHandler."""
         ctx = MagicMock()
-        ctx.langfuse_callback = None
         graph = MagicMock()
         adapter = LangGraphAdapter(graph=graph, context=ctx)
 

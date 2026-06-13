@@ -1,5 +1,4 @@
-from by_framework.core.runtime.file_paths import (FileAccessContext,
-                                                  RuntimePathMapper)
+from by_framework.core.runtime.file_paths import (FileAccessContext, RuntimePathMapper)
 
 
 def test_runtime_path_mapper_normalizes_virtual_paths() -> None:

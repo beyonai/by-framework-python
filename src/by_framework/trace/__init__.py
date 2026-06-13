@@ -17,6 +17,7 @@ from .span_recorder import (
     get_observability_diagnostics,
     live_execution_otel_span,
     reset_observability_diagnostics,
+    sanitize_io_value,
 )
 from .trace_schema import (
     EventRecord,
@@ -50,6 +51,7 @@ __all__ = [
     "get_observability_diagnostics",
     "live_execution_otel_span",
     "reset_observability_diagnostics",
+    "sanitize_io_value",
     "start_langfuse_observation",
     "to_langfuse_trace_id",
 ]

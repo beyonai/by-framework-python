@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from importlib import import_module
 from typing import Any, Optional, Protocol, runtime_checkable
 
+from by_framework.common.logger import get_logger
 from by_framework.core.extensions import (
     AgentConfig,
     Plugin,
@@ -27,6 +28,8 @@ from by_framework.trace.span_recorder import (
     str_to_uint64,
     str_to_uint128,
 )
+
+logger = get_logger(__name__)
 
 LANGFUSE_OBSERVATION_ATTR = "_langfuse_observation"
 LANGFUSE_CALL_PARENT_OBSERVATION_ATTR = "_langfuse_call_parent_observation"
@@ -69,6 +72,82 @@ class LangfuseConfig:
     @staticmethod
     def _clean_env_value(value: str) -> str:
         return value.strip().strip(_QUOTES_TO_STRIP)
+
+
+def build_langchain_callback(
+    *,
+    trace_id: str,
+    parent_observation_id: str,
+) -> Optional[Any]:
+    """Build a Langfuse LangChain CallbackHandler for an existing trace."""
+    config = LangfuseConfig.from_env()
+    if config is None:
+        return None
+
+    try:
+        callback_handler_cls = getattr(
+            import_module("langfuse.langchain"),
+            "CallbackHandler",
+        )
+        callback_handler_cls = _without_langchain_root_promotion(callback_handler_cls)
+        trace_id_hex = f"{str_to_uint128(trace_id):032x}"
+        trace_context = {
+            "trace_id": trace_id_hex,
+            "parent_span_id": parent_observation_id,
+        }
+
+        return callback_handler_cls(
+            public_key=config.public_key,
+            trace_context=trace_context,
+        )
+    except Exception:  # pylint: disable=broad-exception-caught
+        return None
+
+
+def _without_langchain_root_promotion(callback_handler_cls: Any) -> Any:
+    """Return a CallbackHandler class that keeps LangChain runs as child spans."""
+
+    # pylint: disable=too-few-public-methods
+    class ByFrameworkCallbackHandler(callback_handler_cls):
+        """Langfuse LangChain handler that does not rename the existing trace root."""
+
+        def on_chain_start(
+            self,
+            serialized: Any,
+            inputs: dict[str, Any],
+            *,
+            run_id: Any,
+            parent_run_id: Any = None,
+            **kwargs: Any,
+        ) -> Any:
+            result = super().on_chain_start(
+                serialized,
+                inputs,
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                **kwargs,
+            )
+            if parent_run_id is None:
+                runs = getattr(self, "_runs", {})
+                observation = runs.get(run_id) if isinstance(runs, dict) else None
+                _mark_observation_as_non_root(observation)
+            return result
+
+    ByFrameworkCallbackHandler.__name__ = callback_handler_cls.__name__
+    ByFrameworkCallbackHandler.__qualname__ = callback_handler_cls.__qualname__
+    ByFrameworkCallbackHandler.__module__ = callback_handler_cls.__module__
+    return ByFrameworkCallbackHandler
+
+
+def _mark_observation_as_non_root(observation: Any) -> None:
+    """Prevent Langfuse from using a child LangChain run as the trace root."""
+    otel_span = getattr(observation, "_otel_span", None)
+    if otel_span is None or not hasattr(otel_span, "set_attribute"):
+        return
+    try:
+        otel_span.set_attribute("langfuse.internal.as_root", False)
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
 
 
 @runtime_checkable
@@ -371,6 +450,8 @@ class LangfusePlugin(Plugin):
 
     async def on_task_start(self, context: Any) -> None:  # pylint: disable=too-many-locals
         tracer = self._get_tracer()
+        if tracer is None:
+            return
         observation_store = self._get_observation_store(context)
         identity = self._build_task_identity(context)
 
@@ -532,6 +613,8 @@ class LangfusePlugin(Plugin):
     async def on_call_agent_start(self, context: Any, command: Any) -> None:
         """Create a call observation and pass it as the child task parent."""
         tracer = self._get_tracer()
+        if tracer is None:
+            return
         header = getattr(command, "header", None)
         if header is None:
             return
@@ -618,6 +701,8 @@ class LangfusePlugin(Plugin):
         """Create a return observation and pass it as the resume parent."""
         del context, command
         tracer = self._get_tracer()
+        if tracer is None:
+            return
         header = getattr(callback_command, "header", None)
         if header is None:
             return
@@ -730,7 +815,7 @@ class LangfusePlugin(Plugin):
                 return parent_id
         return ""
 
-    def _get_tracer(self) -> LangfuseTracer:
+    def _get_tracer(self) -> Optional[LangfuseTracer]:
         tracer = self._tracer or self._build_default_tracer()
         self._tracer = tracer
         return tracer
@@ -744,13 +829,14 @@ class LangfusePlugin(Plugin):
         )
         return self._observation_store
 
-    def _build_default_tracer(self) -> LangfuseTracer:
+    def _build_default_tracer(self) -> Optional[LangfuseTracer]:
         config = LangfuseConfig.from_env()
         if config is None:
-            raise RuntimeError(
-                "LangfusePlugin requires LANGFUSE_SECRET_KEY, "
-                "LANGFUSE_PUBLIC_KEY, and LANGFUSE_BASE_URL to be set."
+            logger.error(
+                "LangfusePlugin: LANGFUSE_SECRET_KEY, LANGFUSE_PUBLIC_KEY, and "
+                "LANGFUSE_BASE_URL are not set — Langfuse tracing disabled."
             )
+            return None
 
         try:
             langfuse_module = import_module("langfuse")
@@ -761,18 +847,11 @@ class LangfusePlugin(Plugin):
             ) from err
         langfuse_client_cls = getattr(langfuse_module, "Langfuse")
 
-        try:
-            client = langfuse_client_cls(
-                public_key=config.public_key,
-                secret_key=config.secret_key,
-                base_url=config.base_url,
-            )
-        except TypeError:
-            client = langfuse_client_cls(
-                public_key=config.public_key,
-                secret_key=config.secret_key,
-                host=config.base_url,
-            )
+        client = langfuse_client_cls(
+            public_key=config.public_key,
+            secret_key=config.secret_key,
+            base_url=config.base_url,
+        )
 
         return _SdkLangfuseTracer(client, config)
 
@@ -1037,18 +1116,11 @@ def start_client_dispatch_observation(
     tracer = _CLIENT_DISPATCH_TRACER_CACHE.get(config)
     if tracer is None:
         langfuse_client_cls = getattr(langfuse_module, "Langfuse")
-        try:
-            client = langfuse_client_cls(
-                public_key=config.public_key,
-                secret_key=config.secret_key,
-                base_url=config.base_url,
-            )
-        except TypeError:
-            client = langfuse_client_cls(
-                public_key=config.public_key,
-                secret_key=config.secret_key,
-                host=config.base_url,
-            )
+        client = langfuse_client_cls(
+            public_key=config.public_key,
+            secret_key=config.secret_key,
+            base_url=config.base_url,
+        )
         tracer = _SdkLangfuseTracer(client, config)
         _CLIENT_DISPATCH_TRACER_CACHE[config] = tracer
 

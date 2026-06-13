@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from by_framework.metrics.collector import MetricsCollector
 from by_framework.metrics.read_client import (
     MetricsDiagnostic,
     MetricsReadClient,
@@ -205,6 +206,7 @@ def build_observability_diagnostics_metrics(diagnostics: dict[str, Any]) -> str:
 
 
 __all__ = [
+    "MetricsCollector",
     "MetricsDiagnostic",
     "MetricsReadClient",
     "MetricsReadResult",

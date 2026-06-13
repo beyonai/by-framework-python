@@ -1,7 +1,7 @@
 import logging
 
 # logger is now pre-configured or exported
-from by_framework import setup_logging
+from by_framework.common.logger import get_logger, setup_logging
 
 
 class TestLogger:
@@ -82,3 +82,17 @@ class TestLogger:
         # Call setup_logging again
         lg = setup_logging()
         assert len(lg.handlers) == initial_handler_count
+
+    def test_get_logger_uses_unified_formatter(self):
+        """Package loggers should not fall back to bare Python logging output."""
+        lg = get_logger("by_framework_trace_langfuse.langfuse")
+
+        assert lg.handlers
+        assert lg.propagate is False
+        formatter = lg.handlers[0].formatter
+        assert isinstance(formatter, logging.Formatter)
+        assert "%(asctime)s" in formatter._fmt
+        assert "%(name)s" in formatter._fmt
+        assert "%(levelname)s" in formatter._fmt
+        assert "%(filename)s:%(lineno)d" in formatter._fmt
+        assert "%(message)s" in formatter._fmt

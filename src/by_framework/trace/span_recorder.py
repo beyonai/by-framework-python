@@ -127,6 +127,7 @@ def configure_otel_id_generator() -> None:
 
 TRACE_TTL_SECONDS = 15 * 60  # Default to 15 minutes to avoid unbounded Redis growth.
 DEFAULT_METADATA_VALUE_MAX_LENGTH = 256
+DEFAULT_IO_VALUE_MAX_LENGTH = 4096
 SENSITIVE_KEY_PARTS = (
     "api_key",
     "apikey",
@@ -163,6 +164,9 @@ class ObservabilityConfig:
     sample_rate: float = 1.0
     max_spans_per_trace: int = 1000
     metadata_value_max_length: int = DEFAULT_METADATA_VALUE_MAX_LENGTH
+    # When True, trace input/output fields are replaced with "[REDACTED]".
+    redact_inputs: bool = False
+    io_value_max_length: int = DEFAULT_IO_VALUE_MAX_LENGTH
 
 
 def build_observability_config() -> ObservabilityConfig:
@@ -190,7 +194,33 @@ def build_observability_config() -> ObservabilityConfig:
                 DEFAULT_METADATA_VALUE_MAX_LENGTH,
             ),
         ),
+        redact_inputs=_env_bool("BY_FRAMEWORK_REDACT_INPUTS", default=False),
+        io_value_max_length=max(
+            64,
+            _env_int("BY_FRAMEWORK_TRACE_IO_MAX_LENGTH", DEFAULT_IO_VALUE_MAX_LENGTH),
+        ),
     )
+
+
+def sanitize_io_value(value: Any, config: "ObservabilityConfig") -> Any:
+    """Sanitize a trace input/output value according to the observability config.
+
+    Unlike metadata sanitization (key-name-based), this applies a larger
+    truncation budget appropriate for user-visible content, and respects the
+    global ``redact_inputs`` flag.
+    """
+    if config.redact_inputs:
+        return "[REDACTED]"
+    max_len = config.io_value_max_length
+    if isinstance(value, str):
+        return value[:max_len] + "...[TRUNCATED]" if len(value) > max_len else value
+    if isinstance(value, dict):
+        return {
+            str(k): sanitize_io_value(v, config) for k, v in list(value.items())[:50]
+        }
+    if isinstance(value, (list, tuple)):
+        return [sanitize_io_value(item, config) for item in value[:50]]
+    return value
 
 
 def get_observability_diagnostics() -> dict[str, Any]:

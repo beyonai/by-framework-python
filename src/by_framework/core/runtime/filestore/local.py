@@ -12,10 +12,18 @@ from pathlib import Path
 
 from by_framework.common.logger import logger
 
-from .base import (FileContentType, FileDeleteResult, FileEditResult,
-                   FileGlobResult, FileListResult, FilePathEntry,
-                   FileReadResult, FileSearchResult, FileStorage,
-                   FileWriteResult)
+from .base import (
+    FileContentType,
+    FileDeleteResult,
+    FileEditResult,
+    FileGlobResult,
+    FileListResult,
+    FilePathEntry,
+    FileReadResult,
+    FileSearchResult,
+    FileStorage,
+    FileWriteResult,
+)
 
 IMAGE_MEDIA_TYPES = {
     ".png": "image/png",

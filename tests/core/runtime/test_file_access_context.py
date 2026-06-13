@@ -1,5 +1,4 @@
-from by_framework.core.runtime.file_paths import (FileAccessContext,
-                                                  RuntimePathMapper)
+from by_framework.core.runtime.file_paths import (FileAccessContext, RuntimePathMapper)
 from by_framework.core.runtime.session_manager import SessionManager
 
 

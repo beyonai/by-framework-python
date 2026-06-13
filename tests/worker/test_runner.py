@@ -11,6 +11,7 @@ from by_framework import (
     RunningExecution,
     WorkerRunner,
 )
+from by_framework.common.config import WorkerConfig
 from by_framework.core.protocol.agent_state import AgentState
 from by_framework.core.protocol.commands import (
     AskAgentCommand,
@@ -87,8 +88,22 @@ class MultiCapWorker(GatewayWorker):
 
 class DuplicateIdRegistry:
 
-    async def claim_worker_id(self, worker_id: str):
+    async def claim_worker_id(self, worker_id: str, ttl_seconds: int = 15):
         raise ValueError(f"worker_id already in use: {worker_id}")
+
+
+class DuplicateIdRegistryWithCleanupMethods(DuplicateIdRegistry):
+
+    def __init__(self):
+        self.marked_inactive = False
+        self.unregistered_membership = False
+
+    async def mark_worker_inactive(self, worker_id: str):
+        self.marked_inactive = True
+        return True
+
+    async def unregister_worker_membership(self, worker_id: str):
+        self.unregistered_membership = True
 
 
 class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
@@ -154,8 +169,27 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
             redis_client=redis_mock, worker=worker, group_name="test_group"
         )
 
-        with self.assertRaisesRegex(ValueError, "worker_id already in use"):
-            await runner.start()
+        with patch.object(WorkerConfig, "worker_id_claim_max_wait_seconds", 0):
+            with self.assertRaisesRegex(ValueError, "worker_id already in use"):
+                await runner.start()
+
+    async def test_runner_does_not_cleanup_presence_when_claim_never_succeeded(self):
+        """A duplicate worker must not delete the active owner's lease or membership."""
+        worker = MultiCapWorker()
+        registry = DuplicateIdRegistryWithCleanupMethods()
+        worker.registry = registry
+        worker.stop_heartbeat = AsyncMock()
+        redis_mock = MockRedisRunner(message_to_return=[])
+        runner = WorkerRunner(
+            redis_client=redis_mock, worker=worker, group_name="test_group"
+        )
+
+        with patch.object(WorkerConfig, "worker_id_claim_max_wait_seconds", 0):
+            with self.assertRaisesRegex(ValueError, "worker_id already in use"):
+                await runner.start()
+
+        self.assertFalse(registry.marked_inactive)
+        self.assertFalse(registry.unregistered_membership)
 
     async def test_runner_shutdown_releases_presence_and_unregisters_membership(
         self,

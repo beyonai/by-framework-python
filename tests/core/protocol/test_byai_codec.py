@@ -1,11 +1,16 @@
 import pytest
 
-from by_framework.core.protocol.byai_codec import (deserialize_byai_content,
-                                                   serialize_byai_content)
-from by_framework.core.protocol.message import (BaiYingMessage,
-                                                BaiYingMessageRole,
-                                                MessageContent, MessageFile,
-                                                Resource)
+from by_framework.core.protocol.byai_codec import (
+    deserialize_byai_content,
+    serialize_byai_content,
+)
+from by_framework.core.protocol.message import (
+    BaiYingMessage,
+    BaiYingMessageRole,
+    MessageContent,
+    MessageFile,
+    Resource,
+)
 
 
 def test_serialize_single_baiying_message_to_wire_format():

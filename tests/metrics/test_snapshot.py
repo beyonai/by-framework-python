@@ -182,6 +182,80 @@ class StreamAwareRedis:
         self.xinfo_consumers_calls.append((name, groupname))
         return self.stream_consumers.get((name, groupname), [])
 
+    async def eval(self, script, numkeys, *keys_and_args):
+        """Simulate Lua registry scripts in Python for unit tests.
+
+        Dispatches by argv count:
+          3 args → _HEARTBEAT_CAS_SCRIPT  (token, new_value, ttl)
+          2 args → _REFRESH_LOCK_SCRIPT   (token, ttl)
+          1 arg  → _RELEASE_LOCK_SCRIPT   (token_or_empty)
+        """
+        import json as _json
+
+        keys = list(keys_and_args[:numkeys])
+        args = list(keys_and_args[numkeys:])
+        lease_key = keys[0]
+
+        def _parse_token(raw):
+            if raw is None:
+                return None
+            try:
+                data = _json.loads(raw if isinstance(raw, str) else raw.decode("utf-8"))
+                if not isinstance(data, dict):
+                    return None if data == 1 else str(data)
+                return data.get("token")
+            except Exception:  # pylint: disable=broad-exception-caught
+                return "__unparseable__"
+
+        if len(args) == 3:
+            # _HEARTBEAT_CAS_SCRIPT
+            token_arg, new_value, ttl = str(args[0]), args[1], int(args[2])
+            raw = self.kv.get(lease_key)
+            if token_arg != "":
+                if raw is None:
+                    self.kv[lease_key] = new_value
+                    self.expires[lease_key] = ttl
+                    return 1
+                stored = _parse_token(raw)
+                if stored == "__unparseable__":
+                    return -1
+                if stored is None or str(stored) != token_arg:
+                    return 0
+                self.kv[lease_key] = new_value
+                self.expires[lease_key] = ttl
+                return 1
+            if raw is not None:
+                stored = _parse_token(raw)
+                if stored == "__unparseable__" or stored is not None:
+                    return 0
+            self.kv[lease_key] = new_value
+            self.expires[lease_key] = ttl
+            return 1
+
+        if len(args) == 2:
+            # _REFRESH_LOCK_SCRIPT
+            token, ttl = str(args[0]), int(args[1])
+            raw = self.kv.get(lease_key)
+            stored = _parse_token(raw)
+            if stored is None or stored == "__unparseable__" or str(stored) != token:
+                return 0
+            self.expires[lease_key] = ttl
+            return 1
+
+        # len(args) == 1: _RELEASE_LOCK_SCRIPT
+        token_arg = str(args[0])
+        raw = self.kv.get(lease_key)
+        if raw is None:
+            return 1 if token_arg == "" else 0
+        if token_arg == "":
+            self.kv.pop(lease_key, None)
+            return 1
+        stored = _parse_token(raw)
+        if stored == "__unparseable__" or stored is None or str(stored) != token_arg:
+            return 0
+        self.kv.pop(lease_key, None)
+        return 1
+
     def pipeline(self):
         return MockPipeline(self)
 

@@ -590,69 +590,47 @@ class LangGraphAdapter:
         # Always inject token accumulator — works regardless of Langfuse config.
         callbacks.append(_TokenAccumulatingCallbackHandler(self._context))
 
-        # Prefer AgentContext's callback factory so trace and parent ids align.
-        # Filter out auto-generated MagicMock attributes when tests use a mock
-        # context — real callback objects always come from a non-test module.
-        langfuse_callback_value = getattr(self._context, "langfuse_callback", None)
-        is_real_callback = langfuse_callback_value is not None and type(
-            langfuse_callback_value
-        ).__module__ not in ("unittest.mock",)
-
-        if is_real_callback:
-            handler = (
-                langfuse_callback_value()
-                if callable(langfuse_callback_value)
-                else langfuse_callback_value
-            )
-            if handler is not None:
-                callbacks.append(handler)
-                yield
-                return
-
-        # Fallback to local import if context method is missing
-        # pylint: disable=import-outside-toplevel
         try:
-            langfuse_config = import_module(
-                "by_framework_trace_langfuse"
-            ).LangfuseConfig
-            if langfuse_config.from_env() is None:
-                raise ImportError("Langfuse not configured")
-
-            callback_handler = import_module("langfuse.langchain").CallbackHandler
-            get_client = import_module("langfuse").get_client
+            build_langchain_callback = getattr(
+                import_module("by_framework_trace_langfuse"),
+                "build_langchain_callback",
+            )
         except (ImportError, AttributeError):
             yield
             return
 
-        callbacks.append(callback_handler())
+        get_parent_observation_id = getattr(
+            self._context,
+            "get_trace_parent_observation_id",
+            None,
+        )
+        parent_observation_id = (
+            str(get_parent_observation_id() or "")
+            if callable(get_parent_observation_id)
+            else ""
+        )
+        if not parent_observation_id:
+            framework_observation = getattr(
+                self._context, LANGFUSE_OBSERVATION_ATTR, None
+            )
+            parent_observation_id = getattr(framework_observation, "id", "") or ""
+        if not parent_observation_id:
+            execution_id = getattr(self._context, "execution_id", "")
+            message_id = getattr(self._context, "message_id", "")
+            raw_parent_id = (
+                f"{execution_id}:worker.execute"
+                if execution_id
+                else f"{message_id}:worker.execute"
+            )
+            parent_observation_id = f"{str_to_uint64(raw_parent_id):016x}"
 
-        framework_observation = getattr(self._context, LANGFUSE_OBSERVATION_ATTR, None)
-        if framework_observation is None:
-            yield
-            return
-
-        langfuse = get_client()
-        with langfuse.start_as_current_observation(
-            as_type="span",
-            name=self._tracing.run_name,
-            trace_context={
-                "trace_id": getattr(self._context, "trace_id", ""),
-                "parent_span_id": framework_observation.id,
-            },
-            metadata=self._default_metadata(),
-        ):
-            # Prevent the generated OTel span from being promoted to a trace root.
-            # The native LangfusePlugin sets the same attribute on its own path
-            # (via _SdkLangfuseTracer); this covers the LangGraph fallback path.
-            try:
-                from opentelemetry import trace
-
-                current_span = trace.get_current_span()
-                if current_span and hasattr(current_span, "set_attribute"):
-                    current_span.set_attribute("langfuse.internal.as_root", False)
-            except Exception:  # pylint: disable=broad-exception-caught
-                pass
-            yield
+        handler = build_langchain_callback(
+            trace_id=getattr(self._context, "trace_id", ""),
+            parent_observation_id=parent_observation_id,
+        )
+        if handler is not None:
+            callbacks.append(handler)
+        yield
 
     @staticmethod
     def _default_input_mapper(content: str) -> dict:

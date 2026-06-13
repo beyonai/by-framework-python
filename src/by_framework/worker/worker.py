@@ -108,6 +108,13 @@ class GatewayWorker(ABC):
         """Return the worker online lease TTL from config."""
         return WorkerConfig.heartbeat_lease_ttl_seconds
 
+    @property
+    def heartbeat_task(self) -> Optional[asyncio.Task]:
+        """Return the heartbeat asyncio task, or None if not started."""
+        if self._heartbeat is None:
+            return None
+        return self._heartbeat.task
+
     @abstractmethod
     def get_agent_types(self) -> List[str]:
         """Return a list of agent types this worker can handle."""

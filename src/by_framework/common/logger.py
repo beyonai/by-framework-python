@@ -167,7 +167,19 @@ def get_logger(name: str) -> logging.Logger:
     Returns:
         Logger instance
     """
-    return logging.getLogger(name)
+    base_logger = setup_logging()
+    if name == base_logger.name:
+        return base_logger
+
+    child_logger = logging.getLogger(name)
+    child_logger.setLevel(base_logger.level)
+    child_logger.propagate = False
+
+    if not child_logger.handlers:
+        for handler in base_logger.handlers:
+            child_logger.addHandler(handler)
+
+    return child_logger
 
 
 # Expose default logger

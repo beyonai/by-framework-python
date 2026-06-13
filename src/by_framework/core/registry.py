@@ -6,16 +6,17 @@ through Redis-backed storage.
 """
 
 import base64
+import ipaddress
 import json
 import logging
 import random
+import socket
 import time
 import uuid
 import warnings
 from typing import Any, List, Optional, TypedDict
 
-from by_framework.common.constants import (EXEC_FIELD_PREFIX, MSG_MAP_PREFIX,
-                                           RedisKeys)
+from by_framework.common.constants import (EXEC_FIELD_PREFIX, MSG_MAP_PREFIX, RedisKeys)
 from by_framework.common.exceptions import ExecutionDataError
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.extensions import AgentConfigsSnapshot, PluginRegistry
@@ -24,6 +25,105 @@ from by_framework.core.protocol.agent_state import is_terminal_state
 logger = logging.getLogger("by_framework.registry")
 SNAPSHOT_PAYLOAD_PREFIX = "dill-base64:"
 PRESENCE_PAYLOAD_VERSION = 1
+
+# Atomic compare-and-swap for heartbeat renewal.
+# Token-mode: verifies the stored token matches before overwriting.
+# No-token (legacy) mode: only updates absent/unowned legacy presence.
+# ARGV: [1]=token ('' for legacy), [2]=new_value, [3]=ttl_seconds
+# Returns: 1 = success, 0 = lock owned by another instance, -1 = unparseable legacy key
+_HEARTBEAT_CAS_SCRIPT = """
+local function decode_token(raw)
+    local ok, data = pcall(cjson.decode, raw)
+    if not ok then return nil, false end
+    if type(data) == 'table' then
+        local stored = data['token']
+        if stored == nil or stored == cjson.null then return nil, true end
+        return tostring(stored), true
+    end
+    if data == 1 then return nil, true end
+    return tostring(data), true
+end
+
+local raw = redis.call('GET', KEYS[1])
+if ARGV[1] ~= '' then
+    if raw == false then
+        local ok = redis.call('SET', KEYS[1], ARGV[2], 'NX', 'EX', tonumber(ARGV[3]))
+        if ok then return 1 else return 0 end
+    end
+    local stored, parsed = decode_token(raw)
+    if not parsed then return -1 end
+    if stored == nil then return 0 end
+    if stored ~= ARGV[1] then return 0 end
+    redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+    return 1
+end
+
+if raw ~= false then
+    local stored, parsed = decode_token(raw)
+    if not parsed then return 0 end
+    if stored ~= nil then return 0 end
+end
+redis.call('SET', KEYS[1], ARGV[2], 'EX', tonumber(ARGV[3]))
+return 1
+"""
+
+# Atomic token-verified TTL refresh (GET+EXPIRE in one step).
+# ARGV: [1]=expected_token, [2]=ttl_seconds
+# Returns: 1 = refreshed, 0 = token mismatch / key absent / unparseable
+_REFRESH_LOCK_SCRIPT = """
+local function decode_token(raw)
+    local ok, data = pcall(cjson.decode, raw)
+    if not ok then return nil end
+    if type(data) ~= 'table' then
+        if data == 1 then return nil end
+        return tostring(data)
+    end
+    local stored = data['token']
+    if stored == nil or stored == cjson.null then return nil end
+    return tostring(stored)
+end
+
+local raw = redis.call('GET', KEYS[1])
+if raw == false then return 0 end
+local stored = decode_token(raw)
+if stored == nil then return 0 end
+if stored ~= ARGV[1] then return 0 end
+redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+return 1
+"""
+
+# Atomic token-verified key deletion (Redlock release pattern).
+# ARGV: [1]=expected_token
+#   Empty string deletes unconditionally for cases with no token ownership.
+# Returns: 1 = deleted (or key already absent with no-token mode), 0 = token mismatch
+_RELEASE_LOCK_SCRIPT = """
+local function decode_token(raw)
+    local ok, data = pcall(cjson.decode, raw)
+    if not ok then return nil end
+    if type(data) ~= 'table' then
+        if data == 1 then return nil end
+        return tostring(data)
+    end
+    local stored = data['token']
+    if stored == nil or stored == cjson.null then return nil end
+    return tostring(stored)
+end
+
+local raw = redis.call('GET', KEYS[1])
+if raw == false then
+    if ARGV[1] == '' then return 1 end
+    return 0
+end
+if ARGV[1] == '' then
+    redis.call('DEL', KEYS[1])
+    return 1
+end
+local stored = decode_token(raw)
+if stored == nil then return 0 end
+if stored ~= ARGV[1] then return 0 end
+redis.call('DEL', KEYS[1])
+return 1
+"""
 
 
 class ExecutionCompletionFields(TypedDict, total=False):
@@ -36,40 +136,77 @@ class ExecutionCompletionFields(TypedDict, total=False):
     retryable: bool
 
 
-def _decode_worker_presence(raw: Any) -> tuple[Optional[str], int, bool]:
+def _is_useful_presence_ip(value: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return not (ip.is_loopback or ip.is_unspecified)
+
+
+def _get_default_route_ip_address() -> str:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return str(sock.getsockname()[0])
+    except OSError:
+        return ""
+
+
+def _get_local_ip_address() -> str:
+    """Best-effort non-loopback IP address for worker presence diagnostics."""
+    hostname_ip = ""
+    try:
+        hostname_ip = socket.gethostbyname(socket.gethostname())
+        if _is_useful_presence_ip(hostname_ip):
+            return hostname_ip
+    except OSError:
+        pass
+
+    route_ip = _get_default_route_ip_address()
+    if _is_useful_presence_ip(route_ip):
+        return route_ip
+    return hostname_ip or route_ip
+
+
+def _decode_worker_presence(raw: Any) -> tuple[Optional[str], int, bool, str]:
     """Decode worker presence payload.
 
     Returns:
-        (owner token, last_seen timestamp in ms, whether the payload is legacy)
+        (owner token, last_seen timestamp in ms, whether the payload is legacy, ip)
     """
     if raw is None:
-        return (None, 0, False)
+        return (None, 0, False, "")
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8")
 
     try:
         payload = json.loads(raw)
     except (TypeError, ValueError):
-        return (str(raw), 0, True)
+        return (str(raw), 0, True, "")
 
     if isinstance(payload, dict):
         token = payload.get("token")
         last_seen = payload.get("last_seen", 0)
+        ip_address = str(payload.get("ip_address") or "")
         if token is not None:
             token = str(token)
-        return (token, int(last_seen or 0), False)
+        return (token, int(last_seen or 0), False, ip_address)
 
     if payload == 1:
-        return (None, 0, True)
-    return (str(payload), 0, True)
+        return (None, 0, True, "")
+    return (str(payload), 0, True, "")
 
 
-def _encode_worker_presence(token: Optional[str], last_seen: int) -> str:
+def _encode_worker_presence(
+    token: Optional[str], last_seen: int, ip_address: str = ""
+) -> str:
     return json.dumps(
         {
             "version": PRESENCE_PAYLOAD_VERSION,
             "token": token,
             "last_seen": last_seen,
+            "ip_address": ip_address,
         },
         separators=(",", ":"),
     )
@@ -93,8 +230,11 @@ async def check_worker_online(
     lease_value = await redis.get(RedisKeys.worker_online_lease(worker_id))
     if lease_value is None:
         return False
-    decoded_token, last_seen, is_legacy = _decode_worker_presence(lease_value)
+    decoded_token, last_seen, is_legacy, ip_address = _decode_worker_presence(
+        lease_value
+    )
     del decoded_token
+    del ip_address
     return is_legacy or last_seen > 0
 
 
@@ -138,15 +278,28 @@ class WorkerRegistry:
     def __init__(self, redis_client: Optional[Redis] = None):
         self.redis = redis_client or get_redis()
         self._lock_tokens: dict[str, str] = {}
+        self._ip_address = _get_local_ip_address()
 
     async def register_worker_membership(
         self, worker_id: str, agent_types: List[str]
     ) -> None:
+        declared_key = RedisKeys.worker_declared_agent_types(worker_id)
+        new_agent_types = set(agent_types)
+        old_agent_types_raw = await self.redis.smembers(declared_key)
+        old_agent_types = {
+            item.decode("utf-8") if isinstance(item, bytes) else item
+            for item in old_agent_types_raw
+        }
+
         await self.redis.sadd(RedisKeys.KNOWN_WORKERS, worker_id)
-        for agent_type in agent_types:
-            await self.redis.sadd(
-                RedisKeys.worker_declared_agent_types(worker_id), agent_type
+        for stale_agent_type in old_agent_types - new_agent_types:
+            await self.redis.srem(
+                RedisKeys.agent_type_members(stale_agent_type), worker_id
             )
+            await self.redis.srem(declared_key, stale_agent_type)
+
+        for agent_type in new_agent_types:
+            await self.redis.sadd(declared_key, agent_type)
             await self.redis.sadd(RedisKeys.agent_type_members(agent_type), worker_id)
 
     async def heartbeat_worker(
@@ -157,36 +310,29 @@ class WorkerRegistry:
         now = int(time.time() * 1000)
         lease_key = RedisKeys.worker_online_lease(worker_id)
         token = self._lock_tokens.get(worker_id)
-        current = await self.redis.get(lease_key)
-        current_token, decoded_last_seen, is_legacy = _decode_worker_presence(current)
-        del decoded_last_seen, is_legacy
+        token_arg = token or ""
+        new_value = _encode_worker_presence(
+            token if token else None, now, self._ip_address
+        )
 
-        if token:
-            if current is None:
-                ok = await self.redis.set(
-                    lease_key,
-                    _encode_worker_presence(token, now),
-                    nx=True,
-                    ex=lease_ttl_seconds,
-                )
-                if not ok:
-                    return False
-            elif current_token != token:
-                return False
-            else:
-                await self.redis.set(
-                    lease_key,
-                    _encode_worker_presence(token, now),
-                    ex=lease_ttl_seconds,
-                )
-        else:
-            if current_token is not None:
-                return False
-            await self.redis.set(
-                lease_key,
-                _encode_worker_presence(None, now),
-                ex=lease_ttl_seconds,
+        result = await self.redis.eval(
+            _HEARTBEAT_CAS_SCRIPT,
+            1,
+            lease_key,
+            token_arg,
+            new_value,
+            str(lease_ttl_seconds),
+        )
+
+        if result == -1:
+            logger.warning(
+                "[%s] Unparseable legacy presence key detected; heartbeat rejected",
+                worker_id,
             )
+            return False
+
+        if not result:
+            return False
 
         await self.redis.sadd(RedisKeys.KNOWN_WORKERS, worker_id)
         return True
@@ -222,14 +368,13 @@ class WorkerRegistry:
     ) -> bool:
         expected = token or self._lock_tokens.get(worker_id)
         lease_key = RedisKeys.worker_online_lease(worker_id)
-        current = await self.redis.get(lease_key)
-        current_token, decoded_last_seen, is_legacy = _decode_worker_presence(current)
-        del decoded_last_seen, is_legacy
-        if expected and current_token != expected:
-            return False
-
-        await self.redis.delete(lease_key)
-        return True
+        result = await self.redis.eval(
+            _RELEASE_LOCK_SCRIPT,
+            1,
+            lease_key,
+            expected or "",
+        )
+        return bool(result)
 
     async def unregister_worker(self, worker_id: str):
         """Compatibility wrapper for callers that couple deregistration and liveness."""
@@ -308,7 +453,9 @@ class WorkerRegistry:
         result = {}
         for worker_id in sorted(worker_ids):
             presence = await redis_inst.get(RedisKeys.worker_online_lease(worker_id))
-            decoded_token, last_seen, is_legacy = _decode_worker_presence(presence)
+            decoded_token, last_seen, is_legacy, ip_address = _decode_worker_presence(
+                presence
+            )
             del decoded_token
             if presence is None or (not is_legacy and last_seen <= 0):
                 continue
@@ -322,10 +469,15 @@ class WorkerRegistry:
             result[worker_id] = {
                 "agent_types": agent_types,
                 "last_seen": int(time.time() * 1000) if is_legacy else last_seen,
+                "ip_address": ip_address,
             }
         return result
 
-    async def claim_worker_id(self, worker_id: str, ttl_seconds: int = 60) -> str:
+    async def claim_worker_id(
+        self,
+        worker_id: str,
+        ttl_seconds: int = RedisKeys.WORKER_DEFAULT_LEASE_TTL_SECONDS,
+    ) -> str:
         """Attempt to acquire an exclusive lock for Worker ID.
 
         Args:
@@ -342,7 +494,7 @@ class WorkerRegistry:
         lease_key = RedisKeys.worker_online_lease(worker_id)
         ok = await self.redis.set(
             lease_key,
-            _encode_worker_presence(token, 0),
+            _encode_worker_presence(token, 0, self._ip_address),
             nx=True,
             ex=ttl_seconds,
         )
@@ -369,13 +521,13 @@ class WorkerRegistry:
             return False
 
         lease_key = RedisKeys.worker_online_lease(worker_id)
-        current = await self.redis.get(lease_key)
-        current_token, decoded_last_seen, is_legacy = _decode_worker_presence(current)
-        del decoded_last_seen, is_legacy
-        if current_token != token:
-            return False
-
-        result = await self.redis.expire(lease_key, ttl_seconds)
+        result = await self.redis.eval(
+            _REFRESH_LOCK_SCRIPT,
+            1,
+            lease_key,
+            token,
+            str(ttl_seconds),
+        )
         return bool(result)
 
     async def release_worker_id(
@@ -395,15 +547,15 @@ class WorkerRegistry:
             return False
 
         key = RedisKeys.worker_online_lease(worker_id)
-        current = await self.redis.get(key)
-        current_token, decoded_last_seen, is_legacy = _decode_worker_presence(current)
-        del decoded_last_seen, is_legacy
-        if current_token != expected:
-            return False
-
-        await self.redis.delete(key)
-        self._lock_tokens.pop(worker_id, None)
-        return True
+        result = await self.redis.eval(
+            _RELEASE_LOCK_SCRIPT,
+            1,
+            key,
+            expected,
+        )
+        if result:
+            self._lock_tokens.pop(worker_id, None)
+        return bool(result)
 
     async def initialize_execution(self, execution: dict[str, Any]):
         """Initialize Execution on sender side (status QUEUED) with first timeline

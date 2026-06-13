@@ -4,12 +4,15 @@ from dataclasses import dataclass
 import pytest
 
 from by_framework import ActionType, AgentState, DataMessage, RedisKeys
-from by_framework.core.protocol.commands import (AskAgentCommand, BaseCommand,
-                                                 CancelTaskCommand,
-                                                 ResumeCommand,
-                                                 command_from_dict,
-                                                 register_command,
-                                                 unregister_command)
+from by_framework.core.protocol.commands import (
+    AskAgentCommand,
+    BaseCommand,
+    CancelTaskCommand,
+    ResumeCommand,
+    command_from_dict,
+    register_command,
+    unregister_command,
+)
 from by_framework.core.protocol.message_header import MessageHeader
 
 

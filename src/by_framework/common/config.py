@@ -50,6 +50,8 @@ class WorkerConfig:
     )
     heartbeat_lease_ttl_seconds: int = RedisKeys.WORKER_DEFAULT_LEASE_TTL_SECONDS
     lock_ttl_seconds: int = 60
+    worker_id_claim_max_wait_seconds: int = 90
+    worker_id_claim_retry_interval_seconds: float = 3.0
     stream_block_ms: int = 2000
 
 
