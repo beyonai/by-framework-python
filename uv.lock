@@ -488,7 +488,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "by-framework-langgraph"
-version = "0.0.3.dev2"
+version = "0.0.3.dev3"
 source = { editable = "libs/by-framework-langgraph" }
 dependencies = [
     { name = "by-framework" },
