@@ -300,7 +300,13 @@ class WorkerRegistry:
 
         for agent_type in new_agent_types:
             await self.redis.sadd(declared_key, agent_type)
-            await self.redis.sadd(RedisKeys.agent_type_members(agent_type), worker_id)
+            denied = await self.redis.sismember(
+                RedisKeys.agent_type_denied(agent_type), worker_id
+            )
+            if not denied:
+                await self.redis.sadd(
+                    RedisKeys.agent_type_members(agent_type), worker_id
+                )
 
     async def heartbeat_worker(
         self,
@@ -1252,3 +1258,83 @@ class WorkerRegistry:
     def _decode_execution(self, execution: dict[str, Any]) -> dict[str, Any]:  # pylint: disable=unused-argument
         # Deprecated, since we switched to JSON storage
         return {}
+
+    # --- Admin lifecycle state ---
+
+    async def set_worker_admin_state(
+        self,
+        worker_id: str,
+        lifecycle: str,
+        reason: str = "",
+    ) -> None:
+        """Persist admin-controlled lifecycle state for a worker.
+
+        Args:
+            worker_id: Target worker ID.
+            lifecycle: One of "active", "suspended", "evicted".
+            reason: Human-readable reason for the state change.
+        """
+        now = int(time.time() * 1000)
+        key = RedisKeys.worker_admin(worker_id)
+        pipe = self.redis.pipeline()
+        pipe.hset(key, "lifecycle", lifecycle)
+        pipe.hset(key, "reason", reason)
+        pipe.hset(key, "updated_at", now)
+        await pipe.execute()
+
+    async def get_worker_admin_state(self, worker_id: str) -> dict[str, Any]:
+        """Return the admin-controlled state for a worker.
+
+        Returns an empty dict when no admin state has been set (implying
+        the worker is in the default "active" state).
+        """
+        raw = await self.redis.hgetall(RedisKeys.worker_admin(worker_id))
+        if not raw:
+            return {}
+        result: dict[str, Any] = {}
+        for field, value in raw.items():
+            field_str = field.decode() if isinstance(field, bytes) else str(field)
+            value_str = value.decode() if isinstance(value, bytes) else str(value)
+            result[field_str] = value_str
+        if "updated_at" in result:
+            try:
+                result["updated_at"] = int(result["updated_at"])
+            except (ValueError, TypeError):
+                pass
+        return result
+
+    async def clear_worker_admin_state(self, worker_id: str) -> None:
+        """Remove the admin lifecycle key, restoring default-active behaviour."""
+        await self.redis.delete(RedisKeys.worker_admin(worker_id))
+
+    # --- Agent-type denylist ---
+
+    async def deny_worker_for_type(self, agent_type: str, worker_id: str) -> None:
+        """Add worker_id to the denylist for agent_type.
+
+        The worker will stop being added to agent_type:workers on its next
+        membership refresh and will skip XREADGROUP for that stream.
+        """
+        pipe = self.redis.pipeline()
+        pipe.sadd(RedisKeys.agent_type_denied(agent_type), worker_id)
+        pipe.srem(RedisKeys.agent_type_members(agent_type), worker_id)
+        await pipe.execute()
+
+    async def allow_worker_for_type(self, agent_type: str, worker_id: str) -> None:
+        """Remove worker_id from the denylist for agent_type."""
+        await self.redis.srem(RedisKeys.agent_type_denied(agent_type), worker_id)
+
+    async def is_worker_denied_for_type(
+        self, agent_type: str, worker_id: str
+    ) -> bool:
+        """Return True if worker_id is on the denylist for agent_type."""
+        return bool(
+            await self.redis.sismember(
+                RedisKeys.agent_type_denied(agent_type), worker_id
+            )
+        )
+
+    async def get_agent_type_denylist(self, agent_type: str) -> list[str]:
+        """Return all worker_ids on the denylist for agent_type."""
+        raw = await self.redis.smembers(RedisKeys.agent_type_denied(agent_type))
+        return [m.decode() if isinstance(m, bytes) else m for m in raw]

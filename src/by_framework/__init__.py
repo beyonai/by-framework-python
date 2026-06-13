@@ -59,9 +59,12 @@ from .core.protocol.commands import (
     AskAgentCommand,
     BaseCommand,
     CancelTaskCommand,
+    EvictWorkerCommand,
     GatewayCommand,
     ReloadPluginsCommand,
     ResumeCommand,
+    ResumeWorkerCommand,
+    SuspendWorkerCommand,
     command_from_dict,
     get_registered_command,
     register_command,
@@ -95,6 +98,7 @@ from .core.registry import (
     check_agent_type_online,
     check_worker_online,
 )
+from .core.worker_manager import WorkerManager
 from .core.wakeup_controller import WakeupController, WakeupProvider
 from .core.workspace import WorkspaceManager
 from .worker.app import run_worker
@@ -152,6 +156,7 @@ __all__ = [
     "close_redis",
     "Redis",
     "WorkerRegistry",
+    "WorkerManager",
     "check_agent_type_online",
     "check_worker_online",
     "RedisKeys",
@@ -168,6 +173,9 @@ __all__ = [
     "ResumeCommand",
     "CancelTaskCommand",
     "ReloadPluginsCommand",
+    "SuspendWorkerCommand",
+    "ResumeWorkerCommand",
+    "EvictWorkerCommand",
     "GatewayCommand",
     "command_from_dict",
     "register_command",

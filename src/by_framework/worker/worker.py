@@ -262,7 +262,11 @@ class GatewayWorker(ABC):
                 ) from err
         return snapshot
 
-    async def start_heartbeat(self, health_check: Optional[Callable[[], bool]] = None):
+    async def start_heartbeat(
+        self,
+        health_check: Optional[Callable[[], bool]] = None,
+        lifecycle_callback: Optional[Callable[[str], None]] = None,
+    ):
         """Start periodic heartbeat registration"""
         # Call plugin startup hook
         await self.plugin_registry.on_worker_startup(self)
@@ -276,6 +280,7 @@ class GatewayWorker(ABC):
             interval=self.heartbeat_interval,
             lease_ttl_seconds=self.heartbeat_lease_ttl_seconds,
             health_check=health_check,
+            lifecycle_callback=lifecycle_callback,
         )
         await self._heartbeat.start()
 

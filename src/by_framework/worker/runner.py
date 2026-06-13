@@ -23,7 +23,10 @@ from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.protocol.agent_state import TERMINAL_STATES, AgentState
 from by_framework.core.protocol.commands import (
     CancelTaskCommand,
+    EvictWorkerCommand,
     ReloadPluginsCommand,
+    ResumeWorkerCommand,
+    SuspendWorkerCommand,
 )
 from by_framework.core.protocol.results import AgentTaskResult
 from by_framework.core.registry import ExecutionCompletionFields
@@ -42,7 +45,10 @@ from by_framework.worker.worker import GatewayWorker
 
 from ._control_handling import (
     handle_cancel_task,
+    handle_evict_worker,
     handle_reload_plugins,
+    handle_resume_worker,
+    handle_suspend_worker,
     parse_control_command,
 )
 from ._execution_tracking import ExecutionTracker, RunningExecution
@@ -94,6 +100,10 @@ class WorkerRunner:
         self._metrics_collector_task: Optional[asyncio.Task] = None
         self._running_tasks: set[asyncio.Task] = set()
         self._tracker = ExecutionTracker()
+        # Admin-controlled lifecycle: "active" | "suspended" | "evicted"
+        self._admin_lifecycle: str = "active"
+        self._evict_force: bool = False
+        self._evict_event: asyncio.Event = asyncio.Event()
         self._consumer_last_tick_monotonic = 0.0
         stream_block_seconds = float(WorkerConfig.stream_block_ms) / 1000.0
         self._consumer_health_timeout_seconds = max(
@@ -160,6 +170,20 @@ class WorkerRunner:
             if "BUSYGROUP" not in str(e):
                 raise
 
+    async def _active_agent_type_streams(self) -> dict[str, str]:
+        """Return ctrl streams for agent_types not in the admin denylist."""
+        registry = getattr(self.worker, "registry", None)
+        streams: dict[str, str] = {}
+        for agent_type in self.worker.get_agent_types():
+            if registry and hasattr(registry, "is_worker_denied_for_type"):
+                denied = await registry.is_worker_denied_for_type(
+                    agent_type, self.worker.worker_id
+                )
+                if denied:
+                    continue
+            streams[RedisKeys.ctrl_stream(agent_type)] = STREAM_READ_LAST_ID
+        return streams
+
     async def fetch_messages(
         self, count: int = 10, block: int = None
     ) -> list[tuple[str, str, dict]]:
@@ -171,10 +195,10 @@ class WorkerRunner:
         """
         if block is None:
             block = WorkerConfig.stream_block_ms
-        streams = {
-            RedisKeys.ctrl_stream(agent_type): STREAM_READ_LAST_ID
-            for agent_type in self.worker.get_agent_types()
-        }
+        streams = await self._active_agent_type_streams()
+        if not streams:
+            await asyncio.sleep(float(block) / 1000.0)
+            return []
 
         messages = await self.redis.xreadgroup(
             groupname=self.group_name,
@@ -231,6 +255,33 @@ class WorkerRunner:
                         )
                     elif isinstance(command, ReloadPluginsCommand):
                         await handle_reload_plugins(command, self.worker)
+                    elif isinstance(command, SuspendWorkerCommand):
+                        await handle_suspend_worker(command, self._set_admin_lifecycle)
+                        logger.info(
+                            "[%s] Worker suspended by admin: %s",
+                            self.worker.worker_id,
+                            command.reason,
+                        )
+                    elif isinstance(command, ResumeWorkerCommand):
+                        await handle_resume_worker(command, self._set_admin_lifecycle)
+                        logger.info(
+                            "[%s] Worker resumed by admin",
+                            self.worker.worker_id,
+                        )
+                    elif isinstance(command, EvictWorkerCommand):
+                        await handle_evict_worker(
+                            command,
+                            self._set_admin_lifecycle,
+                            request_shutdown=lambda force: setattr(
+                                self, "_evict_force", force
+                            ),
+                        )
+                        logger.info(
+                            "[%s] Worker eviction requested by admin (force=%s): %s",
+                            self.worker.worker_id,
+                            command.force,
+                            command.reason,
+                        )
                     else:
                         # AskAgentCommand or ResumeCommand directly routed here
                         await self._process_message_from_dict(
@@ -328,6 +379,12 @@ class WorkerRunner:
         elapsed = time.monotonic() - self._consumer_last_tick_monotonic
         return elapsed <= self._consumer_health_timeout_seconds
 
+    def _set_admin_lifecycle(self, lifecycle: str) -> None:
+        """Called by admin command handlers to update lifecycle state."""
+        self._admin_lifecycle = lifecycle
+        if lifecycle == "evicted":
+            self._evict_event.set()
+
     async def _consume_loop(
         self,
         ready_event: Optional[asyncio.Event] = None,
@@ -340,6 +397,17 @@ class WorkerRunner:
                 ready_event.set()
             if start_event is not None and not start_event.is_set():
                 await start_event.wait()
+
+            if self._admin_lifecycle == "suspended":
+                await asyncio.sleep(1.0)
+                continue
+            if self._admin_lifecycle == "evicted":
+                logger.info(
+                    "[%s] Eviction requested; stopping consumer loop",
+                    self.worker.worker_id,
+                )
+                return
+
             await self._run_once()
             await asyncio.sleep(CONTROL_LOOP_SLEEP_SECONDS)
 
@@ -796,7 +864,10 @@ class WorkerRunner:
             )
             await reader_ready.wait()
 
-            await self.worker.start_heartbeat(health_check=self._is_consumer_healthy)
+            await self.worker.start_heartbeat(
+                health_check=self._is_consumer_healthy,
+                lifecycle_callback=self._set_admin_lifecycle,
+            )
             reader_start.set()
             heartbeat_task = self.worker.heartbeat_task
             try:
@@ -825,6 +896,19 @@ class WorkerRunner:
                     exc = self._consumer_task.exception()
                     if exc:
                         raise exc
+                    if self._admin_lifecycle == "evicted":
+                        # Consumer loop exited cleanly due to eviction command.
+                        # Drain in-flight tasks before shutting down.
+                        logger.info(
+                            "[%s] Eviction: waiting for %d in-flight task(s)",
+                            self.worker.worker_id,
+                            len(self._running_tasks),
+                        )
+                        if not self._evict_force:
+                            await self.wait_for_tasks(
+                                timeout=WAIT_FOR_TASKS_TIMEOUT_SECONDS
+                            )
+                        return
                     raise RuntimeError(
                         f"Worker '{self.worker.worker_id}' consumer loop stopped"
                     )

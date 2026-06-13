@@ -1,18 +1,22 @@
 """
 Control message handling module for WorkerRunner.
 
-Handles control commands like CancelTaskCommand.
+Handles control commands like CancelTaskCommand and admin lifecycle commands.
 """
 
 import asyncio
 import json
+from typing import Callable, Optional
 
 from by_framework.common.constants import RedisKeys
 from by_framework.core.protocol.commands import (
     AskAgentCommand,
     CancelTaskCommand,
+    EvictWorkerCommand,
     ReloadPluginsCommand,
     ResumeCommand,
+    ResumeWorkerCommand,
+    SuspendWorkerCommand,
     command_from_dict,
 )
 from by_framework.errors import UnsupportedCommandError
@@ -20,19 +24,19 @@ from by_framework.errors import UnsupportedCommandError
 
 async def parse_control_command(
     data_dict: dict,
-) -> CancelTaskCommand | ReloadPluginsCommand | AskAgentCommand | ResumeCommand:
-    """
-    Parse and validate a control or task command from the worker control stream.
-
-    Args:
-        data_dict: Parsed JSON data
-
-    Returns:
-        CancelTaskCommand, ReloadPluginsCommand, AskAgentCommand,
-        or ResumeCommand instance
+) -> (
+    CancelTaskCommand
+    | ReloadPluginsCommand
+    | AskAgentCommand
+    | ResumeCommand
+    | SuspendWorkerCommand
+    | ResumeWorkerCommand
+    | EvictWorkerCommand
+):
+    """Parse and validate a command from the worker control stream.
 
     Raises:
-        UnsupportedCommandError: If command type is not supported on the control stream
+        UnsupportedCommandError: If command type is not supported.
     """
     try:
         command = command_from_dict(data_dict)
@@ -44,6 +48,8 @@ async def parse_control_command(
         return command
     if isinstance(command, (AskAgentCommand, ResumeCommand)):
         # AskAgentCommand/ResumeCommand on worker_ctrl_stream means direct routing
+        return command
+    if isinstance(command, (SuspendWorkerCommand, ResumeWorkerCommand, EvictWorkerCommand)):
         return command
     raise UnsupportedCommandError(type(command).__name__)
 
@@ -202,3 +208,30 @@ def _get_explicit_attr(obj, name: str, default):
     if isinstance(values, dict) and name in values:
         return values[name]
     return default
+
+
+async def handle_suspend_worker(
+    command: SuspendWorkerCommand,
+    set_lifecycle: Callable[[str], None],
+) -> None:
+    """Handle SuspendWorkerCommand: set internal lifecycle to suspended."""
+    set_lifecycle("suspended")
+
+
+async def handle_resume_worker(
+    command: ResumeWorkerCommand,
+    set_lifecycle: Callable[[str], None],
+) -> None:
+    """Handle ResumeWorkerCommand: restore internal lifecycle to active."""
+    set_lifecycle("active")
+
+
+async def handle_evict_worker(
+    command: EvictWorkerCommand,
+    set_lifecycle: Callable[[str], None],
+    request_shutdown: Optional[Callable[[bool], None]] = None,
+) -> None:
+    """Handle EvictWorkerCommand: mark as evicted and trigger graceful shutdown."""
+    set_lifecycle("evicted")
+    if request_shutdown is not None:
+        request_shutdown(command.force)

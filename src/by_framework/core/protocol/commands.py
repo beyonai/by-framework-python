@@ -2,7 +2,7 @@
 Command definitions for Gateway protocol.
 
 Contains command dataclasses for all command types
-(AskAgent, Resume, CancelTask, ReloadPlugins)
+(AskAgent, Resume, CancelTask, ReloadPlugins, SuspendWorker, ResumeWorker, EvictWorker)
 and command registry for dynamic command dispatch.
 """
 
@@ -250,6 +250,82 @@ class ReloadPluginsCommand(BaseCommand):
         )
 
 
+@dataclass
+class SuspendWorkerCommand(BaseCommand):
+    """Admin command: pause a running worker from consuming new tasks.
+
+    In-flight executions continue to completion. The worker resumes only
+    when a ResumeWorkerCommand arrives or the process restarts.
+    """
+
+    action_type: ClassVar[str] = ActionType.SUSPEND_WORKER.value
+
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_type": self.action_type,
+            "header": self.header.to_dict(),
+            "body": {"reason": self.reason},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SuspendWorkerCommand":
+        body = dict(data.get("body", {}))
+        return cls(
+            header=MessageHeader.from_dict(data["header"]),
+            reason=body.get("reason", ""),
+        )
+
+
+@dataclass
+class ResumeWorkerCommand(BaseCommand):
+    """Admin command: resume a previously suspended worker."""
+
+    action_type: ClassVar[str] = ActionType.RESUME_WORKER.value
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_type": self.action_type,
+            "header": self.header.to_dict(),
+            "body": {},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ResumeWorkerCommand":
+        return cls(header=MessageHeader.from_dict(data["header"]))
+
+
+@dataclass
+class EvictWorkerCommand(BaseCommand):
+    """Admin command: shut down a worker after draining in-flight tasks.
+
+    When force=True the worker cancels in-flight tasks immediately instead
+    of waiting for them to finish.
+    """
+
+    action_type: ClassVar[str] = ActionType.EVICT_WORKER.value
+
+    reason: str = ""
+    force: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "action_type": self.action_type,
+            "header": self.header.to_dict(),
+            "body": {"reason": self.reason, "force": self.force},
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "EvictWorkerCommand":
+        body = dict(data.get("body", {}))
+        return cls(
+            header=MessageHeader.from_dict(data["header"]),
+            reason=body.get("reason", ""),
+            force=bool(body.get("force", False)),
+        )
+
+
 GatewayCommand = BaseCommand
 CommandT = TypeVar("CommandT", bound=BaseCommand)
 _COMMAND_REGISTRY: dict[str, type[BaseCommand]] = {}
@@ -283,3 +359,6 @@ register_command(AskAgentCommand)
 register_command(ResumeCommand)
 register_command(CancelTaskCommand)
 register_command(ReloadPluginsCommand)
+register_command(SuspendWorkerCommand)
+register_command(ResumeWorkerCommand)
+register_command(EvictWorkerCommand)

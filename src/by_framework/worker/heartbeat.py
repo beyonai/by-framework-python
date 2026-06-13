@@ -28,6 +28,7 @@ class WorkerHeartbeat:
         interval: int = RedisKeys.WORKER_DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         lease_ttl_seconds: int = RedisKeys.WORKER_DEFAULT_LEASE_TTL_SECONDS,
         health_check: Optional[Callable[[], bool]] = None,
+        lifecycle_callback: Optional[Callable[[str], None]] = None,
     ):
         self.worker_id = worker_id
         self.agent_types = agent_types
@@ -36,6 +37,8 @@ class WorkerHeartbeat:
         self.interval = interval
         self.lease_ttl_seconds = lease_ttl_seconds
         self.health_check = health_check
+        # Called after each successful heartbeat with the latest admin lifecycle value.
+        self.lifecycle_callback = lifecycle_callback
         self._failure_deadline_seconds = max(
             float(self.interval),
             float(self.lease_ttl_seconds) - float(self.interval),
@@ -177,6 +180,15 @@ class WorkerHeartbeat:
                         await heartbeat_registry.register_worker_membership(
                             self.worker_id, self.agent_types
                         )
+                    if self.lifecycle_callback is not None and hasattr(
+                        heartbeat_registry, "get_worker_admin_state"
+                    ):
+                        admin_state = await heartbeat_registry.get_worker_admin_state(
+                            self.worker_id
+                        )
+                        lifecycle = admin_state.get("lifecycle", "active")
+                        if lifecycle:
+                            self.lifecycle_callback(lifecycle)
                     logger.debug("[%s] Heartbeat sent", self.worker_id)
                 except Exception as exc:  # pylint: disable=broad-exception-caught
                     logger.error("[%s] Heartbeat failed: %s", self.worker_id, exc)

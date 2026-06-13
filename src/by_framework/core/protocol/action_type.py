@@ -25,9 +25,19 @@ class ActionType(str, Enum):
     ASK_USER = "ASK_USER"
     CANCEL_TASK = "CANCEL_TASK"
     RELOAD_PLUGINS = "RELOAD_PLUGINS"
+    SUSPEND_WORKER = "SUSPEND_WORKER"
+    RESUME_WORKER = "RESUME_WORKER"
+    EVICT_WORKER = "EVICT_WORKER"
 
 
 # Literal type alias for exhaustive type checking
 ActionTypeLiteral = Literal[
-    "ASK_AGENT", "RESUME", "ASK_USER", "CANCEL_TASK", "RELOAD_PLUGINS"
+    "ASK_AGENT",
+    "RESUME",
+    "ASK_USER",
+    "CANCEL_TASK",
+    "RELOAD_PLUGINS",
+    "SUSPEND_WORKER",
+    "RESUME_WORKER",
+    "EVICT_WORKER",
 ]

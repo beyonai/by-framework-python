@@ -120,6 +120,9 @@ class StreamAwareRedis:
     async def smembers(self, name):
         return self.data.get(name, set())
 
+    async def sismember(self, name, value):
+        return value in self.data.get(name, set())
+
     async def set(self, name, value, nx=False, ex=None):
         if nx and name in self.kv:
             return False

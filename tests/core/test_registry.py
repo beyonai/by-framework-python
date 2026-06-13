@@ -183,6 +183,12 @@ class MockRedis:
             return set()
         return self.data[name]
 
+    async def sismember(self, name, value):
+        bucket = self.data.get(name)
+        if not isinstance(bucket, set):
+            return False
+        return value in bucket
+
     async def set(self, name, value, nx=False, ex=None):
         if nx and name in self.kv:
             return False

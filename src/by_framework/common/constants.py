@@ -197,6 +197,26 @@ class RedisKeys:
         return f"byai_gateway:registry:worker:history_snapshots:{worker_id}"
 
     @staticmethod
+    def worker_admin(worker_id: str) -> str:
+        """HASH storing admin-controlled state for a Worker.
+
+        Fields: lifecycle (active|suspended|evicted), reason, updated_at.
+        Written by WorkerManager; read by the worker on heartbeat and startup.
+        No TTL — persists until explicitly cleared by an admin action.
+        """
+        return f"byai_gateway:registry:worker:admin:{worker_id}"
+
+    @staticmethod
+    def agent_type_denied(agent_type: str) -> str:
+        """SET of worker_ids explicitly denied from consuming an agent_type stream.
+
+        Key absent or empty SET means the agent_type is open to all workers.
+        Written by WorkerManager; checked by workers before XREADGROUP and
+        inside register_worker_membership().
+        """
+        return f"byai_gateway:registry:agent_type:denied:{agent_type}"
+
+    @staticmethod
     def session_registry(session_id: str) -> str:
         """Session-level aggregate registry (Hash).
 
