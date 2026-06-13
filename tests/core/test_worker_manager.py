@@ -2,9 +2,6 @@
 Tests for WorkerManager and related WorkerRegistry admin methods.
 """
 
-import unittest
-from unittest.mock import AsyncMock, MagicMock, call, patch
-
 import pytest
 
 from by_framework.core.registry import WorkerRegistry
@@ -46,7 +43,9 @@ class FakeRedis:
             bucket.discard(v)
 
     async def smembers(self, name):
-        return {v.encode() if isinstance(v, str) else v for v in self.sets.get(name, set())}
+        return {
+            v.encode() if isinstance(v, str) else v for v in self.sets.get(name, set())
+        }
 
     async def sismember(self, name, value):
         return value in self.sets.get(name, set())
@@ -68,6 +67,7 @@ class FakeRedis:
 
 
 class _FakePipeline:
+
     def __init__(self, redis: FakeRedis):
         self._redis = redis
         self._calls: list = []
@@ -186,10 +186,16 @@ async def test_register_worker_membership_skips_denied_types():
 
     await registry.register_worker_membership("w1", ["llm_agent", "search_agent"])
 
-    members_llm = redis.sets.get("byai_gateway:registry:agent_type:workers:llm_agent", set())
-    members_search = redis.sets.get("byai_gateway:registry:agent_type:workers:search_agent", set())
+    members_llm = redis.sets.get(
+        "byai_gateway:registry:agent_type:workers:llm_agent", set()
+    )
+    members_search = redis.sets.get(
+        "byai_gateway:registry:agent_type:workers:search_agent", set()
+    )
 
-    assert "w1" not in members_llm, "denied worker should not be added to llm_agent members"
+    assert (
+        "w1" not in members_llm
+    ), "denied worker should not be added to llm_agent members"
     assert "w1" in members_search, "non-denied type should still be registered"
 
 
@@ -214,6 +220,7 @@ async def test_worker_manager_suspend_worker():
     payload = redis.streams[stream_key][0]
     assert "data" in payload
     import json
+
     data = json.loads(payload["data"])
     assert data["action_type"] == "SUSPEND_WORKER"
 
@@ -230,6 +237,7 @@ async def test_worker_manager_resume_worker():
     assert state["lifecycle"] == "active"
 
     import json
+
     stream = redis.streams["byai_gateway:ctrl:worker:w1"]
     last_cmd = json.loads(stream[-1]["data"])
     assert last_cmd["action_type"] == "RESUME_WORKER"
@@ -246,6 +254,7 @@ async def test_worker_manager_evict_worker_graceful():
     assert state["lifecycle"] == "evicted"
 
     import json
+
     cmd = json.loads(redis.streams["byai_gateway:ctrl:worker:w1"][-1]["data"])
     assert cmd["action_type"] == "EVICT_WORKER"
     assert cmd["body"]["force"] is False
@@ -259,6 +268,7 @@ async def test_worker_manager_evict_worker_force():
     await manager.evict_worker("w1", force=True, reason="emergency")
 
     import json
+
     cmd = json.loads(redis.streams["byai_gateway:ctrl:worker:w1"][-1]["data"])
     assert cmd["body"]["force"] is True
 

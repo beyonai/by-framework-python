@@ -49,7 +49,9 @@ async def parse_control_command(
     if isinstance(command, (AskAgentCommand, ResumeCommand)):
         # AskAgentCommand/ResumeCommand on worker_ctrl_stream means direct routing
         return command
-    if isinstance(command, (SuspendWorkerCommand, ResumeWorkerCommand, EvictWorkerCommand)):
+    if isinstance(
+        command, (SuspendWorkerCommand, ResumeWorkerCommand, EvictWorkerCommand)
+    ):
         return command
     raise UnsupportedCommandError(type(command).__name__)
 

@@ -98,8 +98,8 @@ from .core.registry import (
     check_agent_type_online,
     check_worker_online,
 )
-from .core.worker_manager import WorkerManager
 from .core.wakeup_controller import WakeupController, WakeupProvider
+from .core.worker_manager import WorkerManager
 from .core.workspace import WorkspaceManager
 from .worker.app import run_worker
 from .worker.byai_context import ByaiAgentContext, ByaiAgentTask

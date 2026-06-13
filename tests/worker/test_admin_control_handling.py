@@ -6,7 +6,6 @@ from by_framework.core.protocol.commands import (
     EvictWorkerCommand,
     ResumeWorkerCommand,
     SuspendWorkerCommand,
-    command_from_dict,
 )
 from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.worker._control_handling import (

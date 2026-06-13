@@ -88,9 +88,7 @@ class WorkerManager:
             reason: Human-readable eviction reason.
         """
         await self.registry.set_worker_admin_state(worker_id, "evicted", reason)
-        command = EvictWorkerCommand(
-            header=_admin_header(), reason=reason, force=force
-        )
+        command = EvictWorkerCommand(header=_admin_header(), reason=reason, force=force)
         await self.redis.xadd(
             RedisKeys.worker_ctrl_stream(worker_id),
             command.to_redis_payload(),

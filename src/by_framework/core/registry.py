@@ -1324,9 +1324,7 @@ class WorkerRegistry:
         """Remove worker_id from the denylist for agent_type."""
         await self.redis.srem(RedisKeys.agent_type_denied(agent_type), worker_id)
 
-    async def is_worker_denied_for_type(
-        self, agent_type: str, worker_id: str
-    ) -> bool:
+    async def is_worker_denied_for_type(self, agent_type: str, worker_id: str) -> bool:
         """Return True if worker_id is on the denylist for agent_type."""
         return bool(
             await self.redis.sismember(
