@@ -314,7 +314,7 @@ wheels = [
 
 [[package]]
 name = "by-framework"
-version = "0.2.2.dev4"
+version = "0.2.2.dev5"
 source = { editable = "." }
 dependencies = [
     { name = "dill" },
