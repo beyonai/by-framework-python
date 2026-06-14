@@ -5,7 +5,7 @@ Tests for WorkerManager and related WorkerRegistry admin methods.
 import pytest
 
 from by_framework.core.registry import WorkerRegistry
-from by_framework.core.worker_manager import WorkerManager
+from by_framework.admin.worker_manager import WorkerManager
 
 
 class FakeRedis:

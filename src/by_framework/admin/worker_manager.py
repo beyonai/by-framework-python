@@ -54,9 +54,11 @@ class WorkerManager:
         """Pause a running worker from consuming new tasks.
 
         The worker finishes in-flight tasks but stops accepting new ones.
-        It resumes only when resume_worker() is called or it restarts.
+        Immediately removes the worker from all agent_type:members sets so that
+        routing skips it at once; the worker re-adds itself on resume.
         """
         await self.registry.set_worker_admin_state(worker_id, "suspended", reason)
+        await self.registry.remove_worker_from_type_members(worker_id)
         command = SuspendWorkerCommand(header=_admin_header(), reason=reason)
         await self.redis.xadd(
             RedisKeys.worker_ctrl_stream(worker_id),
@@ -64,8 +66,14 @@ class WorkerManager:
         )
 
     async def resume_worker(self, worker_id: str) -> None:
-        """Resume a previously suspended worker."""
+        """Resume a previously suspended worker.
+
+        Re-adds the worker to all agent_type:members sets immediately (respecting
+        the denylist), so routing can reach it again without waiting for the next
+        heartbeat cycle.
+        """
         await self.registry.set_worker_admin_state(worker_id, "active", "")
+        await self.registry.restore_worker_to_type_members(worker_id)
         command = ResumeWorkerCommand(header=_admin_header())
         await self.redis.xadd(
             RedisKeys.worker_ctrl_stream(worker_id),
@@ -86,8 +94,12 @@ class WorkerManager:
             force: When True, cancels in-flight tasks immediately instead of
                 waiting for them to finish.
             reason: Human-readable eviction reason.
+
+        Immediately removes the worker from all agent_type:members sets so
+        routing stops sending new messages before the heartbeat TTL expires.
         """
         await self.registry.set_worker_admin_state(worker_id, "evicted", reason)
+        await self.registry.remove_worker_from_type_members(worker_id)
         command = EvictWorkerCommand(header=_admin_header(), reason=reason, force=force)
         await self.redis.xadd(
             RedisKeys.worker_ctrl_stream(worker_id),

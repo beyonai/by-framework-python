@@ -69,7 +69,26 @@ class WorkerHeartbeat:
         if self._task:
             return
 
-        await self.registry.register_worker_membership(self.worker_id, self.agent_types)
+        # Read the admin-controlled lifecycle BEFORE registering membership.
+        # A worker that restarts while suspended must not re-join the
+        # agent_type:members sets or start consuming until explicitly resumed.
+        startup_lifecycle = "active"
+        if hasattr(self.registry, "get_worker_admin_state"):
+            admin_state = await self.registry.get_worker_admin_state(self.worker_id)
+            startup_lifecycle = admin_state.get("lifecycle", "active") or "active"
+
+        if startup_lifecycle == "active":
+            await self.registry.register_worker_membership(
+                self.worker_id, self.agent_types
+            )
+        else:
+            logger.warning(
+                "[%s] Startup admin lifecycle is '%s'; skipping member registration "
+                "— worker will not consume until resumed",
+                self.worker_id,
+                startup_lifecycle,
+            )
+
         ok = await self.registry.heartbeat_worker(
             self.worker_id, self.lease_ttl_seconds
         )
@@ -78,6 +97,14 @@ class WorkerHeartbeat:
                 f"Worker ID '{self.worker_id}' heartbeat was rejected; "
                 "another instance may own the lease"
             )
+
+        # Propagate the startup lifecycle to the runner immediately, so that
+        # _admin_lifecycle reflects the persisted state before the consume loop
+        # opens (runner calls reader_start.set() right after start_heartbeat()).
+        # Without this, the runner defaults to "active" and consumes for up to
+        # one full heartbeat interval before the thread callback corrects it.
+        if self.lifecycle_callback is not None and startup_lifecycle != "active":
+            self.lifecycle_callback(startup_lifecycle)
 
         lock_tokens = getattr(self.registry, "_lock_tokens", {})
         token = lock_tokens.get(self.worker_id, "") if lock_tokens else ""
@@ -179,19 +206,26 @@ class WorkerHeartbeat:
                         self._signal_lock_stolen()
                         return
                     last_success = loop.time()
-                    if hasattr(heartbeat_registry, "register_worker_membership"):
-                        await heartbeat_registry.register_worker_membership(
-                            self.worker_id, self.agent_types
-                        )
-                    if self.lifecycle_callback is not None and hasattr(
-                        heartbeat_registry, "get_worker_admin_state"
-                    ):
+                    # Read lifecycle before deciding whether to re-register: a
+                    # suspended or evicted worker must not re-add itself to the
+                    # agent_type:members sets on every heartbeat cycle.
+                    current_lifecycle = "active"
+                    if hasattr(heartbeat_registry, "get_worker_admin_state"):
                         admin_state = await heartbeat_registry.get_worker_admin_state(
                             self.worker_id
                         )
-                        lifecycle = admin_state.get("lifecycle", "active")
-                        if lifecycle:
-                            self.lifecycle_callback(lifecycle)
+                        current_lifecycle = (
+                            admin_state.get("lifecycle", "active") or "active"
+                        )
+                        if self.lifecycle_callback is not None:
+                            self.lifecycle_callback(current_lifecycle)
+                    if (
+                        hasattr(heartbeat_registry, "register_worker_membership")
+                        and current_lifecycle == "active"
+                    ):
+                        await heartbeat_registry.register_worker_membership(
+                            self.worker_id, self.agent_types
+                        )
                     if self.denylist_refresh is not None and hasattr(
                         heartbeat_registry, "is_worker_denied_for_type"
                     ):

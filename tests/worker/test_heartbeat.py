@@ -214,6 +214,7 @@ class TestWorkerHeartbeat(unittest.IsolatedAsyncioTestCase):
             error_count += 1
             raise RuntimeError(f"Error {error_count}")
 
+        mock_registry.get_worker_admin_state = AsyncMock(return_value={})
         mock_registry.register_worker_membership = AsyncMock()
         mock_registry.heartbeat_worker = failing_heartbeat
 

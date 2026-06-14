@@ -472,10 +472,15 @@ class WorkerRegistry:
             agent_types = [
                 c.decode() if isinstance(c, bytes) else c for c in agent_types_raw
             ]
+            admin_state = {}
+            if hasattr(self, "get_worker_admin_state"):
+                admin_state = await self.get_worker_admin_state(worker_id)
             result[worker_id] = {
                 "agent_types": agent_types,
                 "last_seen": int(time.time() * 1000) if is_legacy else last_seen,
                 "ip_address": ip_address,
+                "lifecycle": admin_state.get("lifecycle", "active") or "active",
+                "lifecycle_reason": admin_state.get("reason", ""),
             }
         return result
 
@@ -1306,6 +1311,37 @@ class WorkerRegistry:
     async def clear_worker_admin_state(self, worker_id: str) -> None:
         """Remove the admin lifecycle key, restoring default-active behaviour."""
         await self.redis.delete(RedisKeys.worker_admin(worker_id))
+
+    async def remove_worker_from_type_members(self, worker_id: str) -> None:
+        """SREM worker_id from every agent_type:members set it currently belongs to.
+
+        Preserves the declared-agent-types key so membership can be restored later.
+        Used by suspend and evict to make the worker immediately invisible to routing.
+        """
+        agent_types_raw = await self.redis.smembers(
+            RedisKeys.worker_declared_agent_types(worker_id)
+        )
+        for raw in agent_types_raw:
+            agent_type = raw.decode() if isinstance(raw, bytes) else raw
+            await self.redis.srem(RedisKeys.agent_type_members(agent_type), worker_id)
+
+    async def restore_worker_to_type_members(self, worker_id: str) -> None:
+        """SADD worker_id back to every agent_type:members set it declared.
+
+        Used by resume to make the worker immediately visible to routing again.
+        Denylist is still respected by register_worker_membership on the next
+        heartbeat cycle, so denied types are re-excluded automatically.
+        """
+        agent_types_raw = await self.redis.smembers(
+            RedisKeys.worker_declared_agent_types(worker_id)
+        )
+        for raw in agent_types_raw:
+            agent_type = raw.decode() if isinstance(raw, bytes) else raw
+            denied = await self.is_worker_denied_for_type(agent_type, worker_id)
+            if not denied:
+                await self.redis.sadd(
+                    RedisKeys.agent_type_members(agent_type), worker_id
+                )
 
     # --- Agent-type denylist ---
 
