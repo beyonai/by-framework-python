@@ -106,6 +106,10 @@ class DuplicateIdRegistryWithCleanupMethods(DuplicateIdRegistry):
         self.unregistered_membership = True
 
 
+class StartupOrderStop(RuntimeError):
+    """Sentinel used to stop the infinite runner loop in startup-order tests."""
+
+
 class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
 
     async def test_runner_pull_and_dispatch(self):
@@ -236,6 +240,35 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
             "worker-1", "stale-token"
         )
         worker.registry.unregister_worker_membership.assert_not_awaited()
+
+    async def test_runner_marks_consumer_ready_before_starting_heartbeat(self):
+        """Online lease should not be visible before the reader side is ready."""
+        worker = DummyWorker()
+        worker.registry = Mock()
+        worker.registry.claim_worker_id = AsyncMock(return_value="lock-token")
+        worker.registry.release_worker_id = AsyncMock(return_value=True)
+        worker.registry.unregister_worker_membership = AsyncMock()
+        redis_mock = MockRedisRunner(message_to_return=[])
+        runner = WorkerRunner(
+            redis_client=redis_mock, worker=worker, group_name="test_group"
+        )
+        runner._control_loop = AsyncMock()
+        reader_ready_seen_by_heartbeat = False
+
+        async def start_heartbeat(**kwargs):
+            nonlocal reader_ready_seen_by_heartbeat
+            self.assertIn("health_check", kwargs)
+            reader_ready_seen_by_heartbeat = runner._is_consumer_healthy()
+            raise StartupOrderStop("stop after heartbeat order check")
+
+        worker.start_heartbeat = start_heartbeat
+        worker.stop_heartbeat = AsyncMock()
+
+        with self.assertRaisesRegex(StartupOrderStop, "order check"):
+            await runner.start()
+
+        self.assertTrue(reader_ready_seen_by_heartbeat)
+        self.assertFalse(redis_mock.called_xreadgroup)
 
     async def test_runner_registers_execution_and_acks_processed_message(self):
         """Test that _process_message_from_dict registers execution

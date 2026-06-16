@@ -18,6 +18,55 @@ STATUS_ORDER = ("QUEUED", "RUNNING", "CANCELLING", "COMPLETED", "FAILED", "CANCE
 
 REDIS_HISTORY_KEY = "by_framework:obs:history"
 REDIS_HISTORY_TTL_MS = 2 * 60 * 60 * 1000  # Keep two hours of trend data.
+SLO_RUNBOOKS: dict[str, dict[str, Any]] = {
+    "slo-success-ratio": {
+        "id": "slo-success-ratio",
+        "title": "Restore execution success ratio",
+        "actions": [
+            "Open recent failed executions and group by error type.",
+            "Check Redis Streams pending/deadletter queues for stuck messages.",
+            "Inspect worker logs with trace_id/session_id around the burn window.",
+        ],
+    },
+    "slo-latency-p95": {
+        "id": "slo-latency-p95",
+        "title": "Reduce end-to-end latency P95",
+        "actions": [
+            "Compare queue wait P95 with worker run P95 to locate the bottleneck.",
+            "Check stream depth, pending age, and max delivery count for retry pressure.",
+            "Scale or unblock workers for the affected agent types.",
+        ],
+    },
+    "slo-deadletter": {
+        "id": "slo-deadletter",
+        "title": "Drain and explain deadletters",
+        "actions": [
+            "Inspect deadletter payloads and correlate by message_id/execution_id.",
+            "Identify the producing agent type and error type.",
+            "Replay or quarantine after the handler defect is understood.",
+        ],
+    },
+    "slo-worker-freshness": {
+        "id": "slo-worker-freshness",
+        "title": "Restore worker heartbeat freshness",
+        "actions": [
+            "List worker snapshots and find stale or evicted workers.",
+            "Check worker process health and Redis connectivity.",
+            "Restart or replace stale workers before accepting new traffic.",
+        ],
+    },
+}
+
+
+@dataclass(frozen=True)
+class SLOPolicy:
+    """Service-level objectives used to derive SLI-aware health alerts."""
+
+    success_ratio_target: float = 0.99
+    total_latency_p95_ms: int = 30_000
+    deadletter_threshold: int = 0
+    freshness_max_age_ms: int = 15_000
+    window: str = "5m"
 
 
 @dataclass(frozen=True)
@@ -28,6 +77,7 @@ class AlertPolicy:
     delivery_pending_threshold: int = 0
     consumer_pending_threshold: int = 0
     failed_execution_threshold: int = 0
+    slo_policy: SLOPolicy | None = None
 
 
 async def save_history_point_to_redis(
@@ -186,10 +236,17 @@ async def build_worker_observability_snapshot(
     redis = redis_client or get_redis()
     registry = WorkerRegistry(redis)
     workers, worker_scan = await _get_observable_workers(redis, worker_scan_limit)
+    admin_worker_ids, admin_scan = await _get_admin_managed_worker_ids(
+        redis, worker_scan_limit
+    )
+    sorted_worker_ids = sorted(set(workers) | set(admin_worker_ids))
+    admin_states = await _batch_fetch_admin_states(redis, sorted_worker_ids)
     worker_summaries = await asyncio.gather(
         *[
-            _build_lightweight_worker_summary(registry, workers, worker_id)
-            for worker_id in sorted(workers)
+            _build_lightweight_worker_summary(
+                registry, workers, worker_id, admin_states.get(worker_id, {})
+            )
+            for worker_id in sorted_worker_ids
         ]
     )
     status_counts = _aggregate_status_counts(worker_summaries)
@@ -203,7 +260,8 @@ async def build_worker_observability_snapshot(
     snapshot = {
         "generated_at": int(time.time() * 1000),
         "totals": {
-            "workers_online": len(worker_summaries),
+            "workers_online": len(workers),
+            "workers_managed": len(worker_summaries),
             "agent_types": len(agent_types),
             "active_executions": sum(
                 int(summary.get("active_count", 0)) for summary in worker_summaries
@@ -215,7 +273,7 @@ async def build_worker_observability_snapshot(
         "status_counts": status_counts,
         "workers": worker_summaries,
         "agent_types": agent_types,
-        "worker_scan": worker_scan,
+        "worker_scan": {**worker_scan, "admin": admin_scan},
     }
     snapshot["alerts"] = _build_worker_alerts(
         snapshot, alert_policy=_resolve_alert_policy(alert_policy)
@@ -433,38 +491,27 @@ def build_prometheus_metrics(snapshot: dict[str, Any]) -> str:
         "# TYPE by_framework_active_executions gauge",
         f"by_framework_active_executions {active_execution_count}",
         "# HELP by_framework_tracked_executions Tracked executions across workers.",
-        "# TYPE by_framework_tracked_executions counter",
+        "# TYPE by_framework_tracked_executions gauge",
         f"by_framework_tracked_executions {tracked_execution_count}",
     ]
     lines.extend(
         [
-            "# HELP by_framework_execution_status_total Executions by status.",
-            "# TYPE by_framework_execution_status_total gauge",
+            "# HELP by_framework_execution_status_current Current executions by status.",
+            "# TYPE by_framework_execution_status_current gauge",
         ]
     )
     for status, value in sorted(snapshot.get("status_counts", {}).items()):
         lines.append(
-            "by_framework_execution_status_total"
+            "by_framework_execution_status_current"
             f'{{status="{_escape_label(status)}"}} {int(value)}'
-        )
-
-    lines.extend(
-        [
-            "# HELP by_framework_worker_active_executions Active executions by worker.",
-            "# TYPE by_framework_worker_active_executions gauge",
-        ]
-    )
-    for worker in snapshot.get("workers", []):
-        worker_id = _escape_label(str(worker.get("worker_id", "")))
-        lines.append(
-            "by_framework_worker_active_executions"
-            f'{{worker_id="{worker_id}"}} {int(worker.get("active_count", 0))}'
         )
 
     lines.extend(
         [
             "# HELP by_framework_queue_depth Redis stream depth.",
             "# TYPE by_framework_queue_depth gauge",
+            "# HELP by_framework_stream_depth Redis stream depth.",
+            "# TYPE by_framework_stream_depth gauge",
         ]
     )
     queues = snapshot.get("queues", {})
@@ -512,6 +559,12 @@ def build_prometheus_metrics(snapshot: dict[str, Any]) -> str:
             "# HELP by_framework_stream_consumer_lag "
             "Redis Stream consumer group lag when reported by Redis.",
             "# TYPE by_framework_stream_consumer_lag gauge",
+            "# HELP by_framework_stream_oldest_pending_age_seconds "
+            "Idle age of the oldest pending Redis Stream message.",
+            "# TYPE by_framework_stream_oldest_pending_age_seconds gauge",
+            "# HELP by_framework_stream_max_delivery_count "
+            "Maximum Redis Stream pending delivery count by consumer group.",
+            "# TYPE by_framework_stream_max_delivery_count gauge",
         ]
     )
     for queue in _iter_queues(snapshot):
@@ -530,34 +583,46 @@ def build_prometheus_metrics(snapshot: dict[str, Any]) -> str:
                 lines.append(
                     f"by_framework_stream_consumer_lag{{{labels}}} {int(lag or 0)}"
                 )
+            oldest_pending_age = group.get("oldest_pending_age_seconds")
+            if oldest_pending_age is not None:
+                lines.append(
+                    "by_framework_stream_oldest_pending_age_seconds"
+                    f"{{{labels}}} {int(oldest_pending_age or 0)}"
+                )
+            max_delivery_count = group.get("max_delivery_count")
+            if max_delivery_count is not None:
+                lines.append(
+                    "by_framework_stream_max_delivery_count"
+                    f"{{{labels}}} {int(max_delivery_count or 0)}"
+                )
 
     lines.extend(
         [
-            "# HELP by_framework_execution_failure_total "
+            "# HELP by_framework_execution_recent_failures "
             "Recent failed executions by error type.",
-            "# TYPE by_framework_execution_failure_total gauge",
+            "# TYPE by_framework_execution_recent_failures gauge",
         ]
     )
     for error_type, value in sorted(
         snapshot.get("failures", {}).get("by_error_type", {}).items()
     ):
         lines.append(
-            "by_framework_execution_failure_total"
+            "by_framework_execution_recent_failures"
             f'{{error_type="{_escape_label(str(error_type))}"}} {int(value)}'
         )
 
     lines.extend(
         [
-            "# HELP by_framework_alerts_total "
+            "# HELP by_framework_alerts_current "
             "Current derived health alerts by severity.",
-            "# TYPE by_framework_alerts_total gauge",
+            "# TYPE by_framework_alerts_current gauge",
         ]
     )
     alert_counts = _count_alerts_by_severity(snapshot.get("alerts", []))
     for severity, value in sorted(alert_counts.items()):
         severity_label = _escape_label(severity)
         lines.append(
-            f'by_framework_alerts_total{{severity="{severity_label}"}} {value}'
+            f'by_framework_alerts_current{{severity="{severity_label}"}} {value}'
         )
 
     latency = snapshot.get("latency", {})
@@ -586,8 +651,36 @@ def build_prometheus_metrics(snapshot: dict[str, Any]) -> str:
             "# TYPE by_framework_execution_total_latency_p95_ms gauge",
             "by_framework_execution_total_latency_p95_ms "
             f"{int(total_latency.get('p95_ms', 0) or 0)}",
+            "# HELP by_framework_execution_queue_duration_p95_seconds "
+            "P95 queue wait duration in seconds.",
+            "# TYPE by_framework_execution_queue_duration_p95_seconds gauge",
+            "by_framework_execution_queue_duration_p95_seconds "
+            f"{_ms_to_seconds(queue_latency.get('p95_ms', 0))}",
+            "# HELP by_framework_execution_run_duration_p95_seconds "
+            "P95 worker run duration in seconds.",
+            "# TYPE by_framework_execution_run_duration_p95_seconds gauge",
+            "by_framework_execution_run_duration_p95_seconds "
+            f"{_ms_to_seconds(run_latency.get('p95_ms', 0))}",
+            "# HELP by_framework_execution_total_duration_p95_seconds "
+            "P95 end-to-end execution duration in seconds.",
+            "# TYPE by_framework_execution_total_duration_p95_seconds gauge",
+            "by_framework_execution_total_duration_p95_seconds "
+            f"{_ms_to_seconds(total_latency.get('p95_ms', 0))}",
         ]
     )
+    slo = snapshot.get("slo", {})
+    if slo:
+        lines.extend(
+            [
+                "# HELP by_framework_slo_burn_rate "
+                "Current SLO burn rate by SLI and window.",
+                "# TYPE by_framework_slo_burn_rate gauge",
+                "by_framework_slo_burn_rate"
+                f'{{sli="execution_success_ratio",'
+                f'window="{_escape_label(str(slo.get("window", "5m")))}"}} '
+                f'{float(slo.get("burn_rate", 0) or 0)}',
+            ]
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -596,18 +689,31 @@ def build_history_point(snapshot: dict[str, Any]) -> dict[str, int]:
     status_counts = snapshot.get("status_counts", {})
     totals = snapshot.get("totals", {})
     latency = snapshot.get("latency", {})
+    slo = snapshot.get("slo", {})
+    completed_executions = int(status_counts.get("COMPLETED", 0) or 0)
+    failed_executions = int(status_counts.get("FAILED", 0) or 0)
+    cancelled_executions = int(status_counts.get("CANCELLED", 0) or 0)
     return {
         "generated_at": int(snapshot.get("generated_at", 0) or 0),
         "workers_online": int(totals.get("workers_online", 0) or 0),
         "active_executions": int(totals.get("active_executions", 0) or 0),
         "queued_executions": int(status_counts.get("QUEUED", 0) or 0),
-        "failed_executions": int(status_counts.get("FAILED", 0) or 0),
+        "completed_executions": completed_executions,
+        "failed_executions": failed_executions,
+        "cancelled_executions": cancelled_executions,
+        "terminal_executions": (
+            completed_executions + failed_executions + cancelled_executions
+        ),
         "queue_depth_total": _total_queue_depth(snapshot),
         "consumer_pending_total": _total_consumer_pending(snapshot),
+        "max_delivery_count": _max_delivery_count(snapshot),
         "alert_count": len(snapshot.get("alerts", [])),
         "latency_p95_ms": int(latency.get("p95_ms", 0) or 0),
         "queue_latency_p95_ms": int(latency.get("queue", {}).get("p95_ms", 0) or 0),
         "total_latency_p95_ms": int(latency.get("total", {}).get("p95_ms", 0) or 0),
+        "success_ratio_ppm": int(slo.get("success_ratio_ppm", 1_000_000) or 0),
+        "deadletter_count": int(slo.get("deadletter_count", 0) or 0),
+        "freshness_age_ms": int(slo.get("freshness_age_ms", 0) or 0),
     }
 
 
@@ -624,13 +730,20 @@ def build_demo_observability_history(samples: int = 18) -> list[dict[str, int]]:
                 "workers_online": 2,
                 "active_executions": 2 + (index % 4),
                 "queued_executions": index % 3,
+                "completed_executions": 120 + index * 8,
                 "failed_executions": 1 if index < count - 4 else 3,
+                "cancelled_executions": index // 8,
+                "terminal_executions": 121 + index * 8 + (index // 8),
                 "queue_depth_total": 4 + ((index * 2) % 7),
                 "consumer_pending_total": 1 + (index % 4),
                 "alert_count": 1 if index < count - 5 else 2,
                 "latency_p95_ms": 6000 + ((index % 5) * 900),
                 "queue_latency_p95_ms": 400 + ((index % 4) * 150),
                 "total_latency_p95_ms": 6700 + ((index % 5) * 1000),
+                "success_ratio_ppm": 980000 if index < count - 4 else 960000,
+                "deadletter_count": 0 if index < count - 4 else 2,
+                "freshness_age_ms": 2500 + ((index % 5) * 900),
+                "max_delivery_count": 1 if index < count - 4 else 2,
             }
         )
     return points
@@ -1001,6 +1114,12 @@ def _demo_consumer_group(name: str, *, pending: int, lag: int) -> dict[str, Any]
         "pending": pending,
         "lag": lag,
         "last_delivered_id": "0-0",
+        "pending_total": pending,
+        "pending_oldest_id": "1710000000000-0" if pending else "",
+        "oldest_pending_idle_ms": 4200 if pending else 0,
+        "oldest_pending_age_seconds": 4 if pending else 0,
+        "pending_owner": "worker-demo" if pending else "",
+        "max_delivery_count": 2 if pending else 0,
         "consumers": [
             {
                 "name": "worker-demo",
@@ -1118,6 +1237,67 @@ async def _scan_online_worker_ids(
     return sorted(set(worker_ids)), True
 
 
+async def _get_admin_managed_worker_ids(
+    redis: Redis,
+    scan_limit: int,
+) -> tuple[list[str], dict[str, Any]]:
+    """Return workers with explicit admin lifecycle state, including offline ones."""
+    indexed_raw = await redis.smembers(RedisKeys.ADMIN_WORKERS)
+    indexed_ids = {
+        item.decode("utf-8") if isinstance(item, bytes) else str(item)
+        for item in indexed_raw
+    }
+    scanned_ids, scan_supported = await _scan_worker_admin_ids(redis, scan_limit)
+    worker_ids = sorted(indexed_ids | set(scanned_ids))
+    limited_ids = worker_ids[: max(scan_limit, 0)] if scan_limit else worker_ids
+    return limited_ids, {
+        "source": "admin_index_and_scan" if scan_supported else "admin_index",
+        "indexed_workers": len(indexed_ids),
+        "scanned_workers": len(scanned_ids),
+        "managed_workers": len(worker_ids),
+        "returned_workers": len(limited_ids),
+        "truncated": len(worker_ids) > len(limited_ids),
+    }
+
+
+async def _scan_worker_admin_ids(
+    redis: Redis,
+    scan_limit: int,
+) -> tuple[list[str], bool]:
+    prefix = RedisKeys.worker_admin("")
+    pattern = f"{prefix}*"
+    limit = max(scan_limit, 0)
+    worker_ids: list[str] = []
+    scan_iter = getattr(redis, "scan_iter", None)
+    if callable(scan_iter):
+        async for key in scan_iter(match=pattern, count=max(limit or 100, 100)):
+            key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+            if key_text.startswith(prefix):
+                worker_ids.append(key_text.removeprefix(prefix))
+            if limit and len(worker_ids) >= limit:
+                break
+        return sorted(set(worker_ids)), True
+
+    scan = getattr(redis, "scan", None)
+    if not callable(scan):
+        return [], False
+
+    cursor: int | str = 0
+    while True:
+        cursor, keys = await scan(
+            cursor=cursor, match=pattern, count=max(limit or 100, 100)
+        )
+        for key in keys:
+            key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+            if key_text.startswith(prefix):
+                worker_ids.append(key_text.removeprefix(prefix))
+            if limit and len(worker_ids) >= limit:
+                return sorted(set(worker_ids)), True
+        if str(cursor) == "0":
+            break
+    return sorted(set(worker_ids)), True
+
+
 def _decode_worker_presence_for_snapshot(raw: Any) -> tuple[int, bool]:
     if raw is None:
         return 0, False
@@ -1134,8 +1314,40 @@ def _decode_worker_presence_for_snapshot(raw: Any) -> tuple[int, bool]:
     return 0, True
 
 
+async def _batch_fetch_admin_states(
+    redis: Redis, worker_ids: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Pipeline-fetch admin state HASHes for all workers in one round-trip."""
+    if not worker_ids:
+        return {}
+    pipe = redis.pipeline()
+    for wid in worker_ids:
+        pipe.hgetall(RedisKeys.worker_admin(wid))
+    results = await pipe.execute()
+    return {
+        worker_id: _decode_hash_mapping(raw)
+        for worker_id, raw in zip(worker_ids, results)
+    }
+
+
+def _decode_hash_mapping(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    decoded: dict[str, Any] = {}
+    for key, value in raw.items():
+        key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+        if isinstance(value, bytes):
+            decoded[key_text] = value.decode("utf-8")
+        else:
+            decoded[key_text] = value
+    return decoded
+
+
 async def _build_lightweight_worker_summary(
-    registry: WorkerRegistry, workers: dict[str, Any], worker_id: str
+    registry: WorkerRegistry,
+    workers: dict[str, Any],
+    worker_id: str,
+    admin_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw_counts = await registry.redis.hgetall(RedisKeys.worker_status(worker_id))
     counts = {
@@ -1157,11 +1369,15 @@ async def _build_lightweight_worker_summary(
         "CANCELLED": counts["cancelled"],
     }
     worker_info = workers.get(worker_id, {})
+    admin = admin_state or {}
     return {
         "worker_id": worker_id,
         "online": worker_id in workers,
         "agent_types": sorted(worker_info.get("agent_types", [])),
         "last_seen": int(worker_info.get("last_seen", 0)),
+        "ip_address": worker_info.get("ip_address", ""),
+        "lifecycle": admin.get("lifecycle", "") or "active",
+        "lifecycle_reason": admin.get("reason", "") or "",
         "counts": counts,
         "active_count": counts["active"],
         "total_tracked": counts["total"],
@@ -1184,15 +1400,15 @@ def _get_hash_int(data: dict[Any, Any], key: str) -> int:
 def _enrich_snapshot(
     snapshot: dict[str, Any], *, alert_policy: AlertPolicy | None = None
 ) -> dict[str, Any]:
+    policy = _resolve_alert_policy(alert_policy)
     snapshot["recent_executions"] = [
         _enrich_execution_timing(execution)
         for execution in snapshot.get("recent_executions", [])
     ]
     snapshot["latency"] = _calculate_latency(snapshot.get("recent_executions", []))
     snapshot["failures"] = _build_failure_summary(snapshot.get("recent_executions", []))
-    snapshot["alerts"] = _build_alerts(
-        snapshot, alert_policy=_resolve_alert_policy(alert_policy)
-    )
+    snapshot["slo"] = _build_slo_summary(snapshot, policy.slo_policy)
+    snapshot["alerts"] = _build_alerts(snapshot, alert_policy=policy)
     snapshot["health"] = _build_health_summary(snapshot.get("alerts", []))
     snapshot["agent_health"] = _build_agent_health(snapshot)
     snapshot["data_flow"] = _build_data_flow(snapshot)
@@ -1310,6 +1526,7 @@ def _resolve_alert_policy(
             delivery_pending_threshold=max(0, alert_policy.delivery_pending_threshold),
             consumer_pending_threshold=max(0, alert_policy.consumer_pending_threshold),
             failed_execution_threshold=max(0, alert_policy.failed_execution_threshold),
+            slo_policy=_resolve_slo_policy(alert_policy.slo_policy),
         )
     if queue_backlog_threshold is None:
         return policy
@@ -1318,15 +1535,30 @@ def _resolve_alert_policy(
         delivery_pending_threshold=max(0, policy.delivery_pending_threshold),
         consumer_pending_threshold=max(0, policy.consumer_pending_threshold),
         failed_execution_threshold=max(0, policy.failed_execution_threshold),
+        slo_policy=policy.slo_policy,
+    )
+
+
+def _resolve_slo_policy(slo_policy: SLOPolicy | None) -> SLOPolicy | None:
+    if slo_policy is None:
+        return None
+    return SLOPolicy(
+        success_ratio_target=min(1.0, max(0.0, slo_policy.success_ratio_target)),
+        total_latency_p95_ms=max(0, int(slo_policy.total_latency_p95_ms)),
+        deadletter_threshold=max(0, int(slo_policy.deadletter_threshold)),
+        freshness_max_age_ms=max(0, int(slo_policy.freshness_max_age_ms)),
+        window=slo_policy.window or "5m",
     )
 
 
 def _build_alerts(
     snapshot: dict[str, Any], *, alert_policy: AlertPolicy
 ) -> list[dict[str, Any]]:
-    return _build_worker_alerts(
-        snapshot, alert_policy=alert_policy
-    ) + _build_queue_alerts(snapshot, alert_policy=alert_policy)
+    return (
+        _build_worker_alerts(snapshot, alert_policy=alert_policy)
+        + _build_queue_alerts(snapshot, alert_policy=alert_policy)
+        + _build_slo_alerts(snapshot, alert_policy=alert_policy)
+    )
 
 
 def _build_health_summary(alerts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1445,6 +1677,176 @@ def _build_queue_alerts(
     return alerts
 
 
+def _build_slo_summary(
+    snapshot: dict[str, Any], slo_policy: SLOPolicy | None
+) -> dict[str, Any]:
+    status_counts = snapshot.get("status_counts", {})
+    completed = int(status_counts.get("COMPLETED", 0) or 0)
+    failed = int(status_counts.get("FAILED", 0) or 0)
+    cancelled = int(status_counts.get("CANCELLED", 0) or 0)
+    terminal = completed + failed + cancelled
+    success_ratio = completed / terminal if terminal else 1.0
+    latency_p95 = int(
+        snapshot.get("latency", {}).get("total", {}).get("p95_ms", 0) or 0
+    )
+    deadletter_count = int(
+        snapshot.get("queues", {})
+        .get("control_plane", {})
+        .get("deadletter", {})
+        .get("length", 0)
+        or 0
+    )
+    generated_at = int(snapshot.get("generated_at", 0) or 0)
+    newest_seen = max(
+        [int(worker.get("last_seen", 0) or 0) for worker in snapshot.get("workers", [])]
+        or [generated_at]
+    )
+    freshness_age_ms = max(0, generated_at - newest_seen) if generated_at else 0
+    target = slo_policy.success_ratio_target if slo_policy else 0.99
+    budget = max(0.000001, 1.0 - target)
+    burn_rate = max(0.0, (target - success_ratio) / budget)
+    return {
+        "window": slo_policy.window if slo_policy else "5m",
+        "success_ratio": success_ratio,
+        "success_ratio_ppm": int(success_ratio * 1_000_000),
+        "success_ratio_target_ppm": int(target * 1_000_000),
+        "burn_rate": round(burn_rate, 3),
+        "terminal_executions": terminal,
+        "total_latency_p95_ms": latency_p95,
+        "total_latency_p95_target_ms": (
+            slo_policy.total_latency_p95_ms if slo_policy else 30_000
+        ),
+        "deadletter_count": deadletter_count,
+        "deadletter_threshold": slo_policy.deadletter_threshold if slo_policy else 0,
+        "freshness_age_ms": freshness_age_ms,
+        "freshness_max_age_ms": (
+            slo_policy.freshness_max_age_ms if slo_policy else 15_000
+        ),
+    }
+
+
+def _build_slo_alerts(
+    snapshot: dict[str, Any], *, alert_policy: AlertPolicy | None = None
+) -> list[dict[str, Any]]:
+    policy = _resolve_alert_policy(alert_policy)
+    slo_policy = policy.slo_policy
+    if slo_policy is None:
+        return []
+    slo = snapshot.get("slo") or _build_slo_summary(snapshot, slo_policy)
+    alerts = []
+    success_ratio = float(slo.get("success_ratio", 1.0) or 1.0)
+    if success_ratio < slo_policy.success_ratio_target:
+        alerts.append(
+            _slo_alert(
+                code="SLO_SUCCESS_RATIO",
+                severity="critical"
+                if float(slo.get("burn_rate", 0)) >= 2
+                else "warning",
+                message=(
+                    "Execution success ratio "
+                    f"{success_ratio:.2%} is below target "
+                    f"{slo_policy.success_ratio_target:.2%}."
+                ),
+                value=int(slo.get("success_ratio_ppm", 0) or 0),
+                threshold=int(slo_policy.success_ratio_target * 1_000_000),
+                sli="execution_success_ratio",
+                window=slo_policy.window,
+                burn_rate=float(slo.get("burn_rate", 0) or 0),
+                runbook_id="slo-success-ratio",
+            )
+        )
+    latency_p95 = int(slo.get("total_latency_p95_ms", 0) or 0)
+    if latency_p95 > slo_policy.total_latency_p95_ms:
+        alerts.append(
+            _slo_alert(
+                code="SLO_LATENCY_P95",
+                severity="warning",
+                message=(
+                    f"End-to-end P95 latency {latency_p95} ms exceeds "
+                    f"{slo_policy.total_latency_p95_ms} ms."
+                ),
+                value=latency_p95,
+                threshold=slo_policy.total_latency_p95_ms,
+                sli="execution_total_latency_p95",
+                window=slo_policy.window,
+                burn_rate=round(
+                    latency_p95 / max(slo_policy.total_latency_p95_ms, 1), 3
+                ),
+                runbook_id="slo-latency-p95",
+            )
+        )
+    deadletters = int(slo.get("deadletter_count", 0) or 0)
+    if deadletters > slo_policy.deadletter_threshold:
+        alerts.append(
+            _slo_alert(
+                code="SLO_DEADLETTER",
+                severity="critical",
+                message=f"{deadletters} deadletter messages exceed SLO threshold.",
+                value=deadletters,
+                threshold=slo_policy.deadletter_threshold,
+                sli="deadletter_count",
+                window=slo_policy.window,
+                burn_rate=deadletters / max(slo_policy.deadletter_threshold, 1),
+                runbook_id="slo-deadletter",
+            )
+        )
+    freshness_age_ms = int(slo.get("freshness_age_ms", 0) or 0)
+    if freshness_age_ms > slo_policy.freshness_max_age_ms:
+        alerts.append(
+            _slo_alert(
+                code="SLO_FRESHNESS",
+                severity="warning",
+                message=(
+                    f"Newest worker heartbeat is {freshness_age_ms} ms old, "
+                    f"above {slo_policy.freshness_max_age_ms} ms."
+                ),
+                value=freshness_age_ms,
+                threshold=slo_policy.freshness_max_age_ms,
+                sli="worker_freshness",
+                window=slo_policy.window,
+                burn_rate=round(
+                    freshness_age_ms / max(slo_policy.freshness_max_age_ms, 1), 3
+                ),
+                runbook_id="slo-worker-freshness",
+            )
+        )
+    return alerts
+
+
+def _slo_alert(
+    *,
+    code: str,
+    severity: str,
+    message: str,
+    value: int,
+    threshold: int,
+    sli: str,
+    window: str,
+    burn_rate: float,
+    runbook_id: str,
+) -> dict[str, Any]:
+    runbook = SLO_RUNBOOKS.get(
+        runbook_id,
+        {
+            "id": runbook_id,
+            "title": "Investigate SLO alert",
+            "actions": ["Inspect correlated metrics, traces, logs, and queue state."],
+        },
+    )
+    return {
+        "code": code,
+        "severity": severity,
+        "message": message,
+        "value": value,
+        "threshold": threshold,
+        "sli": sli,
+        "window": window,
+        "burn_rate": round(float(burn_rate), 3),
+        "runbook_id": runbook_id,
+        "runbook": runbook,
+    }
+
+
 def _count_alerts_by_severity(alerts: list[dict[str, Any]]) -> dict[str, int]:
     counts: dict[str, int] = {}
     for alert in alerts:
@@ -1490,6 +1892,8 @@ def _build_data_flow(snapshot: dict[str, Any]) -> dict[str, Any]:
         for execution in snapshot.get("recent_executions", [])
         if execution.get("session_id")
     )
+    total_latency_p95_ms = int(latency.get("total", {}).get("p95_ms", 0) or 0)
+    websocket_observable = False
 
     queue_status = _flow_status(
         critical=False,
@@ -1504,8 +1908,8 @@ def _build_data_flow(snapshot: dict[str, Any]) -> dict[str, Any]:
         warning=pending_deliveries > 0,
     )
     data_stream_status = _flow_status(
-        critical=False,
-        warning=failed_executions > 0,
+        critical=deadletters > 0,
+        warning=False,
     )
 
     nodes = [
@@ -1550,9 +1954,7 @@ def _build_data_flow(snapshot: dict[str, Any]) -> dict[str, Any]:
             "status": data_stream_status,
             "metrics": {
                 "recent_events": data_events,
-                "total_latency_p95_ms": int(
-                    latency.get("total", {}).get("p95_ms", 0) or 0
-                ),
+                "total_latency_p95_ms": total_latency_p95_ms,
             },
         },
         {
@@ -1561,7 +1963,7 @@ def _build_data_flow(snapshot: dict[str, Any]) -> dict[str, Any]:
             "kind": "egress",
             "status": "unknown",
             "metrics": {
-                "observable_from_framework": 0,
+                "fanout_observable": int(websocket_observable),
             },
         },
         {
@@ -1609,8 +2011,8 @@ def _build_data_flow(snapshot: dict[str, Any]) -> dict[str, Any]:
             "source": "data_stream",
             "target": "websocket_backend",
             "label": "Session data stream fan-out",
-            "metric_label": "observable",
-            "metric_value": 0,
+            "metric_label": "fanout observable",
+            "metric_value": int(websocket_observable),
             "status": "unknown",
         },
         {
@@ -1686,6 +2088,17 @@ def _total_consumer_pending(snapshot: dict[str, Any]) -> int:
         int(group.get("pending", 0) or 0)
         for queue in _iter_queues(snapshot)
         for group in queue.get("consumer_groups", [])
+    )
+
+
+def _max_delivery_count(snapshot: dict[str, Any]) -> int:
+    return max(
+        (
+            int(group.get("max_delivery_count", 0) or 0)
+            for queue in _iter_queues(snapshot)
+            for group in queue.get("consumer_groups", [])
+        ),
+        default=0,
     )
 
 
@@ -2221,6 +2634,11 @@ async def _stream_consumer_group_health(
         group = _normalize_redis_mapping(raw_group)
         group_name = str(group.get("name", ""))
         pending = int(group.get("pending", 0) or 0)
+        pending_detail = (
+            await _stream_pending_detail(redis, stream_name, group_name)
+            if include_consumer_details
+            else {}
+        )
         health = {
             "name": group_name,
             "pending": pending,
@@ -2229,6 +2647,7 @@ async def _stream_consumer_group_health(
             "consumers": await _stream_consumer_health(redis, stream_name, group_name)
             if include_consumer_details
             else [],
+            **pending_detail,
         }
         groups.append(health)
     return groups
@@ -2255,6 +2674,71 @@ async def _stream_consumer_health(
             }
         )
     return consumers
+
+
+async def _stream_pending_detail(
+    redis: Redis, stream_name: str, group_name: str
+) -> dict[str, Any]:
+    xpending = getattr(redis, "xpending", None)
+    if not callable(xpending) or not group_name:
+        return {}
+    try:
+        raw_pending = await xpending(stream_name, group_name)
+    except Exception:  # pylint: disable=broad-exception-caught
+        return {}
+    detail = _normalize_pending_summary(raw_pending)
+    if not detail:
+        return {}
+    return detail
+
+
+def _normalize_pending_summary(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    pending = int(raw.get("pending", 0) or 0)
+    entries = raw.get("entries", []) or []
+    oldest_entry = entries[0] if entries else {}
+    if isinstance(oldest_entry, dict):
+        oldest_entry = _normalize_redis_mapping(oldest_entry)
+    else:
+        oldest_entry = {}
+    oldest_id = str(
+        oldest_entry.get("message_id")
+        or oldest_entry.get("message-id")
+        or raw.get("min")
+        or ""
+    )
+    oldest_idle_ms = int(
+        oldest_entry.get("idle_ms")
+        or oldest_entry.get("idle")
+        or raw.get("oldest_pending_idle_ms")
+        or 0
+    )
+    consumers = [
+        _normalize_redis_mapping(consumer)
+        for consumer in raw.get("consumers", []) or []
+        if isinstance(consumer, dict)
+    ]
+    pending_owner = str(
+        oldest_entry.get("consumer")
+        or oldest_entry.get("consumer_name")
+        or (consumers[0].get("name") if consumers else "")
+        or ""
+    )
+    max_delivery_count = int(
+        oldest_entry.get("delivery_count")
+        or oldest_entry.get("times_delivered")
+        or raw.get("max_delivery_count")
+        or 0
+    )
+    return {
+        "pending_total": pending,
+        "pending_oldest_id": oldest_id,
+        "oldest_pending_idle_ms": oldest_idle_ms,
+        "oldest_pending_age_seconds": int(oldest_idle_ms / 1000),
+        "pending_owner": pending_owner,
+        "max_delivery_count": max_delivery_count,
+    }
 
 
 def _normalize_redis_mapping(raw: dict[Any, Any]) -> dict[str, Any]:
@@ -2288,7 +2772,16 @@ def _append_queue_metric(
         f'name="{_escape_label(name)}",'
         f'stream="{_escape_label(str(queue.get("stream", "")))}"}} {int(length)}'
     )
+    lines.append(
+        "by_framework_stream_depth"
+        f'{{queue_type="{_escape_label(queue_type)}",'
+        f'name="{_escape_label(name)}"}} {int(length)}'
+    )
 
 
 def _escape_label(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def _ms_to_seconds(value: Any) -> str:
+    return f"{(float(value or 0) / 1000):.6g}"

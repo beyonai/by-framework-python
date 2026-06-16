@@ -8,6 +8,7 @@ import asyncio
 import os
 import uuid
 from collections import OrderedDict
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import import_module
@@ -35,6 +36,7 @@ LANGFUSE_OBSERVATION_ATTR = "_langfuse_observation"
 LANGFUSE_CALL_PARENT_OBSERVATION_ATTR = "_langfuse_call_parent_observation"
 LANGFUSE_WORKFLOW_OBSERVATION_ATTR = "_langfuse_workflow_observation"
 WORKER_EXECUTE_OBSERVATION_ATTR = "_langfuse_worker_execute_observation"
+LANGFUSE_ATTRIBUTE_PROPAGATION_ATTR = "_langfuse_attribute_propagation"
 LANGFUSE_PARENT_OBSERVATION_METADATA_KEY = "langfuse_parent_observation_id"
 _QUOTES_TO_STRIP = "\"'“”‘’"
 _FALSE_LIKE_VALUES = {"0", "false", "no", "off", "disabled"}
@@ -78,6 +80,7 @@ def build_langchain_callback(
     *,
     trace_id: str,
     parent_observation_id: str,
+    metadata: Optional[dict[str, Any]] = None,
 ) -> Optional[Any]:
     """Build a Langfuse LangChain CallbackHandler for an existing trace."""
     config = LangfuseConfig.from_env()
@@ -96,20 +99,55 @@ def build_langchain_callback(
             "parent_span_id": parent_observation_id,
         }
 
-        return callback_handler_cls(
+        callback = callback_handler_cls(
             public_key=config.public_key,
             trace_context=trace_context,
         )
+        setattr(
+            callback,
+            "_by_framework_metadata",
+            _langchain_callback_metadata(metadata),
+        )
+        return callback
     except Exception:  # pylint: disable=broad-exception-caught
         return None
+
+
+def _langchain_callback_metadata(
+    metadata: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Build metadata injected into Langfuse LangChain child observations."""
+    merged: dict[str, Any] = {}
+    try:
+        from by_framework.worker.context import current_agent_context_var
+
+        context = current_agent_context_var.get()
+        if context is not None:
+            merged["worker_id"] = str(getattr(context, "worker_id", "") or "")
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+    if metadata:
+        merged.update(metadata)
+    return {key: value for key, value in merged.items() if value not in ("", None)}
 
 
 def _without_langchain_root_promotion(callback_handler_cls: Any) -> Any:
     """Return a CallbackHandler class that keeps LangChain runs as child spans."""
 
-    # pylint: disable=too-few-public-methods
+    # pylint: disable=too-few-public-methods,useless-parent-delegation
     class ByFrameworkCallbackHandler(callback_handler_cls):
         """Langfuse LangChain handler that does not rename the existing trace root."""
+
+        def _merge_by_framework_metadata(
+            self,
+            metadata: Optional[dict[str, Any]],
+        ) -> Optional[dict[str, Any]]:
+            framework_metadata = getattr(self, "_by_framework_metadata", {}) or {}
+            if not framework_metadata:
+                return metadata
+            merged = {**framework_metadata, **(metadata or {})}
+            return {key: value for key, value in merged.items() if value is not None}
 
         def on_chain_start(
             self,
@@ -118,6 +156,7 @@ def _without_langchain_root_promotion(callback_handler_cls: Any) -> Any:
             *,
             run_id: Any,
             parent_run_id: Any = None,
+            metadata: Optional[dict[str, Any]] = None,
             **kwargs: Any,
         ) -> Any:
             result = super().on_chain_start(
@@ -125,6 +164,7 @@ def _without_langchain_root_promotion(callback_handler_cls: Any) -> Any:
                 inputs,
                 run_id=run_id,
                 parent_run_id=parent_run_id,
+                metadata=self._merge_by_framework_metadata(metadata),
                 **kwargs,
             )
             if parent_run_id is None:
@@ -132,6 +172,63 @@ def _without_langchain_root_promotion(callback_handler_cls: Any) -> Any:
                 observation = runs.get(run_id) if isinstance(runs, dict) else None
                 _mark_observation_as_non_root(observation)
             return result
+
+        def on_llm_start(
+            self,
+            serialized: Any,
+            prompts: list[str],
+            *,
+            run_id: Any,
+            parent_run_id: Any = None,
+            metadata: Optional[dict[str, Any]] = None,
+            **kwargs: Any,
+        ) -> Any:
+            return super().on_llm_start(
+                serialized,
+                prompts,
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                metadata=self._merge_by_framework_metadata(metadata),
+                **kwargs,
+            )
+
+        def on_chat_model_start(
+            self,
+            serialized: Any,
+            messages: list[Any],
+            *,
+            run_id: Any,
+            parent_run_id: Any = None,
+            metadata: Optional[dict[str, Any]] = None,
+            **kwargs: Any,
+        ) -> Any:
+            return super().on_chat_model_start(
+                serialized,
+                messages,
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                metadata=self._merge_by_framework_metadata(metadata),
+                **kwargs,
+            )
+
+        def on_tool_start(
+            self,
+            serialized: Any,
+            input_str: str,
+            *,
+            run_id: Any,
+            parent_run_id: Any = None,
+            metadata: Optional[dict[str, Any]] = None,
+            **kwargs: Any,
+        ) -> Any:
+            return super().on_tool_start(
+                serialized,
+                input_str,
+                run_id=run_id,
+                parent_run_id=parent_run_id,
+                metadata=self._merge_by_framework_metadata(metadata),
+                **kwargs,
+            )
 
     ByFrameworkCallbackHandler.__name__ = callback_handler_cls.__name__
     ByFrameworkCallbackHandler.__qualname__ = callback_handler_cls.__qualname__
@@ -469,6 +566,7 @@ class LangfusePlugin(Plugin):
             getattr(context.current_command, "content", None)
         )
         metadata = self._build_metadata(identity, context)
+        self._start_attribute_propagation(context, metadata=metadata)
 
         # Parent worker.execute under a durable workflow node. The workflow spans
         # the logical task across async suspend/resume; worker.execute only spans
@@ -574,10 +672,12 @@ class LangfusePlugin(Plugin):
         if not self._is_non_terminal_result(result):
             self._end_workflow_observation(context, output=serialized_output)
         self._update_trace_output(context, output=serialized_output)
+        self._close_attribute_propagation(context)
 
     async def on_task_error(self, context: Any, error: Exception) -> None:
         observations = self._iter_context_observations(context)
         if not observations:
+            self._close_attribute_propagation(context)
             return
 
         for observation in observations:
@@ -588,10 +688,12 @@ class LangfusePlugin(Plugin):
         )
         self._end_workflow_observation(context, output={"error": str(error)})
         self._update_trace_output(context, output={"error": str(error)})
+        self._close_attribute_propagation(context)
 
     async def on_task_cancel(self, context: Any, command: Any) -> None:
         observations = self._iter_context_observations(context)
         if not observations:
+            self._close_attribute_propagation(context)
             return
 
         reason = getattr(command, "reason", "") or "cancelled"
@@ -609,6 +711,7 @@ class LangfusePlugin(Plugin):
             context,
             output={"cancelled": True, "reason": reason},
         )
+        self._close_attribute_propagation(context)
 
     async def on_call_agent_start(self, context: Any, command: Any) -> None:
         """Create a call observation and pass it as the child task parent."""
@@ -829,6 +932,41 @@ class LangfusePlugin(Plugin):
         )
         return self._observation_store
 
+    def _start_attribute_propagation(
+        self, context: Any, *, metadata: dict[str, Any]
+    ) -> None:
+        """Start Langfuse metadata propagation for native LangGraph users."""
+        worker_id = str(metadata.get("worker_id", "") or "")
+        if not worker_id or hasattr(context, LANGFUSE_ATTRIBUTE_PROPAGATION_ATTR):
+            return
+
+        try:
+            propagate_attributes = getattr(
+                import_module("langfuse"),
+                "propagate_attributes",
+            )
+        except (ImportError, AttributeError):
+            return
+
+        stack = ExitStack()
+        stack.enter_context(propagate_attributes(metadata={"worker_id": worker_id}))
+        setattr(context, LANGFUSE_ATTRIBUTE_PROPAGATION_ATTR, stack)
+
+    @staticmethod
+    def _close_attribute_propagation(context: Any) -> None:
+        """Close the task-scoped Langfuse attribute propagation context."""
+        stack = getattr(context, LANGFUSE_ATTRIBUTE_PROPAGATION_ATTR, None)
+        if stack is None:
+            return
+
+        try:
+            stack.close()
+        finally:
+            try:
+                delattr(context, LANGFUSE_ATTRIBUTE_PROPAGATION_ATTR)
+            except AttributeError:
+                pass
+
     def _build_default_tracer(self) -> Optional[LangfuseTracer]:
         config = LangfuseConfig.from_env()
         if config is None:
@@ -894,6 +1032,7 @@ class LangfusePlugin(Plugin):
             "session_id": identity.session_id,
             "trace_id": identity.trace_id,
             "agent_id": identity.agent_id,
+            "worker_id": str(getattr(context, "worker_id", "") or ""),
             "user_code": identity.user_code,
             "user_name": identity.user_name,
             "header_metadata": header_metadata,

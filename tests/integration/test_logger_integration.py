@@ -88,6 +88,10 @@ class TestLoggerIntegration(unittest.TestCase):
         )
 
         registry_mock = AsyncMock()
+        registry_mock.get_worker_admin_state = AsyncMock(return_value={})
+        registry_mock.register_worker_membership = AsyncMock(return_value=None)
+        registry_mock.heartbeat_worker = AsyncMock(return_value=True)
+        registry_mock._lock_tokens = {}  # pylint: disable=protected-access
         redis_mock = AsyncMock()
         redis_mock.pipeline = MagicMock(
             return_value=MagicMock(xadd=MagicMock(), execute=AsyncMock(return_value=[]))
@@ -99,7 +103,10 @@ class TestLoggerIntegration(unittest.TestCase):
         async def run_worker():
             # Simulate processing message
             await worker.start_heartbeat()
-            await worker._handle_message(msg_mock)
+            try:
+                await worker._handle_message(msg_mock)
+            finally:
+                await worker.stop_heartbeat()
 
         try:
             asyncio.run(run_worker())

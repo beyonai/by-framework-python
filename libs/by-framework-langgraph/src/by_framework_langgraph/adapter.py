@@ -525,6 +525,7 @@ class LangGraphAdapter:
                 self._context, "parent_message_id", ""
             ),
             "by_framework_agent_id": getattr(self._context, "current_agent_id", ""),
+            "worker_id": getattr(self._context, "worker_id", ""),
             "langgraph_thread_id": self._thread_id,
         }
         return {
@@ -538,9 +539,30 @@ class LangGraphAdapter:
 
         with (
             self._phoenix_context_manager(),
+            self._langfuse_attribute_propagation_context_manager(),
             self._langfuse_callback_manager(callbacks),
         ):
             yield callbacks
+
+    @contextmanager
+    def _langfuse_attribute_propagation_context_manager(self) -> Iterator[None]:
+        """Propagate stable framework metadata to Langfuse child observations."""
+        worker_id = str(getattr(self._context, "worker_id", "") or "")
+        if not worker_id:
+            yield
+            return
+
+        try:
+            propagate_attributes = getattr(
+                import_module("langfuse"),
+                "propagate_attributes",
+            )
+        except (ImportError, AttributeError):
+            yield
+            return
+
+        with propagate_attributes(metadata={"worker_id": worker_id}):
+            yield
 
     @contextmanager
     def _phoenix_context_manager(self) -> Iterator[None]:

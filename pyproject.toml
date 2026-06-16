@@ -20,12 +20,21 @@ dev = [
     "pyink>=24.0.0",
     "pylint>=3.0.0",
     "ruff>=0.3.0",
+    "typer>=0.12.0",
+    "rich>=13.0.0",
 ]
 observability = [
     "prometheus-client>=0.20.0",
     "opentelemetry-api>=1.25.0",
     "opentelemetry-sdk>=1.25.0",
 ]
+cli = [
+    "typer>=0.12.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+by-admin = "by_framework.admin.cli:app"
 
 [build-system]
 requires = ["hatchling"]

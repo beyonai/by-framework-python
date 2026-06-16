@@ -1,0 +1,866 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Worker Management — by-framework</title>
+<style>
+:root {
+  --bg:        #0F1117;
+  --bg-card:   #181C27;
+  --bg-hover:  #1E2333;
+  --border:    #2A2F42;
+  --border-hi: #3D4460;
+  --text:      #CDD5F0;
+  --text-dim:  #7880A0;
+  --text-head: #E8EDFF;
+  --accent:    #5B8AF0;
+  --accent-2:  #A78BFA;
+  --green:     #34D399;
+  --yellow:    #FBBF24;
+  --red:       #F87171;
+  --orange:    #FB923C;
+  --mono:      'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
+  --sans:      -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  --radius:    8px;
+  --sidebar-w: 220px;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.7;
+  display: flex;
+  min-height: 100vh;
+}
+
+/* ── Sidebar ── */
+nav {
+  width: var(--sidebar-w);
+  flex-shrink: 0;
+  background: var(--bg-card);
+  border-right: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  padding: 24px 0 40px;
+}
+
+.nav-logo {
+  padding: 0 20px 20px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 16px;
+}
+.nav-logo .pkg {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--accent);
+  letter-spacing: .04em;
+}
+.nav-logo .title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-head);
+  margin-top: 4px;
+}
+
+nav a {
+  display: block;
+  padding: 6px 20px;
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 13px;
+  border-left: 2px solid transparent;
+  transition: all .15s;
+}
+nav a:hover { color: var(--text); background: var(--bg-hover); }
+nav a.active { color: var(--accent); border-left-color: var(--accent); background: rgba(91,138,240,.08); }
+nav .nav-section {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  padding: 16px 20px 6px;
+}
+
+/* ── Main ── */
+main {
+  flex: 1;
+  max-width: 860px;
+  padding: 48px 48px 96px;
+  min-width: 0;
+}
+
+h1 {
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--text-head);
+  letter-spacing: -.02em;
+  line-height: 1.3;
+}
+h2 {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-head);
+  margin: 48px 0 16px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+h3 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-head);
+  margin: 24px 0 10px;
+}
+p { margin: 10px 0; }
+strong { color: var(--text-head); font-weight: 600; }
+
+/* ── Hero ── */
+.hero {
+  margin-bottom: 40px;
+  padding-bottom: 32px;
+  border-bottom: 1px solid var(--border);
+}
+.hero-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+.badge-sdk  { background: rgba(91,138,240,.15); color: var(--accent); border: 1px solid rgba(91,138,240,.3); }
+.badge-new  { background: rgba(52,211,153,.12); color: var(--green); border: 1px solid rgba(52,211,153,.3); }
+.badge-ops  { background: rgba(167,139,250,.12); color: var(--accent-2); border: 1px solid rgba(167,139,250,.3); }
+.hero p { color: var(--text-dim); font-size: 15px; max-width: 640px; line-height: 1.65; margin-top: 12px; }
+
+/* ── Cards ── */
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px 24px;
+  margin: 16px 0;
+}
+
+/* ── Callouts ── */
+.callout {
+  display: flex;
+  gap: 12px;
+  padding: 14px 18px;
+  border-radius: var(--radius);
+  margin: 16px 0;
+  border: 1px solid;
+}
+.callout-icon { font-size: 16px; flex-shrink: 0; margin-top: 1px; }
+.callout-body { font-size: 13px; }
+.callout-info  { background: rgba(91,138,240,.08); border-color: rgba(91,138,240,.25); }
+.callout-warn  { background: rgba(251,191,36,.07);  border-color: rgba(251,191,36,.25); }
+.callout-warn .callout-icon { color: var(--yellow); }
+.callout-tip   { background: rgba(52,211,153,.07);  border-color: rgba(52,211,153,.25); }
+.callout-tip .callout-icon { color: var(--green); }
+
+/* ── SVG Diagram ── */
+.diagram-wrap {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  margin: 20px 0;
+  overflow-x: auto;
+}
+.diagram-wrap svg { display: block; margin: 0 auto; }
+
+/* ── Code blocks ── */
+.code-wrap {
+  background: #0A0C14;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  margin: 14px 0;
+  overflow: hidden;
+}
+.code-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: rgba(255,255,255,.03);
+  border-bottom: 1px solid var(--border);
+}
+.code-lang {
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text-dim);
+  letter-spacing: .05em;
+}
+.copy-btn {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+  font-family: var(--sans);
+  transition: all .15s;
+}
+.copy-btn:hover { color: var(--text); border-color: var(--border-hi); }
+.copy-btn.copied { color: var(--green); border-color: rgba(52,211,153,.4); }
+pre {
+  padding: 18px 20px;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.65;
+}
+/* syntax tokens */
+.kw  { color: #C792EA; }
+.kw2 { color: #89DDFF; }
+.fn  { color: #82AAFF; }
+.str { color: #C3E88D; }
+.cm  { color: #546E7A; font-style: italic; }
+.num { color: #F78C6C; }
+.cls { color: #FFCB6B; }
+.op  { color: #89DDFF; }
+.key { color: var(--text); }
+.val { color: #C3E88D; }
+
+/* ── Tables ── */
+.tbl-wrap { overflow-x: auto; margin: 16px 0; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+th {
+  text-align: left;
+  padding: 10px 14px;
+  background: rgba(255,255,255,.04);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--border);
+}
+td {
+  padding: 11px 14px;
+  border-bottom: 1px solid rgba(42,47,66,.6);
+  vertical-align: top;
+}
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: rgba(255,255,255,.02); }
+code {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: rgba(91,138,240,.12);
+  color: #A5B4FC;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid rgba(91,138,240,.2);
+}
+td code { white-space: nowrap; }
+
+/* ── Timeline/steps ── */
+.steps { margin: 16px 0; }
+.step {
+  display: flex;
+  gap: 16px;
+  padding: 16px 0;
+  border-bottom: 1px solid rgba(42,47,66,.5);
+}
+.step:last-child { border-bottom: none; }
+.step-num {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: rgba(91,138,240,.15);
+  border: 1px solid rgba(91,138,240,.3);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.step-body h4 { font-size: 13px; font-weight: 600; color: var(--text-head); margin-bottom: 4px; }
+.step-body p  { font-size: 13px; color: var(--text-dim); }
+
+/* ── Behavior grid ── */
+.beh-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin: 16px 0;
+  font-size: 13px;
+}
+.beh-head { background: rgba(255,255,255,.04); font-weight: 600; color: var(--text-dim); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+.beh-cell { background: var(--bg-card); padding: 12px 14px; }
+.beh-cell.op-name { color: var(--accent); font-family: var(--mono); font-size: 12px; font-weight: 600; }
+.timing-fast { color: var(--green); font-size: 12px; }
+.timing-delayed { color: var(--yellow); font-size: 12px; }
+
+/* ── Tag chips ── */
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  margin: 2px 2px 2px 0;
+}
+.tag-new  { background: rgba(52,211,153,.12); color: var(--green); }
+.tag-cmd  { background: rgba(167,139,250,.1); color: var(--accent-2); }
+
+/* ── Key listing ── */
+.key-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  margin: 10px 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 16px;
+  align-items: start;
+}
+.key-card .k-key  { font-family: var(--mono); font-size: 12px; color: var(--accent); grid-column: 1 / -1; word-break: break-all; }
+.key-card .k-type { font-size: 11px; font-weight: 700; letter-spacing: .05em; padding: 2px 8px; border-radius: 4px; background: rgba(251,191,36,.1); color: var(--yellow); align-self: center; white-space: nowrap; }
+.key-card .k-desc { font-size: 13px; color: var(--text-dim); }
+.key-card .k-fields { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+.key-card .k-field  { font-family: var(--mono); font-size: 11px; color: var(--text-dim); background: rgba(255,255,255,.04); border: 1px solid var(--border); border-radius: 4px; padding: 2px 8px; }
+
+/* ── Section anchors ── */
+section { scroll-margin-top: 24px; }
+
+@media (max-width: 800px) {
+  nav { display: none; }
+  main { padding: 24px 20px 60px; }
+  .beh-row { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<!-- ── Sidebar Navigation ── -->
+<nav id="sidebar">
+  <div class="nav-logo">
+    <div class="pkg">by-framework / python</div>
+    <div class="title">Worker Management</div>
+  </div>
+
+  <div class="nav-section">Overview</div>
+  <a href="#overview">概述</a>
+  <a href="#dual-channel">双通道机制</a>
+
+  <div class="nav-section">Reference</div>
+  <a href="#redis-keys">Redis Keys</a>
+  <a href="#api">WorkerManager API</a>
+  <a href="#commands">协议命令</a>
+
+  <div class="nav-section">Operations</div>
+  <a href="#lifecycle">生命周期管控</a>
+  <a href="#denylist">Denylist 管控</a>
+  <a href="#behavior">Worker 侧行为</a>
+  <a href="#notes">注意事项</a>
+</nav>
+
+<!-- ── Main Content ── -->
+<main>
+
+  <!-- Hero -->
+  <div class="hero">
+    <div class="hero-meta">
+      <span class="badge badge-sdk">Python SDK</span>
+      <span class="badge badge-new">New Feature</span>
+      <span class="badge badge-ops">Ops / Admin</span>
+    </div>
+    <h1>Worker Management</h1>
+    <p>
+      允许管理员在不重启 Worker 进程的前提下，动态控制 Worker 的订阅权限与生命周期。
+      支持暂停、恢复、优雅下线、强制下线，以及基于 Denylist 的 agent_type 订阅管控。
+    </p>
+  </div>
+
+  <!-- Section: Overview -->
+  <section id="overview">
+    <h2>概述</h2>
+    <p>
+      by-framework 是基于 Redis Streams 构建的分布式 Agent 调度引擎。
+      Worker 以竞争消费方式从控制流（Control Stream）获取任务，横向扩展无需改代码。
+    </p>
+    <p>
+      本功能在原有「纯订阅模型」基础上新增管控层，管理员通过 <code>WorkerManager</code> API
+      可以在运行时对任意 Worker 施加生命周期控制或订阅限制，无需重启进程、无需改动任何 Worker 代码。
+    </p>
+
+    <div class="callout callout-info">
+      <span class="callout-icon">ℹ</span>
+      <div class="callout-body">
+        <strong>消息语义：at-most-once</strong><br>
+        消息一旦被 Worker 的 <code>XREADGROUP</code> 消费，所有权即归该 Worker。
+        若 Worker 在处理途中被驱逐或崩溃，该消息超时失败，框架不做重投递——适合 LLM Agent 避免重复调用大模型。
+      </div>
+    </div>
+  </section>
+
+  <!-- Section: Dual Channel -->
+  <section id="dual-channel">
+    <h2>双通道机制</h2>
+    <p>管控命令通过两条独立通道投递，互为冗余，确保指令必达：</p>
+
+    <div class="diagram-wrap">
+      <svg width="720" height="220" viewBox="0 0 720 220" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <marker id="arr" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#5B8AF0"/>
+          </marker>
+          <marker id="arr2" markerWidth="8" markerHeight="6" refX="8" refY="3" orient="auto">
+            <polygon points="0 0, 8 3, 0 6" fill="#A78BFA"/>
+          </marker>
+          <filter id="glow">
+            <feGaussianBlur stdDeviation="3" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+
+        <!-- WorkerManager box -->
+        <rect x="20" y="80" width="140" height="60" rx="8" fill="#1E2333" stroke="#3D4460" stroke-width="1.5"/>
+        <text x="90" y="104" text-anchor="middle" fill="#E8EDFF" font-family="system-ui,sans-serif" font-size="12" font-weight="600">WorkerManager</text>
+        <text x="90" y="122" text-anchor="middle" fill="#7880A0" font-family="monospace" font-size="10">admin.suspend()</text>
+        <text x="90" y="136" text-anchor="middle" fill="#7880A0" font-family="monospace" font-size="10">admin.evict()</text>
+
+        <!-- Arrow push channel -->
+        <line x1="160" y1="96" x2="268" y2="60" stroke="#5B8AF0" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr)"/>
+        <!-- Arrow pull channel -->
+        <line x1="160" y1="124" x2="268" y2="160" stroke="#A78BFA" stroke-width="1.5" stroke-dasharray="5,3" marker-end="url(#arr2)"/>
+
+        <!-- Push channel label -->
+        <text x="195" y="58" text-anchor="middle" fill="#5B8AF0" font-family="system-ui,sans-serif" font-size="10" font-weight="600">Push 通道</text>
+        <!-- Pull channel label -->
+        <text x="195" y="178" text-anchor="middle" fill="#A78BFA" font-family="system-ui,sans-serif" font-size="10" font-weight="600">Pull 兜底</text>
+
+        <!-- Redis Push box -->
+        <rect x="270" y="30" width="180" height="56" rx="8" fill="#1a1228" stroke="#3D4460" stroke-width="1.5"/>
+        <text x="360" y="52" text-anchor="middle" fill="#5B8AF0" font-family="monospace" font-size="10">ctrl:worker:{worker_id}</text>
+        <text x="360" y="68" text-anchor="middle" fill="#7880A0" font-family="system-ui,sans-serif" font-size="10">Redis Stream · XADD</text>
+        <text x="360" y="82" text-anchor="middle" fill="#7880A0" font-family="system-ui,sans-serif" font-size="10">立即推送</text>
+
+        <!-- Redis Pull box -->
+        <rect x="270" y="134" width="180" height="56" rx="8" fill="#1a1228" stroke="#3D4460" stroke-width="1.5"/>
+        <text x="360" y="155" text-anchor="middle" fill="#A78BFA" font-family="monospace" font-size="10">registry:worker:admin:{id}</text>
+        <text x="360" y="171" text-anchor="middle" fill="#7880A0" font-family="system-ui,sans-serif" font-size="10">Redis HASH · HSET</text>
+        <text x="360" y="185" text-anchor="middle" fill="#7880A0" font-family="system-ui,sans-serif" font-size="10">持久存储 · 心跳轮询</text>
+
+        <!-- Arrow to Worker -->
+        <line x1="450" y1="58" x2="558" y2="100" stroke="#5B8AF0" stroke-width="1.5" marker-end="url(#arr)"/>
+        <line x1="450" y1="162" x2="558" y2="120" stroke="#A78BFA" stroke-width="1.5" marker-end="url(#arr2)"/>
+
+        <!-- Worker box -->
+        <rect x="560" y="70" width="140" height="80" rx="8" fill="#1E2333" stroke="#3D4460" stroke-width="1.5"/>
+        <text x="630" y="96" text-anchor="middle" fill="#E8EDFF" font-family="system-ui,sans-serif" font-size="12" font-weight="600">Worker</text>
+
+        <!-- heartbeat indicator -->
+        <circle cx="600" cy="120" r="5" fill="rgba(52,211,153,.15)" stroke="#34D399" stroke-width="1"/>
+        <text x="611" y="124" fill="#34D399" font-family="system-ui,sans-serif" font-size="10">Heartbeat 5s</text>
+
+        <!-- consume loop indicator -->
+        <circle cx="600" cy="140" r="5" fill="rgba(91,138,240,.15)" stroke="#5B8AF0" stroke-width="1"/>
+        <text x="611" y="144" fill="#5B8AF0" font-family="system-ui,sans-serif" font-size="10">XREADGROUP</text>
+
+        <!-- Push timing label -->
+        <text x="490" y="70" fill="#5B8AF0" font-family="system-ui,sans-serif" font-size="10">即时</text>
+        <!-- Pull timing label -->
+        <text x="490" y="150" fill="#A78BFA" font-family="system-ui,sans-serif" font-size="10">≤5s 兜底</text>
+      </svg>
+    </div>
+
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div class="step-body">
+          <h4>Push 通道（即时）</h4>
+          <p>
+            <code>WorkerManager</code> 调用 <code>XADD</code> 把命令写入
+            <code>byai_gateway:ctrl:worker:{worker_id}</code>，
+            Worker 的 <code>XREADGROUP</code> 循环立即消费并响应。
+          </p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div class="step-body">
+          <h4>Pull 通道（心跳兜底）</h4>
+          <p>
+            同时把状态写入 <code>byai_gateway:registry:worker:admin:{worker_id}</code> HASH。
+            即使 Push 消息因网络抖动未被消费，Worker 的心跳线程每 <strong>5 秒</strong>读取一次该 HASH 并同步状态，确保指令最终生效。
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Section: Redis Keys -->
+  <section id="redis-keys">
+    <h2>新增 Redis Key</h2>
+
+    <div class="key-card">
+      <div class="k-key">byai_gateway:registry:worker:admin:<span style="color:#FBBF24">{worker_id}</span></div>
+      <div class="k-type">HASH</div>
+      <div class="k-desc">存储 Worker 的管理员控制状态。无 TTL，持久存在，需显式清除。</div>
+      <div class="k-fields">
+        <span class="k-field">lifecycle: active | suspended | evicted</span>
+        <span class="k-field">reason: string</span>
+        <span class="k-field">updated_at: unix_timestamp</span>
+      </div>
+    </div>
+
+    <div class="key-card">
+      <div class="k-key">byai_gateway:registry:agent_type:denied:<span style="color:#FBBF24">{agent_type}</span></div>
+      <div class="k-type">SET</div>
+      <div class="k-desc">
+        被禁止订阅该 agent_type 的 worker_id 集合。
+        <strong>Denylist 语义</strong>：key 不存在 = 所有 Worker 均可订阅，默认开放，向后兼容。
+      </div>
+      <div class="k-fields">
+        <span class="k-field">member: worker_id</span>
+      </div>
+    </div>
+
+    <div class="callout callout-warn">
+      <span class="callout-icon">⚠</span>
+      <div class="callout-body">
+        <code>worker:admin:{worker_id}</code> 在 Worker 重启后仍然存在。若希望重启后恢复默认行为，
+        需调用 <code>clear_worker_admin_state()</code> 或 <code>resume_worker()</code>。
+      </div>
+    </div>
+  </section>
+
+  <!-- Section: API -->
+  <section id="api">
+    <h2>WorkerManager API</h2>
+    <p>所有操作均通过 <code>WorkerManager</code> 完成，已封装双通道投递逻辑。</p>
+
+    <div class="code-wrap">
+      <div class="code-header">
+        <span class="code-lang">python</span>
+        <button class="copy-btn" onclick="copyCode(this)">copy</button>
+      </div>
+      <pre><span class="kw">from</span> by_framework <span class="kw">import</span> <span class="cls">WorkerManager</span>
+<span class="kw">from</span> by_framework.common.redis_client <span class="kw">import</span> get_redis
+
+redis <span class="op">=</span> get_redis()
+manager <span class="op">=</span> <span class="cls">WorkerManager</span>(redis)
+
+<span class="cm"># ── 生命周期管控 ──────────────────────────────────────────</span>
+
+<span class="cm"># 暂停 Worker（停止消费新消息，in-flight 任务继续跑完）</span>
+<span class="kw">await</span> manager.<span class="fn">suspend_worker</span>(<span class="str">"worker-abc"</span>, reason<span class="op">=</span><span class="str">"maintenance"</span>)
+
+<span class="cm"># 恢复 Worker</span>
+<span class="kw">await</span> manager.<span class="fn">resume_worker</span>(<span class="str">"worker-abc"</span>)
+
+<span class="cm"># 优雅下线（等 in-flight 任务完成后进程自然退出）</span>
+<span class="kw">await</span> manager.<span class="fn">evict_worker</span>(<span class="str">"worker-abc"</span>, reason<span class="op">=</span><span class="str">"scale down"</span>)
+
+<span class="cm"># 强制下线（立即退出，in-flight 任务超时失败）</span>
+<span class="kw">await</span> manager.<span class="fn">evict_worker</span>(<span class="str">"worker-abc"</span>, force<span class="op">=</span><span class="kw2">True</span>, reason<span class="op">=</span><span class="str">"emergency"</span>)
+
+<span class="cm"># ── 订阅权限管控 ──────────────────────────────────────────</span>
+
+<span class="cm"># 禁止某个 Worker 订阅某个 agent_type（≤5s 内生效）</span>
+<span class="kw">await</span> manager.<span class="fn">deny_worker_for_type</span>(<span class="str">"gpt-4o"</span>, <span class="str">"worker-abc"</span>)
+
+<span class="cm"># 恢复订阅权限</span>
+<span class="kw">await</span> manager.<span class="fn">allow_worker_for_type</span>(<span class="str">"gpt-4o"</span>, <span class="str">"worker-abc"</span>)
+
+<span class="cm"># ── 查询 ──────────────────────────────────────────────────</span>
+
+<span class="cm"># 查看 Worker 当前 admin 状态</span>
+state <span class="op">=</span> <span class="kw">await</span> manager.<span class="fn">get_worker_admin_state</span>(<span class="str">"worker-abc"</span>)
+<span class="cm"># → {"lifecycle": "suspended", "reason": "maintenance", "updated_at": "1749000000"}</span>
+
+<span class="cm"># 查看某个 agent_type 的 denylist</span>
+denied <span class="op">=</span> <span class="kw">await</span> manager.<span class="fn">get_type_denylist</span>(<span class="str">"gpt-4o"</span>)
+<span class="cm"># → ["worker-abc", "worker-xyz"]</span>
+
+<span class="cm"># 清除 admin 状态（恢复默认行为）</span>
+<span class="kw">await</span> manager.<span class="fn">clear_worker_admin_state</span>(<span class="str">"worker-abc"</span>)</pre>
+    </div>
+  </section>
+
+  <!-- Section: Protocol Commands -->
+  <section id="commands">
+    <h2>新增协议命令</h2>
+    <p>
+      以下命令由 <code>WorkerManager</code> 自动封装，通常不需要直接使用。
+      在实现自定义管控逻辑时可直接导入。
+    </p>
+
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>命令类</th>
+            <th>Action Type</th>
+            <th>参数</th>
+            <th>用途</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>SuspendWorkerCommand</code></td>
+            <td><code>SUSPEND_WORKER</code></td>
+            <td><code>reason: str</code></td>
+            <td>暂停 Worker 消费</td>
+          </tr>
+          <tr>
+            <td><code>ResumeWorkerCommand</code></td>
+            <td><code>RESUME_WORKER</code></td>
+            <td>—</td>
+            <td>恢复 Worker 消费</td>
+          </tr>
+          <tr>
+            <td><code>EvictWorkerCommand</code></td>
+            <td><code>EVICT_WORKER</code></td>
+            <td><code>reason: str, force: bool</code></td>
+            <td>驱逐 Worker（graceful / force）</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="code-wrap">
+      <div class="code-header">
+        <span class="code-lang">python · 直接使用示例</span>
+        <button class="copy-btn" onclick="copyCode(this)">copy</button>
+      </div>
+      <pre><span class="kw">from</span> by_framework <span class="kw">import</span> <span class="cls">SuspendWorkerCommand</span>, <span class="cls">ResumeWorkerCommand</span>, <span class="cls">EvictWorkerCommand</span>
+
+cmd <span class="op">=</span> <span class="cls">EvictWorkerCommand</span>(force<span class="op">=</span><span class="kw2">True</span>, reason<span class="op">=</span><span class="str">"OOM kill"</span>)
+payload <span class="op">=</span> cmd.<span class="fn">to_redis_payload</span>()  <span class="cm"># → dict for XADD</span></pre>
+    </div>
+  </section>
+
+  <!-- Section: Lifecycle -->
+  <section id="lifecycle">
+    <h2>生命周期管控操作</h2>
+
+    <h3>暂停 / 恢复</h3>
+    <p>
+      <code>suspend_worker()</code> 让 Worker 停止从 control stream 取新消息，
+      但正在执行的任务（in-flight）<strong>不会被中断</strong>，LLM 调用会继续完成。
+      适合在维护窗口期间临时冻结流量。
+    </p>
+
+    <div class="callout callout-tip">
+      <span class="callout-icon">✓</span>
+      <div class="callout-body">
+        暂停后，Worker 进程仍在运行并保持心跳，Redis 中的 Worker 在线状态不变。
+        恢复只需调用 <code>resume_worker()</code>，即时生效。
+      </div>
+    </div>
+
+    <h3>优雅下线（Graceful Evict）</h3>
+    <p>
+      Worker 收到 <code>EvictWorkerCommand(force=False)</code> 后，停止消费新消息，
+      等待所有 in-flight 任务完成，然后进程自然退出。
+      <strong>无需手动 kill 进程。</strong>
+    </p>
+
+    <h3>强制下线（Force Evict）</h3>
+    <p>
+      Worker 收到 <code>EvictWorkerCommand(force=True)</code> 后，立即退出进程。
+      in-flight 任务被中断，客户端等待超时后收到失败响应。
+    </p>
+
+    <div class="callout callout-warn">
+      <span class="callout-icon">⚠</span>
+      <div class="callout-body">
+        Force evict 时，已被 <code>XREADGROUP</code> 消费但未 <code>XACK</code> 的消息
+        留在 PEL（Pending Entry List）中。框架不做重投递（at-most-once 语义），
+        消息超时失败，客户端需自行处理重试。
+      </div>
+    </div>
+  </section>
+
+  <!-- Section: Denylist -->
+  <section id="denylist">
+    <h2>Denylist 订阅管控</h2>
+    <p>
+      基于黑名单（Denylist）语义，默认开放：<br>
+      key 不存在 = 该 agent_type 对所有 Worker 开放；加入 denylist = 禁止订阅该类型消息。
+    </p>
+
+    <div class="code-wrap">
+      <div class="code-header">
+        <span class="code-lang">python · 典型场景：灰度流量管控</span>
+        <button class="copy-btn" onclick="copyCode(this)">copy</button>
+      </div>
+      <pre><span class="cm"># 只允许 worker-new 处理 gpt-4o 任务，其余 worker 全部禁止</span>
+all_workers <span class="op">=</span> [<span class="str">"worker-a"</span>, <span class="str">"worker-b"</span>, <span class="str">"worker-c"</span>]
+<span class="kw">for</span> w <span class="kw">in</span> all_workers:
+    <span class="kw">await</span> manager.<span class="fn">deny_worker_for_type</span>(<span class="str">"gpt-4o"</span>, w)
+
+<span class="cm"># 验证 denylist</span>
+denied <span class="op">=</span> <span class="kw">await</span> manager.<span class="fn">get_type_denylist</span>(<span class="str">"gpt-4o"</span>)
+<span class="cm"># → ["worker-a", "worker-b", "worker-c"]</span>
+
+<span class="cm"># 灰度完成后，恢复所有权限</span>
+<span class="kw">for</span> w <span class="kw">in</span> all_workers:
+    <span class="kw">await</span> manager.<span class="fn">allow_worker_for_type</span>(<span class="str">"gpt-4o"</span>, w)</pre>
+    </div>
+
+    <div class="callout callout-warn">
+      <span class="callout-icon">⚠</span>
+      <div class="callout-body">
+        <code>deny_worker_for_type</code> 最多有 <strong>5 秒延迟</strong>——
+        Worker 的心跳线程每 5s 刷新一次内存中的 denylist 缓存，刷新前仍可能消费该 agent_type 的消息。
+      </div>
+    </div>
+
+    <h3>实现原理</h3>
+    <p>
+      Worker 启动后，<code>_active_agent_type_streams()</code> 从内存
+      <code>frozenset[denied_agent_types]</code> 中过滤订阅列表（纯内存 O(N)，无 Redis 调用），
+      心跳线程每次刷新该缓存。这避免了高消息速率下每次 consume 循环调用 N 次 <code>SISMEMBER</code> 的开销。
+    </p>
+  </section>
+
+  <!-- Section: Behavior Table -->
+  <section id="behavior">
+    <h2>Worker 侧行为对照</h2>
+
+    <div class="beh-row">
+      <div class="beh-cell beh-head">操作</div>
+      <div class="beh-cell beh-head">感知时机</div>
+      <div class="beh-cell beh-head">Worker 行为</div>
+
+      <div class="beh-cell op-name">suspend_worker()</div>
+      <div class="beh-cell"><span class="timing-fast">即时（push）</span><br><span class="timing-delayed">或 ≤5s（兜底）</span></div>
+      <div class="beh-cell">停止从 control stream 取新消息；in-flight 任务继续执行完毕</div>
+
+      <div class="beh-cell op-name">resume_worker()</div>
+      <div class="beh-cell"><span class="timing-fast">即时（push）</span><br><span class="timing-delayed">或 ≤5s（兜底）</span></div>
+      <div class="beh-cell">恢复正常消费</div>
+
+      <div class="beh-cell op-name">evict_worker()</div>
+      <div class="beh-cell"><span class="timing-fast">即时（push）</span><br><span class="timing-delayed">或 ≤5s（兜底）</span></div>
+      <div class="beh-cell">停止消费 → 等所有 in-flight 任务完成 → 进程自然退出</div>
+
+      <div class="beh-cell op-name">evict_worker(force=True)</div>
+      <div class="beh-cell"><span class="timing-fast">即时（push）</span><br><span class="timing-delayed">或 ≤5s（兜底）</span></div>
+      <div class="beh-cell">立即退出进程；in-flight 任务中断，客户端超时失败</div>
+
+      <div class="beh-cell op-name">deny_worker_for_type()</div>
+      <div class="beh-cell"><span class="timing-delayed">≤5s（心跳刷新 denylist 缓存）</span></div>
+      <div class="beh-cell">从活跃订阅流列表中移除该 agent_type，不再消费该类型消息</div>
+
+      <div class="beh-cell op-name">allow_worker_for_type()</div>
+      <div class="beh-cell"><span class="timing-delayed">≤5s（心跳刷新 denylist 缓存）</span></div>
+      <div class="beh-cell">重新订阅该 agent_type</div>
+    </div>
+  </section>
+
+  <!-- Section: Notes -->
+  <section id="notes">
+    <h2>注意事项</h2>
+
+    <div class="card">
+      <h3 style="margin-top:0">Worker 重启后状态保留</h3>
+      <p>
+        <code>registry:worker:admin:{worker_id}</code> HASH 无 TTL，Worker 重启后仍存在。
+        若希望重启后的 Worker 以默认状态（active）运行，需在重启前或重启后调用：
+      </p>
+      <div class="code-wrap" style="margin-top:12px">
+        <div class="code-header">
+          <span class="code-lang">python</span>
+          <button class="copy-btn" onclick="copyCode(this)">copy</button>
+        </div>
+        <pre><span class="kw">await</span> manager.<span class="fn">clear_worker_admin_state</span>(<span class="str">"worker-abc"</span>)
+<span class="cm"># 或</span>
+<span class="kw">await</span> manager.<span class="fn">resume_worker</span>(<span class="str">"worker-abc"</span>)</pre>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0">不会中断正在执行的 LLM 调用</h3>
+      <p>
+        <code>suspend</code> 和 <code>evict</code>（non-force）只影响<strong>新消息的消费</strong>，
+        不会中断正在进行的 <code>process_command()</code> 调用、LLM 流式输出或任何 in-flight 操作。
+      </p>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0">at-most-once 消息语义</h3>
+      <p>
+        消息被 <code>XREADGROUP</code> 消费后即归属该 Worker。
+        Worker 崩溃或被 force-evict 时，消息留在 PEL 中，框架<strong>不做重投递</strong>。
+        客户端等待超时后收到失败响应，重试由应用层决策——这避免了 LLM 调用被重复触发。
+      </p>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0">evict 后无需手动 kill</h3>
+      <p>
+        Worker 收到 evict 命令后会自行完成退出流程（graceful 等任务完成，force 立即退出），
+        无需额外 <code>kill</code> 进程操作。
+      </p>
+    </div>
+  </section>
+
+</main>
+
+<script>
+// Copy button
+function copyCode(btn) {
+  const pre = btn.closest('.code-wrap').querySelector('pre');
+  const text = pre.innerText || pre.textContent;
+  navigator.clipboard.writeText(text).then(() => {
+    btn.textContent = 'copied!';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = 'copy'; btn.classList.remove('copied'); }, 1800);
+  });
+}
+
+// Active nav link tracking
+const sections = document.querySelectorAll('section[id]');
+const navLinks = document.querySelectorAll('nav a[href^="#"]');
+
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(e => {
+    if (e.isIntersecting) {
+      navLinks.forEach(a => a.classList.remove('active'));
+      const active = document.querySelector(`nav a[href="#${e.target.id}"]`);
+      if (active) active.classList.add('active');
+    }
+  });
+}, { rootMargin: '-10% 0px -80% 0px' });
+
+sections.forEach(s => observer.observe(s));
+</script>
+</body>
+</html>

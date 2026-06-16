@@ -56,6 +56,19 @@ def init_redis(
     return _redis_client
 
 
+def init_redis_from_url(url: str) -> Redis:
+    """Initialize the global Redis singleton from a redis:// or rediss:// URL."""
+    global _redis_client  # pylint: disable=global-statement
+    if _redis_client is None:
+        try:
+            _redis_client = Redis.from_url(url, decode_responses=True)
+        except Exception as e:
+            raise RedisConnectionError(
+                f"Failed to initialize Redis from URL: {e}"
+            ) from e
+    return _redis_client
+
+
 def get_redis() -> Redis:
     """Get the initialized global Redis client.
 

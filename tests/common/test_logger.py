@@ -1,7 +1,13 @@
+import json
 import logging
 
 # logger is now pre-configured or exported
-from by_framework.common.logger import get_logger, setup_logging
+from by_framework.common.logger import (
+    JSONFormatter,
+    get_logger,
+    observability_log_extra,
+    setup_logging,
+)
 
 
 class TestLogger:
@@ -96,3 +102,38 @@ class TestLogger:
         assert "%(levelname)s" in formatter._fmt
         assert "%(filename)s:%(lineno)d" in formatter._fmt
         assert "%(message)s" in formatter._fmt
+
+    def test_observability_log_extra_formats_structured_correlation_fields(self):
+        """Explicit log extras should use stable observability field names."""
+        extra = observability_log_extra(
+            trace_id="trace-1",
+            session_id="sess-1",
+            execution_id="exec-1",
+            message_id="msg-1",
+            worker_id="worker-1",
+            agent_type="planner",
+            ignored="value",
+            empty="",
+        )
+        record = logging.LogRecord(
+            name="test-logger",
+            level=logging.INFO,
+            pathname="test.py",
+            lineno=21,
+            msg="structured event",
+            args=(),
+            exc_info=None,
+        )
+        for key, value in extra["extra"].items():
+            setattr(record, key, value)
+
+        payload = json.loads(JSONFormatter().format(record))
+
+        assert payload["trace_id"] == "trace-1"
+        assert payload["session_id"] == "sess-1"
+        assert payload["execution_id"] == "exec-1"
+        assert payload["message_id"] == "msg-1"
+        assert payload["worker_id"] == "worker-1"
+        assert payload["agent_type"] == "planner"
+        assert "ignored" not in payload
+        assert "empty" not in payload

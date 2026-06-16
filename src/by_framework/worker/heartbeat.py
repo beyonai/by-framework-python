@@ -2,7 +2,7 @@
 
 import asyncio
 import threading
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from by_framework.common.constants import RedisKeys
 from by_framework.common.logger import logger
@@ -27,6 +27,9 @@ class WorkerHeartbeat:
         registry: Optional[WorkerRegistry] = None,
         interval: int = RedisKeys.WORKER_DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         lease_ttl_seconds: int = RedisKeys.WORKER_DEFAULT_LEASE_TTL_SECONDS,
+        health_check: Optional[Callable[[], bool]] = None,
+        lifecycle_callback: Optional[Callable[[str], None]] = None,
+        denylist_refresh: Optional[Callable[[frozenset], None]] = None,
     ):
         self.worker_id = worker_id
         self.agent_types = agent_types
@@ -34,6 +37,11 @@ class WorkerHeartbeat:
         self.registry = registry or WorkerRegistry(self.redis)
         self.interval = interval
         self.lease_ttl_seconds = lease_ttl_seconds
+        self.health_check = health_check
+        # Called after each successful heartbeat with the latest admin lifecycle value.
+        self.lifecycle_callback = lifecycle_callback
+        # Called with the current denied agent_type set after each successful heartbeat.
+        self.denylist_refresh = denylist_refresh
         self._failure_deadline_seconds = max(
             float(self.interval),
             float(self.lease_ttl_seconds) - float(self.interval),
@@ -46,6 +54,7 @@ class WorkerHeartbeat:
         # Set by the heartbeat thread when it detects the lock was stolen;
         # triggers the watcher task in the main loop.
         self._lock_stolen_event: Optional[asyncio.Event] = None
+        self._failure_reason: str = ""
 
         self._thread: Optional[threading.Thread] = None
         self._thread_stop = threading.Event()
@@ -60,7 +69,26 @@ class WorkerHeartbeat:
         if self._task:
             return
 
-        await self.registry.register_worker_membership(self.worker_id, self.agent_types)
+        # Read the admin-controlled lifecycle BEFORE registering membership.
+        # A worker that restarts while suspended must not re-join the
+        # agent_type:members sets or start consuming until explicitly resumed.
+        startup_lifecycle = "active"
+        if hasattr(self.registry, "get_worker_admin_state"):
+            admin_state = await self.registry.get_worker_admin_state(self.worker_id)
+            startup_lifecycle = admin_state.get("lifecycle", "active") or "active"
+
+        if startup_lifecycle == "active":
+            await self.registry.register_worker_membership(
+                self.worker_id, self.agent_types
+            )
+        else:
+            logger.warning(
+                "[%s] Startup admin lifecycle is '%s'; skipping member registration "
+                "— worker will not consume until resumed",
+                self.worker_id,
+                startup_lifecycle,
+            )
+
         ok = await self.registry.heartbeat_worker(
             self.worker_id, self.lease_ttl_seconds
         )
@@ -69,6 +97,14 @@ class WorkerHeartbeat:
                 f"Worker ID '{self.worker_id}' heartbeat was rejected; "
                 "another instance may own the lease"
             )
+
+        # Propagate the startup lifecycle to the runner immediately, so that
+        # _admin_lifecycle reflects the persisted state before the consume loop
+        # opens (runner calls reader_start.set() right after start_heartbeat()).
+        # Without this, the runner defaults to "active" and consumes for up to
+        # one full heartbeat interval before the thread callback corrects it.
+        if self.lifecycle_callback is not None and startup_lifecycle != "active":
+            self.lifecycle_callback(startup_lifecycle)
 
         lock_tokens = getattr(self.registry, "_lock_tokens", {})
         token = lock_tokens.get(self.worker_id, "") if lock_tokens else ""
@@ -93,10 +129,11 @@ class WorkerHeartbeat:
     async def _watcher(self):
         """Watcher coroutine: unblocks only when the thread signals lock-stolen."""
         await self._lock_stolen_event.wait()
-        raise RuntimeError(
+        reason = self._failure_reason or (
             f"Worker ID '{self.worker_id}' lock was stolen by another instance; "
             "this process must exit"
         )
+        raise RuntimeError(reason)
 
     # ------------------------------------------------------------------
     # Thread-side implementation
@@ -146,6 +183,16 @@ class WorkerHeartbeat:
             while not self._thread_stop.is_set():
                 if await self._sleep_or_stop(self.interval):
                     break
+                if self.health_check is not None and not self.health_check():
+                    logger.critical(
+                        "[%s] Heartbeat stopping because reader is unhealthy",
+                        self.worker_id,
+                    )
+                    self._signal_lock_stolen(
+                        f"Worker ID '{self.worker_id}' reader is unhealthy; "
+                        "this process must exit"
+                    )
+                    return
                 try:
                     ok = await heartbeat_registry.heartbeat_worker(
                         self.worker_id, self.lease_ttl_seconds
@@ -159,10 +206,36 @@ class WorkerHeartbeat:
                         self._signal_lock_stolen()
                         return
                     last_success = loop.time()
-                    if hasattr(heartbeat_registry, "register_worker_membership"):
+                    # Read lifecycle before deciding whether to re-register: a
+                    # suspended or evicted worker must not re-add itself to the
+                    # agent_type:members sets on every heartbeat cycle.
+                    current_lifecycle = "active"
+                    if hasattr(heartbeat_registry, "get_worker_admin_state"):
+                        admin_state = await heartbeat_registry.get_worker_admin_state(
+                            self.worker_id
+                        )
+                        current_lifecycle = (
+                            admin_state.get("lifecycle", "active") or "active"
+                        )
+                        if self.lifecycle_callback is not None:
+                            self.lifecycle_callback(current_lifecycle)
+                    if (
+                        hasattr(heartbeat_registry, "register_worker_membership")
+                        and current_lifecycle == "active"
+                    ):
                         await heartbeat_registry.register_worker_membership(
                             self.worker_id, self.agent_types
                         )
+                    if self.denylist_refresh is not None and hasattr(
+                        heartbeat_registry, "is_worker_denied_for_type"
+                    ):
+                        denied: set[str] = set()
+                        for agent_type in self.agent_types:
+                            if await heartbeat_registry.is_worker_denied_for_type(
+                                agent_type, self.worker_id
+                            ):
+                                denied.add(agent_type)
+                        self.denylist_refresh(frozenset(denied))
                     logger.debug("[%s] Heartbeat sent", self.worker_id)
                 except Exception as exc:  # pylint: disable=broad-exception-caught
                     logger.error("[%s] Heartbeat failed: %s", self.worker_id, exc)
@@ -223,8 +296,10 @@ class WorkerHeartbeat:
             )
             return None
 
-    def _signal_lock_stolen(self) -> None:
+    def _signal_lock_stolen(self, reason: str = "") -> None:
         """Notify the main event loop that the lock has been stolen."""
+        if reason:
+            self._failure_reason = reason
         if (
             self._main_loop
             and not self._main_loop.is_closed()

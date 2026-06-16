@@ -119,6 +119,7 @@ class AgentContext:
         layout_builder: Optional[DataLayoutBuilder] = None,
         is_sub_agent: bool = False,
         execution_id: str = "",
+        worker_id: str = "",
         span_recorder: Optional[SpanRecorder] = None,
     ):
         self.redis = redis_client or get_redis()
@@ -127,6 +128,7 @@ class AgentContext:
         self.data_stream_name = data_stream_name
         self.current_agent_id = current_agent_id
         self.execution_id = execution_id
+        self.worker_id = worker_id
         self.span_recorder = span_recorder or SpanRecorder(self.redis)
         self._chunk_count: int = 0
 

@@ -1,11 +1,14 @@
 """Tests for observability dashboard snapshots."""
 
+import asyncio
+
 import pytest
 
 from by_framework import RedisKeys, WorkerRegistry
 from by_framework.core.protocol.data_message import DataMessage
 from by_framework.metrics.snapshot import (
     AlertPolicy,
+    SLOPolicy,
     build_demo_observability_history,
     build_demo_observability_snapshot,
     build_demo_session_observability_snapshot,
@@ -57,23 +60,61 @@ class MockPipeline:
         self.commands.append(("expire", name, ttl))
         return self
 
+    def hgetall(self, name):
+        self.commands.append(("hgetall", name))
+        return self
+
+    def sadd(self, name, value):
+        self.commands.append(("sadd", name, value))
+        return self
+
+    def srem(self, name, value):
+        self.commands.append(("srem", name, value))
+        return self
+
+    def delete(self, name):
+        self.commands.append(("delete", name))
+        return self
+
     async def execute(self):
+        results = []
         for command in self.commands:
             if command[0] == "hset":
                 await self.redis.hset(command[1], {command[2]: command[3]})
+                results.append(None)
             elif command[0] == "hdel":
                 await self.redis.hdel(command[1], *command[2])
+                results.append(None)
             elif command[0] == "zadd":
                 await self.redis.zadd(command[1], command[2])
+                results.append(None)
             elif command[0] == "zrem":
                 await self.redis.zrem(command[1], *command[2])
+                results.append(None)
             elif command[0] == "rpush":
                 await self.redis.rpush(command[1], command[2])
+                results.append(None)
             elif command[0] == "hincrby":
                 await self.redis.hincrby(command[1], command[2], command[3])
+                results.append(None)
             elif command[0] == "expire":
                 await self.redis.expire(command[1], command[2])
-        return []
+                results.append(None)
+            elif command[0] == "hgetall":
+                result = await self.redis.hgetall(command[1])
+                results.append(result)
+            elif command[0] == "sadd":
+                await self.redis.sadd(command[1], command[2])
+                results.append(None)
+            elif command[0] == "srem":
+                await self.redis.srem(command[1], command[2])
+                results.append(None)
+            elif command[0] == "delete":
+                await self.redis.delete(command[1])
+                results.append(None)
+            else:
+                results.append(None)
+        return results
 
 
 class StreamAwareRedis:
@@ -87,7 +128,9 @@ class StreamAwareRedis:
         self.stream_entries = {}
         self.stream_groups = {}
         self.stream_consumers = {}
+        self.pending_summaries = {}
         self.xinfo_consumers_calls = []
+        self.xpending_calls = []
 
     async def zadd(self, name, mapping):
         self.data.setdefault(name, {}).update(mapping)
@@ -119,6 +162,9 @@ class StreamAwareRedis:
 
     async def smembers(self, name):
         return self.data.get(name, set())
+
+    async def sismember(self, name, value):
+        return value in self.data.get(name, set())
 
     async def set(self, name, value, nx=False, ex=None):
         if nx and name in self.kv:
@@ -181,6 +227,10 @@ class StreamAwareRedis:
     async def xinfo_consumers(self, name, groupname):
         self.xinfo_consumers_calls.append((name, groupname))
         return self.stream_consumers.get((name, groupname), [])
+
+    async def xpending(self, name, groupname):
+        self.xpending_calls.append((name, groupname))
+        return self.pending_summaries.get((name, groupname), {})
 
     async def eval(self, script, numkeys, *keys_and_args):
         """Simulate Lua registry scripts in Python for unit tests.
@@ -393,6 +443,8 @@ async def test_build_observability_snapshot_aggregates_workers_and_queues():
     assert snapshot["data_flow"]["nodes"][1]["metrics"]["queue_depth"] == 4
     assert snapshot["data_flow"]["nodes"][1]["metrics"]["consumer_pending"] == 2
     assert snapshot["data_flow"]["nodes"][2]["status"] == "healthy"
+    assert snapshot["data_flow"]["nodes"][3]["status"] == "healthy"
+    assert snapshot["data_flow"]["nodes"][4]["metrics"]["fanout_observable"] == 0
     assert snapshot["data_flow"]["nodes"][5]["metrics"]["pending_deliveries"] == 2
     assert snapshot["data_flow"]["edges"][0] == {
         "id": "client-to-control-queues",
@@ -445,12 +497,11 @@ async def test_split_worker_snapshot_bounds_known_worker_scan():
 
     snapshot = await build_worker_observability_snapshot(redis, worker_scan_limit=1)
 
-    assert snapshot["worker_scan"] == {
-        "source": "known_workers_fallback",
-        "known_workers": 2,
-        "scanned_workers": 1,
-        "truncated": True,
-    }
+    assert snapshot["worker_scan"]["source"] == "known_workers_fallback"
+    assert snapshot["worker_scan"]["known_workers"] == 2
+    assert snapshot["worker_scan"]["scanned_workers"] == 1
+    assert snapshot["worker_scan"]["truncated"] is True
+    assert snapshot["worker_scan"]["admin"]["managed_workers"] == 0
     assert snapshot["totals"]["workers_online"] == 1
 
 
@@ -475,6 +526,26 @@ async def test_split_worker_snapshot_prefers_online_lease_scan():
     assert snapshot["worker_scan"]["known_workers"] == 1
     assert snapshot["workers"][0]["worker_id"] == "worker-online"
     assert snapshot["agent_types"] == ["planner"]
+
+
+@pytest.mark.asyncio
+async def test_worker_snapshot_includes_offline_evicted_admin_worker():
+    """Worker endpoint includes evicted workers even after online lease is gone."""
+    redis = StreamAwareRedis()
+    registry = WorkerRegistry(redis)
+    await registry.set_worker_admin_state("worker-evicted", "evicted", "decommission")
+
+    snapshot = await build_worker_observability_snapshot(redis)
+
+    assert snapshot["totals"]["workers_online"] == 0
+    assert snapshot["totals"]["workers_managed"] == 1
+    worker = snapshot["workers"][0]
+    assert worker["worker_id"] == "worker-evicted"
+    assert worker["online"] is False
+    assert worker["lifecycle"] == "evicted"
+    assert worker["lifecycle_reason"] == "decommission"
+    assert worker["last_seen"] == 0
+    assert worker["agent_types"] == []
 
 
 @pytest.mark.asyncio
@@ -544,6 +615,50 @@ async def test_build_observability_snapshot_can_include_consumer_details():
     ] == [{"name": "worker-1", "pending": 1, "idle_ms": 2500}]
 
 
+def test_queue_snapshot_includes_pending_ownership_and_age_details():
+    """Redis Streams details include pending owner, retry count, and age."""
+    redis = StreamAwareRedis()
+    stream_name = RedisKeys.ctrl_stream("planner")
+    redis.stream_lengths[stream_name] = 3
+    redis.stream_groups[stream_name] = [
+        {"name": "agent_engines", "pending": 2, "lag": 5}
+    ]
+    redis.stream_consumers[(stream_name, "agent_engines")] = [
+        {"name": "worker-1", "pending": 2, "idle": 4500}
+    ]
+    redis.pending_summaries[(stream_name, "agent_engines")] = {
+        "pending": 2,
+        "min": "1710000000000-0",
+        "max": "1710000005000-0",
+        "consumers": [{"name": "worker-1", "pending": 2}],
+        "entries": [
+            {
+                "message_id": "1710000000000-0",
+                "consumer": "worker-1",
+                "idle_ms": 9000,
+                "delivery_count": 3,
+            }
+        ],
+    }
+
+    snapshot = asyncio.run(
+        build_queue_observability_snapshot(
+            redis,
+            agent_types=["planner"],
+            include_consumer_details=True,
+        )
+    )
+
+    group = snapshot["queues"]["agent_type_streams"][0]["consumer_groups"][0]
+    assert redis.xpending_calls == [(stream_name, "agent_engines")]
+    assert group["pending_oldest_id"] == "1710000000000-0"
+    assert group["oldest_pending_idle_ms"] == 9000
+    assert group["oldest_pending_age_seconds"] == 9
+    assert group["pending_owner"] == "worker-1"
+    assert group["max_delivery_count"] == 3
+    assert group["consumers"][0]["idle_ms"] == 4500
+
+
 def test_build_demo_observability_snapshot_has_visualization_data():
     """Demo snapshot provides stable data for local dashboard previews."""
     snapshot = build_demo_observability_snapshot()
@@ -599,13 +714,23 @@ def test_build_history_point_extracts_trend_values():
     assert point["generated_at"] == snapshot["generated_at"]
     assert point["workers_online"] == snapshot["totals"]["workers_online"]
     assert point["active_executions"] == snapshot["totals"]["active_executions"]
+    assert point["completed_executions"] == snapshot["status_counts"]["COMPLETED"]
     assert point["failed_executions"] == snapshot["status_counts"]["FAILED"]
+    assert point["cancelled_executions"] == snapshot["status_counts"]["CANCELLED"]
+    assert point["terminal_executions"] == (
+        snapshot["status_counts"]["COMPLETED"]
+        + snapshot["status_counts"]["FAILED"]
+        + snapshot["status_counts"]["CANCELLED"]
+    )
     assert point["queue_depth_total"] == 9
     assert point["consumer_pending_total"] == 3
+    assert point["max_delivery_count"] == 2
     assert point["alert_count"] == len(snapshot["alerts"])
     assert point["latency_p95_ms"] == snapshot["latency"]["p95_ms"]
     assert point["queue_latency_p95_ms"] == snapshot["latency"]["queue"]["p95_ms"]
     assert point["total_latency_p95_ms"] == snapshot["latency"]["total"]["p95_ms"]
+    assert point["success_ratio_ppm"] == snapshot["slo"]["success_ratio_ppm"]
+    assert point["deadletter_count"] == snapshot["slo"]["deadletter_count"]
 
 
 def test_alert_policy_customizes_thresholds():
@@ -638,6 +763,36 @@ def test_alert_policy_customizes_thresholds():
         "warning_alerts": 1,
         "summary": "1 warning alert active.",
     }
+
+
+def test_slo_policy_adds_sli_context_to_alerts_and_health():
+    """SLO alerts carry SLI, window, burn-rate, and runbook metadata."""
+    snapshot = build_demo_observability_snapshot(
+        alert_policy=AlertPolicy(
+            failed_execution_threshold=99,
+            delivery_pending_threshold=99,
+            consumer_pending_threshold=99,
+            queue_backlog_threshold=99,
+            slo_policy=SLOPolicy(
+                success_ratio_target=0.99,
+                total_latency_p95_ms=1000,
+                deadletter_threshold=0,
+                freshness_max_age_ms=1000,
+                window="5m",
+            ),
+        )
+    )
+
+    alerts_by_code = {alert["code"]: alert for alert in snapshot["alerts"]}
+    assert alerts_by_code["SLO_SUCCESS_RATIO"]["sli"] == "execution_success_ratio"
+    assert alerts_by_code["SLO_SUCCESS_RATIO"]["window"] == "5m"
+    assert alerts_by_code["SLO_SUCCESS_RATIO"]["burn_rate"] > 1
+    assert alerts_by_code["SLO_SUCCESS_RATIO"]["runbook_id"] == "slo-success-ratio"
+    assert alerts_by_code["SLO_SUCCESS_RATIO"]["runbook"]["id"] == "slo-success-ratio"
+    assert alerts_by_code["SLO_SUCCESS_RATIO"]["runbook"]["title"]
+    assert alerts_by_code["SLO_SUCCESS_RATIO"]["runbook"]["actions"]
+    assert alerts_by_code["SLO_LATENCY_P95"]["sli"] == "execution_total_latency_p95"
+    assert snapshot["slo"]["success_ratio_ppm"] < 990000
 
 
 def test_alert_policy_can_produce_healthy_demo_snapshot():
@@ -674,6 +829,10 @@ def test_build_demo_observability_history_has_ordered_points():
     assert all("latency_p95_ms" in point for point in history)
     assert all("queue_latency_p95_ms" in point for point in history)
     assert all("total_latency_p95_ms" in point for point in history)
+    assert all("completed_executions" in point for point in history)
+    assert all("terminal_executions" in point for point in history)
+    assert all("deadletter_count" in point for point in history)
+    assert all("max_delivery_count" in point for point in history)
 
 
 def test_build_demo_session_observability_snapshot_has_tree_and_events():
@@ -888,26 +1047,61 @@ def test_build_prometheus_metrics_exports_core_snapshot_values():
     metrics = build_prometheus_metrics(snapshot)
 
     assert "by_framework_workers_online 2" in metrics
-    assert 'by_framework_execution_status_total{status="RUNNING"} 3' in metrics
+    assert 'by_framework_execution_status_current{status="RUNNING"} 3' in metrics
     assert (
         'by_framework_queue_depth{queue_type="agent_type",name="planner",'
         'stream="byai_gateway:ctrl:agent_type:planner"} 4'
     ) in metrics
-    assert (
-        'by_framework_worker_active_executions{worker_id="worker-planner-1"} 3'
-        in metrics
-    )
-    assert 'by_framework_alerts_total{severity="warning"} 3' in metrics
+    assert "by_framework_worker_active_executions" not in metrics
+    assert 'by_framework_alerts_current{severity="warning"} 3' in metrics
     assert "by_framework_execution_latency_avg_ms " in metrics
     assert "by_framework_execution_latency_p95_ms " in metrics
     assert "by_framework_execution_queue_latency_p95_ms " in metrics
     assert "by_framework_execution_total_latency_p95_ms " in metrics
+    assert "by_framework_execution_total_duration_p95_seconds " in metrics
+    assert "by_framework_execution_queue_duration_p95_seconds " in metrics
+    assert "by_framework_execution_run_duration_p95_seconds " in metrics
+    assert "# TYPE by_framework_execution_total_duration_seconds" not in metrics
+    assert "by_framework_stream_depth" in metrics
+    assert "by_framework_stream_oldest_pending_age_seconds" in metrics
+    assert (
+        'by_framework_stream_max_delivery_count{queue_type="agent_type",'
+        'name="planner",group="agent_engines"} 2'
+    ) in metrics
+    assert "by_framework_slo_burn_rate" in metrics
     assert (
         'by_framework_stream_pending_messages{queue_type="agent_type",'
         'name="planner",group="agent_engines"} 1'
     ) in metrics
     assert (
-        'by_framework_execution_failure_total{error_type="RuntimeError"} 1' in metrics
+        'by_framework_execution_recent_failures{error_type="RuntimeError"} 1' in metrics
     )
     assert 'by_framework_agent_queue_depth{agent_type="planner"} 4' in metrics
     assert 'by_framework_agent_workers{agent_type="planner"} 1' in metrics
+
+
+def test_build_prometheus_metrics_uses_consistent_metric_contract():
+    """Snapshot metrics keep stable names and Prometheus-compatible types."""
+    metrics = build_prometheus_metrics(build_demo_observability_snapshot())
+    metric_types = {}
+
+    for line in metrics.splitlines():
+        if not line.startswith("# TYPE "):
+            continue
+        _, _, name, metric_type = line.split(maxsplit=3)
+        assert name not in metric_types
+        metric_types[name] = metric_type
+
+    assert metric_types["by_framework_execution_status_current"] == "gauge"
+    assert metric_types["by_framework_tracked_executions"] == "gauge"
+    assert metric_types["by_framework_execution_recent_failures"] == "gauge"
+    assert metric_types["by_framework_alerts_current"] == "gauge"
+    assert metric_types["by_framework_execution_total_duration_p95_seconds"] == "gauge"
+    assert metric_types["by_framework_stream_depth"] == "gauge"
+    assert metric_types["by_framework_stream_max_delivery_count"] == "gauge"
+    assert "by_framework_execution_status_total" not in metric_types
+    assert all(
+        metric_type == "counter"
+        for name, metric_type in metric_types.items()
+        if name.endswith("_total")
+    )

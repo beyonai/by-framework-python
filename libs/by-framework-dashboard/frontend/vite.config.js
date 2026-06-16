@@ -4,8 +4,8 @@ import { defineConfig } from "vite";
 export default defineConfig({
   plugins: [react()],
   build: {
-    outDir: "../static",
-    emptyOutDir: true,
+    outDir: "../src/by_framework_dashboard/static",
+    emptyOutDir: false,
     cssCodeSplit: false,
     rollupOptions: {
       output: {

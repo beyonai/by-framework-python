@@ -18,6 +18,7 @@ from typing import Any, List, Optional, TypedDict
 
 from by_framework.common.constants import (EXEC_FIELD_PREFIX, MSG_MAP_PREFIX, RedisKeys)
 from by_framework.common.exceptions import ExecutionDataError
+from by_framework.common.logger import observability_log_extra
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.extensions import AgentConfigsSnapshot, PluginRegistry
 from by_framework.core.protocol.agent_state import is_terminal_state
@@ -300,7 +301,13 @@ class WorkerRegistry:
 
         for agent_type in new_agent_types:
             await self.redis.sadd(declared_key, agent_type)
-            await self.redis.sadd(RedisKeys.agent_type_members(agent_type), worker_id)
+            denied = await self.redis.sismember(
+                RedisKeys.agent_type_denied(agent_type), worker_id
+            )
+            if not denied:
+                await self.redis.sadd(
+                    RedisKeys.agent_type_members(agent_type), worker_id
+                )
 
     async def heartbeat_worker(
         self,
@@ -466,10 +473,15 @@ class WorkerRegistry:
             agent_types = [
                 c.decode() if isinstance(c, bytes) else c for c in agent_types_raw
             ]
+            admin_state = {}
+            if hasattr(self, "get_worker_admin_state"):
+                admin_state = await self.get_worker_admin_state(worker_id)
             result[worker_id] = {
                 "agent_types": agent_types,
                 "last_seen": int(time.time() * 1000) if is_legacy else last_seen,
                 "ip_address": ip_address,
+                "lifecycle": admin_state.get("lifecycle", "active") or "active",
+                "lifecycle_reason": admin_state.get("reason", ""),
             }
         return result
 
@@ -664,6 +676,11 @@ class WorkerRegistry:
             "error_code": execution.get("error_code", ""),
             "failed_stage": execution.get("failed_stage", ""),
             "retryable": bool(execution.get("retryable", False)),
+            "agent_configs_version": execution.get("agent_configs_version", 0),
+            "agent_configs_snapshot_key": execution.get(
+                "agent_configs_snapshot_key", ""
+            ),
+            "agent_config_audit": execution.get("agent_config_audit"),
         }
 
     @staticmethod
@@ -795,8 +812,10 @@ class WorkerRegistry:
         if current is None:
             return
 
+        old_execution = dict(current)
         current.update(kwargs)
-        current["updated_at"] = int(time.time() * 1000)
+        now = int(time.time() * 1000)
+        current["updated_at"] = now
 
         reg_key = RedisKeys.session_registry(session_id)
         pipe = self.redis.pipeline()
@@ -807,6 +826,7 @@ class WorkerRegistry:
         )
         pipe.expire(reg_key, RedisKeys.DEFAULT_SESSION_TTL)
         await pipe.execute()
+        await self._update_worker_execution_stats(old_execution, current, now)
 
     async def save_execution(self, execution: dict[str, Any]):
         """(Compatibility) Save execution data to Redis.
@@ -1030,6 +1050,10 @@ class WorkerRegistry:
                     session_id,
                     snapshot_key,
                     err,
+                    **observability_log_extra(
+                        execution_id=execution_id,
+                        session_id=session_id,
+                    ),
                 )
             finally:
                 current["updated_at"] = int(time.time() * 1000)
@@ -1232,6 +1256,7 @@ class WorkerRegistry:
             "online": worker_id in workers,
             "agent_types": sorted(worker_info.get("agent_types", [])),
             "last_seen": int(worker_info.get("last_seen", 0)),
+            "ip_address": worker_info.get("ip_address", ""),
             "counts": counts,
             "active_count": counts["active"],
             "total_tracked": counts["total"],
@@ -1252,3 +1277,116 @@ class WorkerRegistry:
     def _decode_execution(self, execution: dict[str, Any]) -> dict[str, Any]:  # pylint: disable=unused-argument
         # Deprecated, since we switched to JSON storage
         return {}
+
+    # --- Admin lifecycle state ---
+
+    async def set_worker_admin_state(
+        self,
+        worker_id: str,
+        lifecycle: str,
+        reason: str = "",
+    ) -> None:
+        """Persist admin-controlled lifecycle state for a worker.
+
+        Args:
+            worker_id: Target worker ID.
+            lifecycle: One of "active", "suspended", "evicted".
+            reason: Human-readable reason for the state change.
+        """
+        now = int(time.time() * 1000)
+        key = RedisKeys.worker_admin(worker_id)
+        pipe = self.redis.pipeline()
+        pipe.hset(key, "lifecycle", lifecycle)
+        pipe.hset(key, "reason", reason)
+        pipe.hset(key, "updated_at", now)
+        pipe.sadd(RedisKeys.ADMIN_WORKERS, worker_id)
+        await pipe.execute()
+
+    async def get_worker_admin_state(self, worker_id: str) -> dict[str, Any]:
+        """Return the admin-controlled state for a worker.
+
+        Returns an empty dict when no admin state has been set (implying
+        the worker is in the default "active" state).
+        """
+        raw = await self.redis.hgetall(RedisKeys.worker_admin(worker_id))
+        if not raw:
+            return {}
+        result: dict[str, Any] = {}
+        for field, value in raw.items():
+            field_str = field.decode() if isinstance(field, bytes) else str(field)
+            value_str = value.decode() if isinstance(value, bytes) else str(value)
+            result[field_str] = value_str
+        if "updated_at" in result:
+            try:
+                result["updated_at"] = int(result["updated_at"])
+            except (ValueError, TypeError):
+                pass
+        return result
+
+    async def clear_worker_admin_state(self, worker_id: str) -> None:
+        """Remove the admin lifecycle key, restoring default-active behaviour."""
+        pipe = self.redis.pipeline()
+        pipe.delete(RedisKeys.worker_admin(worker_id))
+        pipe.srem(RedisKeys.ADMIN_WORKERS, worker_id)
+        await pipe.execute()
+
+    async def remove_worker_from_type_members(self, worker_id: str) -> None:
+        """SREM worker_id from every agent_type:members set it currently belongs to.
+
+        Preserves the declared-agent-types key so membership can be restored later.
+        Used by suspend and evict to make the worker immediately invisible to routing.
+        """
+        agent_types_raw = await self.redis.smembers(
+            RedisKeys.worker_declared_agent_types(worker_id)
+        )
+        for raw in agent_types_raw:
+            agent_type = raw.decode() if isinstance(raw, bytes) else raw
+            await self.redis.srem(RedisKeys.agent_type_members(agent_type), worker_id)
+
+    async def restore_worker_to_type_members(self, worker_id: str) -> None:
+        """SADD worker_id back to every agent_type:members set it declared.
+
+        Used by resume to make the worker immediately visible to routing again.
+        Denylist is still respected by register_worker_membership on the next
+        heartbeat cycle, so denied types are re-excluded automatically.
+        """
+        agent_types_raw = await self.redis.smembers(
+            RedisKeys.worker_declared_agent_types(worker_id)
+        )
+        for raw in agent_types_raw:
+            agent_type = raw.decode() if isinstance(raw, bytes) else raw
+            denied = await self.is_worker_denied_for_type(agent_type, worker_id)
+            if not denied:
+                await self.redis.sadd(
+                    RedisKeys.agent_type_members(agent_type), worker_id
+                )
+
+    # --- Agent-type denylist ---
+
+    async def deny_worker_for_type(self, agent_type: str, worker_id: str) -> None:
+        """Add worker_id to the denylist for agent_type.
+
+        The worker will stop being added to agent_type:workers on its next
+        membership refresh and will skip XREADGROUP for that stream.
+        """
+        pipe = self.redis.pipeline()
+        pipe.sadd(RedisKeys.agent_type_denied(agent_type), worker_id)
+        pipe.srem(RedisKeys.agent_type_members(agent_type), worker_id)
+        await pipe.execute()
+
+    async def allow_worker_for_type(self, agent_type: str, worker_id: str) -> None:
+        """Remove worker_id from the denylist for agent_type."""
+        await self.redis.srem(RedisKeys.agent_type_denied(agent_type), worker_id)
+
+    async def is_worker_denied_for_type(self, agent_type: str, worker_id: str) -> bool:
+        """Return True if worker_id is on the denylist for agent_type."""
+        return bool(
+            await self.redis.sismember(
+                RedisKeys.agent_type_denied(agent_type), worker_id
+            )
+        )
+
+    async def get_agent_type_denylist(self, agent_type: str) -> list[str]:
+        """Return all worker_ids on the denylist for agent_type."""
+        raw = await self.redis.smembers(RedisKeys.agent_type_denied(agent_type))
+        return [m.decode() if isinstance(m, bytes) else m for m in raw]

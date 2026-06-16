@@ -1,5 +1,7 @@
 """Tests for observability dashboard static serving helpers."""
 
+# pylint: disable=line-too-long
+
 import asyncio
 import http.client
 import json
@@ -190,6 +192,314 @@ def test_flow_endpoint_returns_backend_data_flow_model():
     assert payload["data_flow"]["edges"][0]["source"] == "client"
 
 
+def test_alerts_endpoint_returns_actionable_demo_alerts():
+    """Alert center API returns normalized alerts with remediation guidance."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/alerts?demo=1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 200
+    assert payload["summary"]["total"] >= 1
+    assert payload["alerts"][0]["status"] == "open"
+    assert payload["alerts"][0]["recommendations"]
+    assert payload["recommendations"]
+
+
+def test_actions_endpoint_returns_demo_action_center():
+    """Action center API returns backend-derived operational tasks."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/actions?demo=1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 200
+    assert payload["summary"]["total"] >= 1
+    assert payload["actions"][0]["target_view"]
+    assert payload["actions"][0]["recommendations"]
+
+
+def test_action_detail_endpoint_returns_demo_action_context():
+    """Action detail API backs risk and to-do drill-downs."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/actions?demo=1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        action_id = payload["actions"][0]["id"]
+
+        connection.request("GET", f"/api/actions/{action_id}?demo=1")
+        detail_response = connection.getresponse()
+        detail = json.loads(detail_response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 200
+    assert detail_response.status == 200
+    assert detail["action"]["id"] == action_id
+    assert detail["recommendations"]
+    assert "related" in detail
+
+
+def test_action_detail_endpoint_404_for_unknown_action():
+    """Unknown action inspect requests fail explicitly."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/actions/not-real?demo=1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 404
+    assert payload["error"] == "action not found"
+
+
+def test_worker_detail_endpoint_returns_demo_worker_context():
+    """Worker detail API backs worker row drill-down."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/workers/worker-planner-1?demo=1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 200
+    assert payload["worker"]["worker_id"] == "worker-planner-1"
+    assert payload["executions"]
+    assert payload["recommendations"]
+
+
+def test_metrics_catalog_endpoint_returns_metric_metadata():
+    """Metrics catalog API exposes normalized metric meaning and debug split."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/metrics/catalog")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 200
+    assert payload["total"] == len(payload["metrics"])
+    assert payload["core_count"] > 0
+    assert payload["debug_count"] > 0
+    total_duration = payload["metrics"]["by_framework_execution_total_duration_seconds"]
+    assert total_duration["kind"] == "histogram"
+    assert total_duration["unit"] == "seconds"
+    assert total_duration["labels"] == ["status", "agent_type"]
+    assert total_duration["description"]
+    assert total_duration["interpretation"]
+    legacy_latency = payload["metrics"]["by_framework_execution_latency_ms"]
+    assert legacy_latency["debug_only"] is True
+    assert "worker_id" in legacy_latency["labels"]
+
+
+def test_execution_detail_includes_agent_config_audit_projection(monkeypatch):
+    """Execution drill-down exposes the config projection captured for that run."""
+    base_snapshot = build_demo_observability_snapshot()
+    execution = base_snapshot["recent_executions"][0]
+    execution["execution_id"] = "exec-with-agent-config"
+    execution["target_agent_type"] = "weather-agent"
+    execution["agent_config_audit"] = {
+        "version": 3,
+        "target_agent_type": "weather-agent",
+        "snapshot_hash": "sha256:test",
+        "target_agent_config": {
+            "agent_id": "weather-agent",
+            "name": "Weather Agent",
+            "tools": {"weather_api": {"config_hash": "sha256:tool"}},
+        },
+    }
+
+    def fake_snapshot(*_args, **_kwargs):
+        return base_snapshot
+
+    monkeypatch.setattr(
+        "by_framework_dashboard.dashboard.build_demo_observability_snapshot",
+        fake_snapshot,
+    )
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/executions/exec-with-agent-config?demo=1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 200
+    assert payload["agent_config"]["target_agent_type"] == "weather-agent"
+    assert payload["agent_config"]["target_agent_config"]["agent_id"] == (
+        "weather-agent"
+    )
+
+
+def test_worker_detail_endpoint_404_for_unknown_worker():
+    """Unknown worker drill-down requests fail explicitly."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/workers/not-a-worker?demo=1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 404
+    assert payload["error"] == "worker not found"
+
+
+def test_execution_detail_endpoint_returns_demo_execution_context():
+    """Execution detail API backs execution row drill-down."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/executions/exec-demo-failed?demo=1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 200
+    assert payload["execution"]["execution_id"] == "exec-demo-failed"
+    assert payload["failures"]
+    assert payload["recommendations"]
+
+
+def test_execution_detail_endpoint_404_for_unknown_execution():
+    """Unknown execution drill-down requests fail explicitly."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/executions/not-an-exec?demo=1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 404
+    assert payload["error"] == "execution not found"
+
+
+def test_queue_detail_endpoint_returns_demo_queue_guidance():
+    """Queue detail API backs the row-level queue inspect action."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/queues/planner?demo=1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 200
+    assert payload["queue"]["name"] == "planner"
+    assert payload["queue"]["pending_total"] == 1
+    assert payload["queue"]["status"] == "warning"
+    assert payload["recommendations"]
+
+
+def test_queue_detail_endpoint_404_for_unknown_queue():
+    """Unknown queue inspect requests fail explicitly."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/queues/not-a-real-queue?demo=1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 404
+    assert payload["error"] == "queue not found"
+
+
 def test_dashboard_auth_token_protects_api_routes():
     """Dashboard API routes require the configured bearer token."""
     server = ThreadingHTTPServer(
@@ -222,6 +532,73 @@ def test_dashboard_auth_token_protects_api_routes():
     assert allowed_payload["status"] == "ok"
 
 
+def test_config_endpoint_reports_dashboard_capabilities():
+    """Config API backs the dashboard configuration page."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/config?demo=1")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 200
+    assert payload["dashboard"]["demo_mode"] is True
+    assert payload["observability"]["history_limit"] > 0
+    assert any(cap["id"] == "exports" for cap in payload["capabilities"])
+
+
+def test_export_endpoint_returns_scoped_demo_payload():
+    """Export API returns a downloadable JSON envelope for selected scope."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/export?demo=1&scope=alerts")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 200
+    assert payload["scope"] == "alerts"
+    assert payload["format"] == "json"
+    assert payload["payload"]["summary"]["total"] >= 1
+
+
+def test_export_endpoint_rejects_unknown_scope():
+    """Export API rejects unsupported scopes with a clear error."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        connection.request("GET", "/api/export?demo=1&scope=bogus")
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert response.status == 400
+    assert "unsupported export scope" in payload["error"]
+
+
 def test_trace_endpoints_return_demo_trace_data():
     """Trace APIs expose trace detail, timeline, and trace summaries."""
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
@@ -250,6 +627,19 @@ def test_trace_endpoints_return_demo_trace_data():
     assert trace_payload["trace_id"] == "trace-demo"
     assert trace_payload["spans"]
     assert trace_payload["tree"]
+    assert trace_payload["metrics_window"]["summary"]["sample_count"] >= 1
+    assert "slo_window" in trace_payload["metrics_window"]["summary"]
+    assert {
+        item["category"]
+        for item in trace_payload["metrics_window"]["summary"]["signal_explain"]
+    } == {"queue", "worker", "errors"}
+    queue_signal = next(
+        item
+        for item in trace_payload["metrics_window"]["summary"]["signal_explain"]
+        if item["category"] == "queue"
+    )
+    assert "max_delivery_count" in queue_signal["metrics"]
+    assert trace_payload["metrics_window"]["diagnostics"]
     assert timeline_response.status == 200
     assert timeline_payload["trace_id"] == "trace-demo"
     assert all("offset_ms" in item for item in timeline_payload["timeline"])
@@ -434,3 +824,292 @@ def test_trace_fallback_api_routing(monkeypatch):
     assert payload["trace_id"] == "trace-fallback-api-123"
     assert payload["session_id"] == "sess-fallback-api"
     assert payload["spans"][0]["operation"] == "agent.process"
+
+
+# --- Admin route tests ---
+
+
+def _make_admin_server(monkeypatch):
+    """Spin up a dashboard server with WorkerManager fully mocked."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    async def fake_build_workers(*args, **kwargs):
+        del args, kwargs
+        return {
+            "generated_at": 9000,
+            "totals": {"workers_online": 1, "agent_types": 1},
+            "status_counts": {},
+            "workers": [
+                {
+                    "worker_id": "w1",
+                    "online": True,
+                    "agent_types": ["chat"],
+                    "last_seen": 8000,
+                    "ip_address": "192.168.1.1",
+                    "lifecycle": "active",
+                    "lifecycle_reason": "",
+                    "active_count": 0,
+                    "total_tracked": 0,
+                    "counts": {},
+                    "status_counts": {},
+                }
+            ],
+            "agent_types": ["chat"],
+            "worker_scan": {},
+            "alerts": [],
+            "health": {"status": "ok"},
+        }
+
+    monkeypatch.setattr(
+        "by_framework_dashboard.dashboard.build_worker_observability_snapshot",
+        fake_build_workers,
+    )
+
+    mgr_mock = MagicMock()
+    mgr_mock.suspend_worker = AsyncMock()
+    mgr_mock.resume_worker = AsyncMock()
+    mgr_mock.evict_worker = AsyncMock()
+    mgr_mock.allow_worker_rejoin = AsyncMock()
+    mgr_mock.deny_worker_for_type = AsyncMock()
+    mgr_mock.allow_worker_for_type = AsyncMock()
+    mgr_mock.get_type_denylist = AsyncMock(return_value=["w2"])
+
+    monkeypatch.setattr(
+        "by_framework_dashboard.dashboard.WorkerManager",
+        lambda *a, **kw: mgr_mock,
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    return server, thread, mgr_mock
+
+
+def _post(connection, path, body=None):
+    payload = json.dumps(body or {}).encode("utf-8")
+    connection.request(
+        "POST",
+        path,
+        body=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(len(payload)),
+        },
+    )
+    resp = connection.getresponse()
+    return resp, json.loads(resp.read().decode("utf-8"))
+
+
+def test_api_workers_includes_lifecycle_and_ip(monkeypatch):
+    """/api/workers response includes lifecycle, lifecycle_reason, ip_address per worker."""
+    server, thread, _ = _make_admin_server(monkeypatch)
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        conn.request("GET", "/api/workers")
+        resp = conn.getresponse()
+        payload = json.loads(resp.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert resp.status == 200
+    w = payload["workers"][0]
+    assert w["lifecycle"] == "active"
+    assert "lifecycle_reason" in w
+    assert w["ip_address"] == "192.168.1.1"
+
+
+def test_admin_denylist_get_returns_denied_workers(monkeypatch):
+    """GET /api/admin/type/{t}/denylist returns denied worker IDs."""
+    server, thread, mgr_mock = _make_admin_server(monkeypatch)
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        conn.request("GET", "/api/admin/type/chat/denylist")
+        resp = conn.getresponse()
+        payload = json.loads(resp.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert resp.status == 200
+    assert payload["agent_type"] == "chat"
+    assert payload["denied"] == ["w2"]
+    mgr_mock.get_type_denylist.assert_awaited_once_with("chat")
+
+
+def test_admin_suspend_calls_worker_manager(monkeypatch):
+    """POST /api/admin/worker/{id}/suspend invokes WorkerManager.suspend_worker."""
+    server, thread, mgr_mock = _make_admin_server(monkeypatch)
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        resp, payload = _post(conn, "/api/admin/worker/w1/suspend", {"reason": "maint"})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert resp.status == 200
+    assert payload["ok"] is True
+    assert payload["action"] == "suspend"
+    mgr_mock.suspend_worker.assert_awaited_once_with("w1", reason="maint")
+
+
+def test_admin_resume_calls_worker_manager(monkeypatch):
+    """POST /api/admin/worker/{id}/resume invokes WorkerManager.resume_worker."""
+    server, thread, mgr_mock = _make_admin_server(monkeypatch)
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        resp, payload = _post(conn, "/api/admin/worker/w1/resume")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert resp.status == 200
+    assert payload["ok"] is True
+    assert payload["action"] == "resume"
+    mgr_mock.resume_worker.assert_awaited_once_with("w1")
+
+
+def test_admin_evict_with_force_calls_worker_manager(monkeypatch):
+    """POST /api/admin/worker/{id}/evict with force=true invokes evict_worker(force=True)."""
+    server, thread, mgr_mock = _make_admin_server(monkeypatch)
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        resp, payload = _post(
+            conn, "/api/admin/worker/w1/evict", {"force": True, "reason": "bye"}
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert resp.status == 200
+    assert payload["ok"] is True
+    assert payload["action"] == "evict"
+    mgr_mock.evict_worker.assert_awaited_once_with("w1", force=True, reason="bye")
+
+
+def test_admin_allow_rejoin_calls_worker_manager(monkeypatch):
+    """POST /api/admin/worker/{id}/allow-rejoin clears the admin lifecycle lock."""
+    server, thread, mgr_mock = _make_admin_server(monkeypatch)
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        resp, payload = _post(conn, "/api/admin/worker/w1/allow-rejoin")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert resp.status == 200
+    assert payload["ok"] is True
+    assert payload["action"] == "allow-rejoin"
+    mgr_mock.allow_worker_rejoin.assert_awaited_once_with("w1")
+
+
+def test_admin_deny_calls_worker_manager(monkeypatch):
+    """POST /api/admin/type/{t}/deny invokes WorkerManager.deny_worker_for_type."""
+    server, thread, mgr_mock = _make_admin_server(monkeypatch)
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        resp, payload = _post(conn, "/api/admin/type/chat/deny", {"worker_id": "w1"})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert resp.status == 200
+    assert payload["ok"] is True
+    assert payload["action"] == "deny"
+    mgr_mock.deny_worker_for_type.assert_awaited_once_with("chat", "w1")
+
+
+def test_admin_allow_calls_worker_manager(monkeypatch):
+    """POST /api/admin/type/{t}/allow invokes WorkerManager.allow_worker_for_type."""
+    server, thread, mgr_mock = _make_admin_server(monkeypatch)
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        resp, payload = _post(conn, "/api/admin/type/chat/allow", {"worker_id": "w1"})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert resp.status == 200
+    assert payload["ok"] is True
+    assert payload["action"] == "allow"
+    mgr_mock.allow_worker_for_type.assert_awaited_once_with("chat", "w1")
+
+
+def test_admin_post_requires_auth_token(monkeypatch):
+    """Unauthenticated admin POST returns 401 when a token is configured."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    mgr_mock = MagicMock()
+    mgr_mock.suspend_worker = AsyncMock()
+    monkeypatch.setattr(
+        "by_framework_dashboard.dashboard.WorkerManager",
+        lambda *a, **kw: mgr_mock,
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(auth_token="secret"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        resp, payload = _post(conn, "/api/admin/worker/w1/suspend", {"reason": "x"})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert resp.status == 401
+    assert payload["error"] == "unauthorized"
+    mgr_mock.suspend_worker.assert_not_awaited()
+
+
+def test_admin_post_unknown_path_returns_404(monkeypatch):
+    """POST to an unrecognised /api/admin/... path returns 404."""
+    from unittest.mock import MagicMock
+
+    mgr_mock = MagicMock()
+    monkeypatch.setattr(
+        "by_framework_dashboard.dashboard.WorkerManager",
+        lambda *a, **kw: mgr_mock,
+    )
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection(
+            "127.0.0.1", server.server_address[1], timeout=5
+        )
+        resp, payload = _post(conn, "/api/admin/unknown/path")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert resp.status == 404
+    assert payload["error"] == "not found"

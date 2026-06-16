@@ -14,7 +14,7 @@ import traceback
 import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 if TYPE_CHECKING:
     from by_framework.core.registry import WorkerRegistry
@@ -32,6 +32,7 @@ from by_framework.common.emitter import DataLayoutBuilder
 from by_framework.common.logger import logger
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.extensions import AgentConfigsSnapshot, PluginRegistry
+from by_framework.core.extensions.agent_config_audit import build_agent_config_audit_projection
 from by_framework.core.protocol.agent_state import AgentState
 from by_framework.core.protocol.commands import (
     CancelTaskCommand,
@@ -155,6 +156,7 @@ class GatewayWorker(ABC):
         self,
         execution: Optional["RunningExecution"],
         session_id: str,
+        target_agent_type: str,
     ) -> AgentConfigsSnapshot:
         """Resolve the config snapshot bound to the current execution."""
         if execution and execution.is_resumed:
@@ -240,11 +242,16 @@ class GatewayWorker(ABC):
                     execution.execution_id,
                     snapshot,
                 )
+                audit_projection = build_agent_config_audit_projection(
+                    snapshot=snapshot,
+                    target_agent_type=target_agent_type,
+                )
                 await registry.update_execution_fields(
                     execution.execution_id,
                     session_id,
                     agent_configs_version=snapshot.version,
                     agent_configs_snapshot_key=snapshot_key,
+                    agent_config_audit=audit_projection,
                 )
             except Exception as err:
                 logger.exception(
@@ -262,7 +269,12 @@ class GatewayWorker(ABC):
                 ) from err
         return snapshot
 
-    async def start_heartbeat(self):
+    async def start_heartbeat(
+        self,
+        health_check: Optional[Callable[[], bool]] = None,
+        lifecycle_callback: Optional[Callable[[str], None]] = None,
+        denylist_refresh: Optional[Callable[[frozenset], None]] = None,
+    ):
         """Start periodic heartbeat registration"""
         # Call plugin startup hook
         await self.plugin_registry.on_worker_startup(self)
@@ -275,6 +287,9 @@ class GatewayWorker(ABC):
             registry=self.registry,
             interval=self.heartbeat_interval,
             lease_ttl_seconds=self.heartbeat_lease_ttl_seconds,
+            health_check=health_check,
+            lifecycle_callback=lifecycle_callback,
+            denylist_refresh=denylist_refresh,
         )
         await self._heartbeat.start()
 
@@ -539,6 +554,7 @@ class GatewayWorker(ABC):
         agent_config_snapshot = await self._resolve_agent_configs_snapshot(
             execution,
             header.session_id,
+            header.target_agent_type,
         )
 
         context = self.get_context_class()(
@@ -565,6 +581,7 @@ class GatewayWorker(ABC):
             layout_builder=self.get_data_layout_builder(),
             is_sub_agent=has_source_agent,
             execution_id=execution.execution_id if execution else "",
+            worker_id=self.worker_id,
         )
         if execution:
             execution.context = context

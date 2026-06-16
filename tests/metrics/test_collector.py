@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from by_framework.metrics import PROMETHEUS_AVAILABLE, generate_latest_metrics
 from by_framework.metrics.collector import COLLECTOR_LOCK_KEY, MetricsCollector
 from by_framework.metrics.snapshot import REDIS_HISTORY_KEY
 
@@ -94,6 +95,11 @@ async def test_collector_acquires_lock_and_writes_history():
     assert redis.store[COLLECTOR_LOCK_KEY] == "w1"
     assert REDIS_HISTORY_KEY in redis.zsets
     assert len(redis.zsets[REDIS_HISTORY_KEY]) >= 1
+    if PROMETHEUS_AVAILABLE:
+        metrics = generate_latest_metrics()
+        assert "by_framework_metrics_collector_cycles_total" in metrics
+        assert 'result="success"' in metrics
+        assert "by_framework_metrics_collector_lock_held 1.0" in metrics
 
 
 @pytest.mark.asyncio

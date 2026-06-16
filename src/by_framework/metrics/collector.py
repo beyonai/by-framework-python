@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from typing import Any, Optional
 
-from by_framework.common.logger import logger
+from by_framework.common.logger import logger, observability_log_extra
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.metrics.snapshot import (
     build_history_point,
@@ -22,6 +23,50 @@ from by_framework.metrics.snapshot import (
 COLLECTOR_LOCK_KEY = "by_framework:obs:collector_lock"
 # Lock TTL must exceed the collection interval so it is still held between cycles.
 _LOCK_TTL_MULTIPLIER = 3
+
+try:
+    from prometheus_client import Counter, Gauge, Histogram  # type: ignore
+
+    _collector_cycles_total = Counter(
+        "by_framework_metrics_collector_cycles_total",
+        "Metrics collector cycles by result.",
+        ["result"],
+    )
+    _collector_snapshot_duration_ms = Histogram(
+        "by_framework_metrics_collector_snapshot_duration_ms",
+        "Metrics collector snapshot and history write duration in milliseconds.",
+        buckets=(10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000),
+    )
+    _collector_lock_held = Gauge(
+        "by_framework_metrics_collector_lock_held",
+        "Whether this process currently holds the metrics collector lock.",
+    )
+    _collector_last_success_timestamp_ms = Gauge(
+        "by_framework_metrics_collector_last_success_timestamp_ms",
+        "Unix timestamp in milliseconds for the last successful metrics collection.",
+    )
+except ImportError:
+
+    class _NoopMetric:
+        """No-op metric used when prometheus-client is not installed."""
+
+        def labels(self, *args: Any, **kwargs: Any) -> "_NoopMetric":
+            del args, kwargs
+            return self
+
+        def inc(self, amount: float = 1.0) -> None:
+            del amount
+
+        def observe(self, amount: float) -> None:
+            del amount
+
+        def set(self, value: float) -> None:
+            del value
+
+    _collector_cycles_total = _NoopMetric()
+    _collector_snapshot_duration_ms = _NoopMetric()
+    _collector_lock_held = _NoopMetric()
+    _collector_last_success_timestamp_ms = _NoopMetric()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -103,15 +148,32 @@ class MetricsCollector:
     async def _collect_once(self) -> None:
         """Attempt to acquire the lock and write one history point."""
         if not self.enabled:
+            _collector_cycles_total.labels(result="disabled").inc()
             return
         if not await self._acquire_or_renew_lock():
+            _collector_lock_held.set(0)
+            _collector_cycles_total.labels(result="lock_skipped").inc()
             return
+        _collector_lock_held.set(1)
+        started_at = time.perf_counter()
         try:
             snapshot = await build_observability_snapshot(self.redis)
             point = build_history_point(snapshot)
             await save_history_point_to_redis(self.redis, point)
+            _collector_snapshot_duration_ms.observe(
+                max(0.0, (time.perf_counter() - started_at) * 1000)
+            )
+            _collector_last_success_timestamp_ms.set(
+                int(point.get("generated_at", 0) or int(time.time() * 1000))
+            )
+            _collector_cycles_total.labels(result="success").inc()
         except Exception as err:  # pylint: disable=broad-exception-caught
-            logger.debug("MetricsCollector snapshot failed: %s", err)
+            _collector_cycles_total.labels(result="snapshot_failed").inc()
+            logger.debug(
+                "MetricsCollector snapshot failed: %s",
+                err,
+                **observability_log_extra(worker_id=self.worker_id),
+            )
 
     async def _acquire_or_renew_lock(self) -> bool:
         """Return True if this worker now holds the collector lock.
@@ -137,7 +199,11 @@ class MetricsCollector:
                 return True
             return False
         except Exception as err:  # pylint: disable=broad-exception-caught
-            logger.debug("MetricsCollector lock acquire failed: %s", err)
+            logger.debug(
+                "MetricsCollector lock acquire failed: %s",
+                err,
+                **observability_log_extra(worker_id=self.worker_id),
+            )
             return False
 
     async def _release_lock(self) -> None:
@@ -148,6 +214,7 @@ class MetricsCollector:
                 current = current.decode()
             if current == self.worker_id:
                 await self.redis.delete(COLLECTOR_LOCK_KEY)
+                _collector_lock_held.set(0)
         except Exception as err:  # pylint: disable=broad-exception-caught
             logger.debug("MetricsCollector lock release failed: %s", err)
 

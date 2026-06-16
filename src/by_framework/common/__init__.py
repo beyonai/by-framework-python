@@ -28,7 +28,13 @@ from .config import (
 from .constants import RedisKeys
 from .emitter import (DataLayoutBuilder, DefaultSseLayoutBuilder, GatewayDataEmitter)
 from .logger import get_logger, logger, setup_logging
-from .redis_client import Redis, close_redis, get_redis, init_redis
+from .redis_client import (
+    Redis,
+    close_redis,
+    get_redis,
+    init_redis,
+    init_redis_from_url,
+)
 
 __all__ = [
     "RedisKeys",
@@ -37,6 +43,7 @@ __all__ = [
     "setup_logging",
     "get_redis",
     "init_redis",
+    "init_redis_from_url",
     "close_redis",
     "Redis",
     "DataLayoutBuilder",

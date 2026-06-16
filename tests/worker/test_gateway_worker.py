@@ -289,6 +289,7 @@ async def test_worker_injects_decoded_command_into_context(tmp_path):
 
         async def process_command(self, command, context):
             observed["command"] = getattr(context, "current_command", None)
+            observed["worker_id"] = getattr(context, "worker_id", "")
             return {"ok": True}
 
     worker = ContextInspectWorker(
@@ -313,6 +314,7 @@ async def test_worker_injects_decoded_command_into_context(tmp_path):
 
     assert isinstance(observed["command"], ResumeCommand)
     assert observed["command"].reply_data == {"answer": 7}
+    assert observed["worker_id"] == "test-inspect"
 
 
 @pytest.mark.asyncio
@@ -497,12 +499,18 @@ async def test_worker_persists_agent_configs_snapshot_for_new_execution(tmp_path
     persisted_snapshot = registry.persist_agent_configs_snapshot.await_args.args[1]
     assert persisted_snapshot.version == 1
     assert [config.agent_id for config in persisted_snapshot.configs] == ["agent_v1"]
-    registry.update_execution_fields.assert_awaited_once_with(
-        "exec-7",
-        "s7",
-        agent_configs_version=1,
-        agent_configs_snapshot_key="snapshot-key-1",
+    registry.update_execution_fields.assert_awaited_once()
+    args = registry.update_execution_fields.await_args.args
+    kwargs = registry.update_execution_fields.await_args.kwargs
+    assert args == ("exec-7", "s7")
+    assert kwargs["agent_configs_version"] == 1
+    assert kwargs["agent_configs_snapshot_key"] == "snapshot-key-1"
+    assert kwargs["agent_config_audit"]["target_agent_type"] == "recording_agent"
+    assert kwargs["agent_config_audit"]["target_agent_registered"] is False
+    assert kwargs["agent_config_audit"]["target_agent_config"]["agent_id"] == (
+        "recording_agent"
     )
+    assert kwargs["agent_config_audit"]["target_agent_config"]["registered"] is False
 
 
 @pytest.mark.asyncio
@@ -562,12 +570,18 @@ async def test_worker_persists_agent_configs_snapshot_when_execution_suspends(tm
     persisted_snapshot = registry.persist_agent_configs_snapshot.await_args.args[1]
     assert persisted_snapshot.version == 1
     assert [config.agent_id for config in persisted_snapshot.configs] == ["agent_v1"]
-    registry.update_execution_fields.assert_awaited_once_with(
-        "exec-10",
-        "s10",
-        agent_configs_version=1,
-        agent_configs_snapshot_key="snapshot-key-10",
+    registry.update_execution_fields.assert_awaited_once()
+    args = registry.update_execution_fields.await_args.args
+    kwargs = registry.update_execution_fields.await_args.kwargs
+    assert args == ("exec-10", "s10")
+    assert kwargs["agent_configs_version"] == 1
+    assert kwargs["agent_configs_snapshot_key"] == "snapshot-key-10"
+    assert kwargs["agent_config_audit"]["target_agent_type"] == "recording_agent"
+    assert kwargs["agent_config_audit"]["target_agent_registered"] is False
+    assert kwargs["agent_config_audit"]["target_agent_config"]["agent_id"] == (
+        "recording_agent"
     )
+    assert kwargs["agent_config_audit"]["target_agent_config"]["registered"] is False
 
 
 @pytest.mark.asyncio

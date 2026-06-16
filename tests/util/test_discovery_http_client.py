@@ -89,7 +89,7 @@ async def test_discovery_failure(mock_discovery_client, mock_http_client):
 
 
 @pytest.mark.asyncio
-@patch("asyncio.sleep", new_callable=AsyncMock)
+@patch("by_framework.util.discovery_http_client.sleep_async", new_callable=AsyncMock)
 async def test_retry_on_status_code_with_node_switch(
     mock_sleep,
     mock_discovery_client,
@@ -154,7 +154,7 @@ async def test_retry_on_status_code_with_node_switch(
 
 
 @pytest.mark.asyncio
-@patch("asyncio.sleep", new_callable=AsyncMock)
+@patch("by_framework.util.discovery_http_client.sleep_async", new_callable=AsyncMock)
 async def test_retry_on_network_error_exhausted(
     mock_sleep, mock_discovery_client, mock_http_client, fake_instance_1
 ):

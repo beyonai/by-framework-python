@@ -188,6 +188,62 @@ def test_build_langchain_callback_uses_trace_context_for_current_sdk(monkeypatch
     assert root_observation._otel_span.attributes["langfuse.internal.as_root"] is False
 
 
+def test_build_langchain_callback_injects_worker_id_into_run_metadata(monkeypatch):
+    """LangChain child observations receive framework worker metadata."""
+    captured_metadata: list[dict[str, Any]] = []
+
+    class FakeCallbackHandler:  # pylint: disable=too-few-public-methods
+
+        def __init__(self, *, public_key=None, trace_context=None):
+            del public_key, trace_context
+            self._runs: dict[str, Any] = {}
+
+        def on_chain_start(
+            self, serialized, inputs, *, run_id, metadata=None, **kwargs
+        ):
+            del serialized, inputs, kwargs
+            captured_metadata.append(metadata or {})
+            observation = SimpleNamespace(_otel_span=FakeOtelSpan())
+            self._runs[run_id] = observation
+
+        def on_chat_model_start(
+            self, serialized, messages, *, run_id, metadata=None, **kwargs
+        ):
+            del serialized, messages, run_id, kwargs
+            captured_metadata.append(metadata or {})
+
+        def on_tool_start(
+            self, serialized, input_str, *, run_id, metadata=None, **kwargs
+        ):
+            del serialized, input_str, run_id, kwargs
+            captured_metadata.append(metadata or {})
+
+    monkeypatch.setitem(
+        sys.modules,
+        "langfuse.langchain",
+        SimpleNamespace(CallbackHandler=FakeCallbackHandler),
+    )
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-test")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-test")
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "http://localhost:3000")
+
+    handler = build_langchain_callback(
+        trace_id="trace-langfuse",
+        parent_observation_id="obs-parent",
+        metadata={"worker_id": "worker-callback-1"},
+    )
+
+    handler.on_chain_start(None, {}, run_id="chain-run", metadata={"node": "root"})
+    handler.on_chat_model_start(None, [], run_id="chat-run")
+    handler.on_tool_start(None, "{}", run_id="tool-run", metadata={"tool": "calc"})
+
+    assert captured_metadata == [
+        {"worker_id": "worker-callback-1", "node": "root"},
+        {"worker_id": "worker-callback-1"},
+        {"worker_id": "worker-callback-1", "tool": "calc"},
+    ]
+
+
 def _build_context(
     *,
     message_id: str = "msg-1",
@@ -199,6 +255,7 @@ def _build_context(
     metadata: Optional[dict[str, Any]] = None,
     langfuse_parent_observation_id: str = "",
     trace_parent_span_id: str = "",
+    worker_id: str = "worker-langfuse-1",
 ) -> AgentContext:
     command = AskAgentCommand(
         header=MessageHeader(
@@ -225,6 +282,7 @@ def _build_context(
         current_command=command,
         user_code="user-1",
         user_name="Alice",
+        worker_id=worker_id,
     )
 
 
@@ -335,6 +393,9 @@ async def test_langfuse_plugin_starts_observation_and_persists_mapping():
     assert worker_execute_call["name"] == "worker.execute"
     assert worker_execute_call["parent_observation_id"] == "obs-1"
     assert worker_execute_call["trace_id"] == "12345678901234567890123456789012"
+    assert workflow_call["metadata"]["worker_id"] == "worker-langfuse-1"
+    assert worker_execute_call["metadata"]["worker_id"] == "worker-langfuse-1"
+    assert agent_call["metadata"]["worker_id"] == "worker-langfuse-1"
 
     # The agent task nests under this execution's worker.execute observation.
     assert agent_call["name"] == "planner"
@@ -344,6 +405,53 @@ async def test_langfuse_plugin_starts_observation_and_persists_mapping():
     assert context.get_trace_parent_observation_id() == "obs-3"
     # The workflow observation id is what children look up as their parent.
     assert store.mapping[("session-1", "msg-child")] == "obs-1"
+
+
+@pytest.mark.asyncio
+async def test_langfuse_plugin_propagates_worker_id_during_task(monkeypatch):
+    """Native LangGraph calls inside process_command inherit worker metadata."""
+    tracer = FakeTracer()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=FakeObservationStore())
+    context = _build_context(worker_id="native-langgraph-worker")
+    propagation_active = False
+    propagation_events: list[tuple[str, dict[str, str]]] = []
+
+    class FakePropagation:
+
+        def __init__(self, metadata):
+            self.metadata = metadata
+
+        def __enter__(self):
+            nonlocal propagation_active
+            propagation_active = True
+            propagation_events.append(("enter", self.metadata))
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            nonlocal propagation_active
+            propagation_events.append(("exit", self.metadata))
+            propagation_active = False
+
+    def fake_propagate_attributes(**kwargs):
+        return FakePropagation(metadata=kwargs["metadata"])
+
+    monkeypatch.setitem(
+        sys.modules,
+        "langfuse",
+        SimpleNamespace(propagate_attributes=fake_propagate_attributes),
+    )
+
+    await plugin.on_task_start(context)
+
+    assert propagation_active is True
+    assert propagation_events == [("enter", {"worker_id": "native-langgraph-worker"})]
+
+    await plugin.on_task_complete(context, {"status": "COMPLETED"})
+
+    assert propagation_active is False
+    assert propagation_events == [
+        ("enter", {"worker_id": "native-langgraph-worker"}),
+        ("exit", {"worker_id": "native-langgraph-worker"}),
+    ]
 
 
 @pytest.mark.asyncio

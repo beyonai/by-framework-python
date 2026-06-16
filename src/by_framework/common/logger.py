@@ -6,6 +6,28 @@ import sys
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
+OBSERVABILITY_LOG_FIELDS = (
+    "worker_id",
+    "message_id",
+    "session_id",
+    "trace_id",
+    "execution_id",
+    "agent_type",
+    "task_group_id",
+    "span_id",
+)
+
+
+def observability_log_extra(**fields: object) -> dict[str, dict[str, str]]:
+    """Build a logging ``extra`` payload with stable correlation field names."""
+    return {
+        "extra": {
+            key: str(value)
+            for key, value in fields.items()
+            if key in OBSERVABILITY_LOG_FIELDS and value not in ("", None)
+        }
+    }
+
 
 class ContextFilter(logging.Filter):
     """
@@ -80,16 +102,7 @@ class JSONFormatter(logging.Formatter):
         }
 
         # Add extra fields if present and non-empty
-        for key in (
-            "worker_id",
-            "message_id",
-            "session_id",
-            "trace_id",
-            "execution_id",
-            "agent_type",
-            "task_group_id",
-            "span_id",
-        ):
+        for key in OBSERVABILITY_LOG_FIELDS:
             val = getattr(record, key, None)
             if val:
                 log_data[key] = val

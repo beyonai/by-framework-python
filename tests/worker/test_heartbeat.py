@@ -184,6 +184,26 @@ class TestWorkerHeartbeat(unittest.IsolatedAsyncioTestCase):
 
         await heartbeat.stop()
 
+    async def test_heartbeat_stops_renewal_when_health_check_fails(self):
+        """Heartbeat should not extend online lease when reader is unhealthy."""
+        mock_registry = MockRegistry()
+        heartbeat = WorkerHeartbeat(
+            worker_id="worker-1",
+            agent_types=["agent-a"],
+            registry=mock_registry,
+            interval=0.01,
+            health_check=lambda: False,
+        )
+
+        await heartbeat.start()
+
+        with self.assertRaisesRegex(RuntimeError, "reader is unhealthy"):
+            await asyncio.wait_for(heartbeat.task, timeout=0.5)
+
+        self.assertEqual(mock_registry.heartbeat_calls, [("worker-1", 30)])
+
+        await heartbeat.stop()
+
     async def test_heartbeat_error_handling(self):
         """Test that heartbeat handles registry errors gracefully in loop."""
         mock_registry = Mock()
@@ -194,6 +214,7 @@ class TestWorkerHeartbeat(unittest.IsolatedAsyncioTestCase):
             error_count += 1
             raise RuntimeError(f"Error {error_count}")
 
+        mock_registry.get_worker_admin_state = AsyncMock(return_value={})
         mock_registry.register_worker_membership = AsyncMock()
         mock_registry.heartbeat_worker = failing_heartbeat
 

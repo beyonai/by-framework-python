@@ -23,6 +23,7 @@ def _make_mock_context(session_id: str = "test-session"):
     ctx.message_id = "msg-ctx"
     ctx.parent_message_id = "parent-ctx"
     ctx.current_agent_id = "planner"
+    ctx.worker_id = "worker-langgraph-1"
     ctx.redis = AsyncMock()
     ctx.emit_chunk = AsyncMock()
     ctx.ask_user = AsyncMock()
@@ -225,6 +226,7 @@ class TestAdapterRun:
         assert config["metadata"]["langfuse_session_id"] == "test-session"
         assert config["metadata"]["langfuse_user_id"] == "user-1"
         assert config["metadata"]["by_framework_message_id"] == "msg-ctx"
+        assert config["metadata"]["worker_id"] == "worker-langgraph-1"
         assert config["metadata"]["langgraph_thread_id"] == "test-session"
         # Callbacks list includes the Langfuse handler(s) plus the token accumulator.
         assert callback_handler in config["callbacks"]
@@ -237,6 +239,63 @@ class TestAdapterRun:
                 "trace_id": "trace-ctx",
                 "parent_observation_id": "obs-framework",
             }
+        ]
+
+    @pytest.mark.asyncio
+    async def test_propagates_worker_id_to_langfuse_child_observations(
+        self, monkeypatch
+    ):
+        """Langfuse attribute propagation covers nested LangGraph observations."""
+        ctx = _make_mock_context()
+        graph = MagicMock()
+        snapshot = MagicMock()
+        snapshot.next = ()
+        graph.get_state.return_value = snapshot
+
+        propagation_events: list[tuple[str, dict[str, str]]] = []
+        propagation_active = False
+
+        class FakePropagation:
+
+            def __init__(self, metadata):
+                self.metadata = metadata
+
+            def __enter__(self):
+                nonlocal propagation_active
+                propagation_active = True
+                propagation_events.append(("enter", self.metadata))
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                nonlocal propagation_active
+                propagation_events.append(("exit", self.metadata))
+                propagation_active = False
+
+        def fake_propagate_attributes(**kwargs):
+            return FakePropagation(metadata=kwargs["metadata"])
+
+        async def fake_ainvoke(input_data, *, config):
+            del input_data
+            assert config["metadata"]["worker_id"] == "worker-langgraph-1"
+            assert propagation_active is True
+            return {"messages": [MagicMock(content="hello")]}
+
+        graph.ainvoke = fake_ainvoke
+        monkeypatch.setitem(
+            sys.modules,
+            "langfuse",
+            SimpleNamespace(propagate_attributes=fake_propagate_attributes),
+        )
+
+        adapter = LangGraphAdapter(graph, ctx, stream=False)
+
+        result = await adapter.run(
+            AskAgentCommand(header=_make_header(), content="write a poem")
+        )
+
+        assert result == "hello"
+        assert propagation_events == [
+            ("enter", {"worker_id": "worker-langgraph-1"}),
+            ("exit", {"worker_id": "worker-langgraph-1"}),
         ]
 
     @pytest.mark.asyncio
