@@ -4,8 +4,8 @@ Tests for WorkerManager and related WorkerRegistry admin methods.
 
 import pytest
 
-from by_framework.core.registry import WorkerRegistry
 from by_framework.admin.worker_manager import WorkerManager
+from by_framework.core.registry import WorkerRegistry
 
 
 class FakeRedis:
@@ -84,6 +84,10 @@ class _FakePipeline:
         self._calls.append(("srem", name, *values))
         return self
 
+    def delete(self, name):
+        self._calls.append(("delete", name))
+        return self
+
     async def execute(self):
         for op, *args in self._calls:
             if op == "hset":
@@ -97,6 +101,9 @@ class _FakePipeline:
                 bucket = self._redis.sets.get(name, set())
                 for v in values:
                     bucket.discard(v)
+            elif op == "delete":
+                (name,) = args
+                await self._redis.delete(name)
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +122,7 @@ async def test_set_and_get_worker_admin_state():
     assert state["lifecycle"] == "suspended"
     assert state["reason"] == "maintenance"
     assert int(state["updated_at"]) > 0
+    assert "w1" in redis.sets["byai_gateway:registry:worker:admin_workers"]
 
 
 @pytest.mark.asyncio
@@ -136,6 +144,9 @@ async def test_clear_worker_admin_state():
 
     state = await registry.get_worker_admin_state("w1")
     assert state == {}
+    assert "w1" not in redis.sets.get(
+        "byai_gateway:registry:worker:admin_workers", set()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -297,3 +308,18 @@ async def test_worker_manager_clear_admin_state():
 
     state = await manager.get_worker_admin_state("w1")
     assert state == {}
+
+
+@pytest.mark.asyncio
+async def test_worker_manager_allow_worker_rejoin_clears_admin_state():
+    redis = FakeRedis()
+    manager = WorkerManager(redis_client=redis)
+
+    await manager.evict_worker("w1")
+    await manager.allow_worker_rejoin("w1")
+
+    state = await manager.get_worker_admin_state("w1")
+    assert state == {}
+    assert "w1" not in redis.sets.get(
+        "byai_gateway:registry:worker:admin_workers", set()
+    )

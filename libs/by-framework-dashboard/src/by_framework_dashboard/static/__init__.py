@@ -1,1 +1,1 @@
-"""Packaged static assets for the by-framework dashboard."""
+"""Packaged static assets for the observability dashboard."""

@@ -9,6 +9,7 @@ from typing import Any, Optional
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.metrics.snapshot import (
     REDIS_HISTORY_KEY,
+    SLOPolicy,
     build_history_point,
     build_observability_snapshot,
     load_history_from_redis,
@@ -104,6 +105,7 @@ class MetricsReadClient:
         end_ts: int,
         buffer_ms: int = 5_000,
         limit: int = 120,
+        slo_policy: SLOPolicy | None = None,
     ) -> MetricsReadResult:
         """Summarize metrics conditions around a trace/span time window."""
         window = MetricsWindow(
@@ -144,7 +146,10 @@ class MetricsReadClient:
                     )
                 )
         summary = self._summarize(samples)
+        if slo_policy is not None and samples:
+            summary["slo_window"] = self._summarize_slo_window(samples, slo_policy)
         diagnostics.extend(self._diagnose_summary(summary))
+        diagnostics.extend(self._diagnose_slo_window(summary.get("slo_window")))
         status = "partial" if diagnostics else "ok"
         return MetricsReadResult(
             window=window,
@@ -214,6 +219,11 @@ class MetricsReadClient:
             "latency_p95_ms",
             "queue_latency_p95_ms",
             "total_latency_p95_ms",
+            "success_ratio_ppm",
+            "deadletter_count",
+            "freshness_age_ms",
+            "oldest_pending_age_seconds",
+            "max_delivery_count",
         )
         summary: dict[str, Any] = {"sample_count": len(samples)}
         for field_name in fields:
@@ -223,7 +233,101 @@ class MetricsReadClient:
                 "max": max(values),
                 "last": values[-1],
             }
+        summary["signal_explain"] = MetricsReadClient._build_signal_explain(summary)
         return summary
+
+    @staticmethod
+    def _summary_max(summary: dict[str, Any], field_name: str) -> int:
+        value = summary.get(field_name, {})
+        return int(value.get("max", 0) or 0) if isinstance(value, dict) else 0
+
+    @staticmethod
+    def _summary_last(summary: dict[str, Any], field_name: str) -> int:
+        value = summary.get(field_name, {})
+        return int(value.get("last", 0) or 0) if isinstance(value, dict) else 0
+
+    @staticmethod
+    def _build_signal_explain(summary: dict[str, Any]) -> list[dict[str, Any]]:
+        queue_depth = MetricsReadClient._summary_max(summary, "queue_depth_total")
+        pending = MetricsReadClient._summary_max(summary, "consumer_pending_total")
+        oldest_pending_age = MetricsReadClient._summary_max(
+            summary, "oldest_pending_age_seconds"
+        )
+        max_delivery_count = MetricsReadClient._summary_max(
+            summary, "max_delivery_count"
+        )
+        workers_online = MetricsReadClient._summary_last(summary, "workers_online")
+        active_executions = MetricsReadClient._summary_max(summary, "active_executions")
+        failed_executions = MetricsReadClient._summary_max(summary, "failed_executions")
+        deadletter_count = MetricsReadClient._summary_max(summary, "deadletter_count")
+        alert_count = MetricsReadClient._summary_max(summary, "alert_count")
+
+        return [
+            {
+                "category": "queue",
+                "severity": (
+                    "warning"
+                    if (
+                        queue_depth > 0
+                        or pending > 0
+                        or oldest_pending_age > 0
+                        or max_delivery_count > 1
+                    )
+                    else "ok"
+                ),
+                "message": (
+                    "Queue backlog or pending delivery overlapped this trace window."
+                    if (
+                        queue_depth > 0
+                        or pending > 0
+                        or oldest_pending_age > 0
+                        or max_delivery_count > 1
+                    )
+                    else "No queue backlog was observed in this trace window."
+                ),
+                "metrics": {
+                    "queue_depth_total": queue_depth,
+                    "consumer_pending_total": pending,
+                    "oldest_pending_age_seconds": oldest_pending_age,
+                    "max_delivery_count": max_delivery_count,
+                },
+            },
+            {
+                "category": "worker",
+                "severity": (
+                    "warning"
+                    if workers_online <= 0 or active_executions > workers_online
+                    else "ok"
+                ),
+                "message": (
+                    "Worker capacity was absent or saturated during this trace window."
+                    if workers_online <= 0 or active_executions > workers_online
+                    else "Worker capacity was available during this trace window."
+                ),
+                "metrics": {
+                    "workers_online": workers_online,
+                    "active_executions": active_executions,
+                },
+            },
+            {
+                "category": "errors",
+                "severity": (
+                    "warning"
+                    if failed_executions > 0 or deadletter_count > 0 or alert_count > 0
+                    else "ok"
+                ),
+                "message": (
+                    "Failures, deadletters, or alerts overlapped this trace window."
+                    if failed_executions > 0 or deadletter_count > 0 or alert_count > 0
+                    else "No failure signal was observed in this trace window."
+                ),
+                "metrics": {
+                    "failed_executions": failed_executions,
+                    "deadletter_count": deadletter_count,
+                    "alert_count": alert_count,
+                },
+            },
+        ]
 
     @staticmethod
     def _diagnose_summary(summary: dict[str, Any]) -> list[MetricsDiagnostic]:
@@ -243,10 +347,149 @@ class MetricsReadClient:
                 "metrics_failures_present",
                 "Failed executions were present.",
             ),
+            (
+                "deadletter_count",
+                "metrics_deadletters_present",
+                "Deadletter messages were present.",
+            ),
+            (
+                "oldest_pending_age_seconds",
+                "metrics_pending_age_high",
+                "Pending messages had non-zero idle age.",
+            ),
+            (
+                "max_delivery_count",
+                "metrics_stream_redelivery_high",
+                "Pending messages had repeated delivery attempts.",
+            ),
+            (
+                "freshness_age_ms",
+                "metrics_freshness_age_high",
+                "Worker or metrics freshness age was non-zero.",
+            ),
         )
         for field_name, code, message in checks:
             max_value = int(summary.get(field_name, {}).get("max", 0) or 0)
             if max_value > 0:
+                diagnostics.append(
+                    MetricsDiagnostic(
+                        code=code,
+                        message=message,
+                        severity="warning",
+                    )
+                )
+        success_ratio = summary.get("success_ratio_ppm", {})
+        if success_ratio and int(success_ratio.get("min", 1_000_000) or 0) < 990_000:
+            diagnostics.append(
+                MetricsDiagnostic(
+                    code="metrics_slo_success_ratio",
+                    message="Execution success ratio was below 99%.",
+                    severity="warning",
+                )
+            )
+        return diagnostics
+
+    @staticmethod
+    def _summarize_slo_window(
+        samples: list[dict[str, int]], slo_policy: SLOPolicy
+    ) -> dict[str, Any]:
+        first = samples[0]
+        last = samples[-1]
+
+        successful_executions = max(
+            0,
+            int(last.get("completed_executions", 0) or 0)
+            - int(first.get("completed_executions", 0) or 0),
+        )
+        terminal_executions = max(
+            0,
+            int(last.get("terminal_executions", 0) or 0)
+            - int(first.get("terminal_executions", 0) or 0),
+        )
+        if terminal_executions <= 0:
+            failed_delta = max(
+                0,
+                int(last.get("failed_executions", 0) or 0)
+                - int(first.get("failed_executions", 0) or 0),
+            )
+            cancelled_delta = max(
+                0,
+                int(last.get("cancelled_executions", 0) or 0)
+                - int(first.get("cancelled_executions", 0) or 0),
+            )
+            terminal_executions = successful_executions + failed_delta + cancelled_delta
+
+        success_ratio = (
+            successful_executions / terminal_executions
+            if terminal_executions > 0
+            else 1.0
+        )
+        target = min(1.0, max(0.0, float(slo_policy.success_ratio_target)))
+        error_budget = max(1.0 - target, 0.000001)
+        burn_rate = max(0.0, (target - success_ratio) / error_budget)
+        total_latency_p95_ms = max(
+            int(sample.get("total_latency_p95_ms", 0) or 0) for sample in samples
+        )
+        deadletter_count = max(
+            int(sample.get("deadletter_count", 0) or 0) for sample in samples
+        )
+        freshness_age_ms = max(
+            int(sample.get("freshness_age_ms", 0) or 0) for sample in samples
+        )
+
+        return {
+            "window": slo_policy.window,
+            "successful_executions": successful_executions,
+            "terminal_executions": terminal_executions,
+            "success_ratio_ppm": int(success_ratio * 1_000_000),
+            "success_ratio_target_ppm": int(target * 1_000_000),
+            "success_ratio_objective_met": success_ratio >= target,
+            "burn_rate": round(burn_rate, 3),
+            "total_latency_p95_ms": total_latency_p95_ms,
+            "latency_objective_met": (
+                total_latency_p95_ms <= int(slo_policy.total_latency_p95_ms)
+            ),
+            "deadletter_count": deadletter_count,
+            "deadletter_objective_met": (
+                deadletter_count <= int(slo_policy.deadletter_threshold)
+            ),
+            "freshness_age_ms": freshness_age_ms,
+            "freshness_objective_met": (
+                freshness_age_ms <= int(slo_policy.freshness_max_age_ms)
+            ),
+        }
+
+    @staticmethod
+    def _diagnose_slo_window(
+        slo_window: dict[str, Any] | None,
+    ) -> list[MetricsDiagnostic]:
+        diagnostics: list[MetricsDiagnostic] = []
+        if not slo_window:
+            return diagnostics
+        checks = (
+            (
+                "success_ratio_objective_met",
+                "metrics_slo_window_success_ratio",
+                "Window execution success ratio missed the configured SLO.",
+            ),
+            (
+                "latency_objective_met",
+                "metrics_slo_window_latency",
+                "Window total latency P95 missed the configured SLO.",
+            ),
+            (
+                "deadletter_objective_met",
+                "metrics_slo_window_deadletter",
+                "Window deadletter count missed the configured SLO.",
+            ),
+            (
+                "freshness_objective_met",
+                "metrics_slo_window_freshness",
+                "Window metrics or heartbeat freshness missed the configured SLO.",
+            ),
+        )
+        for key, code, message in checks:
+            if slo_window.get(key) is False:
                 diagnostics.append(
                     MetricsDiagnostic(
                         code=code,

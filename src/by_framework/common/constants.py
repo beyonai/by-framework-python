@@ -135,6 +135,9 @@ class RedisKeys:
     # --- Registry ---
     # Set of known workers used for registry enumeration.
     KNOWN_WORKERS = "byai_gateway:registry:workers"
+    # Set of workers with explicit admin lifecycle state. Used by dashboard
+    # management views to include offline suspended/evicted workers.
+    ADMIN_WORKERS = "byai_gateway:registry:worker:admin_workers"
     WORKER_DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5
     # 6× the heartbeat interval gives enough margin even when the main event
     # loop is briefly occupied by an LLM call.  The dedicated heartbeat thread

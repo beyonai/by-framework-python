@@ -18,6 +18,7 @@ from typing import Any, List, Optional, TypedDict
 
 from by_framework.common.constants import (EXEC_FIELD_PREFIX, MSG_MAP_PREFIX, RedisKeys)
 from by_framework.common.exceptions import ExecutionDataError
+from by_framework.common.logger import observability_log_extra
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.extensions import AgentConfigsSnapshot, PluginRegistry
 from by_framework.core.protocol.agent_state import is_terminal_state
@@ -675,6 +676,11 @@ class WorkerRegistry:
             "error_code": execution.get("error_code", ""),
             "failed_stage": execution.get("failed_stage", ""),
             "retryable": bool(execution.get("retryable", False)),
+            "agent_configs_version": execution.get("agent_configs_version", 0),
+            "agent_configs_snapshot_key": execution.get(
+                "agent_configs_snapshot_key", ""
+            ),
+            "agent_config_audit": execution.get("agent_config_audit"),
         }
 
     @staticmethod
@@ -806,8 +812,10 @@ class WorkerRegistry:
         if current is None:
             return
 
+        old_execution = dict(current)
         current.update(kwargs)
-        current["updated_at"] = int(time.time() * 1000)
+        now = int(time.time() * 1000)
+        current["updated_at"] = now
 
         reg_key = RedisKeys.session_registry(session_id)
         pipe = self.redis.pipeline()
@@ -818,6 +826,7 @@ class WorkerRegistry:
         )
         pipe.expire(reg_key, RedisKeys.DEFAULT_SESSION_TTL)
         await pipe.execute()
+        await self._update_worker_execution_stats(old_execution, current, now)
 
     async def save_execution(self, execution: dict[str, Any]):
         """(Compatibility) Save execution data to Redis.
@@ -1041,6 +1050,10 @@ class WorkerRegistry:
                     session_id,
                     snapshot_key,
                     err,
+                    **observability_log_extra(
+                        execution_id=execution_id,
+                        session_id=session_id,
+                    ),
                 )
             finally:
                 current["updated_at"] = int(time.time() * 1000)
@@ -1243,6 +1256,7 @@ class WorkerRegistry:
             "online": worker_id in workers,
             "agent_types": sorted(worker_info.get("agent_types", [])),
             "last_seen": int(worker_info.get("last_seen", 0)),
+            "ip_address": worker_info.get("ip_address", ""),
             "counts": counts,
             "active_count": counts["active"],
             "total_tracked": counts["total"],
@@ -1285,6 +1299,7 @@ class WorkerRegistry:
         pipe.hset(key, "lifecycle", lifecycle)
         pipe.hset(key, "reason", reason)
         pipe.hset(key, "updated_at", now)
+        pipe.sadd(RedisKeys.ADMIN_WORKERS, worker_id)
         await pipe.execute()
 
     async def get_worker_admin_state(self, worker_id: str) -> dict[str, Any]:
@@ -1310,7 +1325,10 @@ class WorkerRegistry:
 
     async def clear_worker_admin_state(self, worker_id: str) -> None:
         """Remove the admin lifecycle key, restoring default-active behaviour."""
-        await self.redis.delete(RedisKeys.worker_admin(worker_id))
+        pipe = self.redis.pipeline()
+        pipe.delete(RedisKeys.worker_admin(worker_id))
+        pipe.srem(RedisKeys.ADMIN_WORKERS, worker_id)
+        await pipe.execute()
 
     async def remove_worker_from_type_members(self, worker_id: str) -> None:
         """SREM worker_id from every agent_type:members set it currently belongs to.

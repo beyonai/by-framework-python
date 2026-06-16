@@ -552,6 +552,12 @@ class WorkerRunner:
             # within the agent (e.g. LangGraph/Langfuse LLM calls) nest under
             # worker.execute via normal OTel context propagation.
             execution_started_at = int(time.time() * 1000)
+            try:
+                from by_framework.metrics import record_execution_started_metrics
+
+                record_execution_started_metrics(agent_type=header.target_agent_type)
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                logger.debug("Failed to record execution start metric: %s", e)
             err_start_ts = execution_started_at
             client_dispatch_parent_span_id = self._client_dispatch_parent_span_id(
                 header

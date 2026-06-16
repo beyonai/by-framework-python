@@ -1,5 +1,6 @@
 """Tests for WorkerRegistry functionality."""
 
+import asyncio
 import json
 from unittest.mock import patch
 
@@ -55,6 +56,31 @@ def test_local_ip_falls_back_to_route_when_hostname_is_loopback():
     )
 
 
+def test_worker_execution_snapshot_preserves_agent_config_audit_projection():
+    """Worker execution history keeps redacted agent config lookup metadata."""
+    registry = WorkerRegistry(object())
+    snapshot = registry._build_worker_execution_snapshot(  # pylint: disable=protected-access
+        {
+            "execution_id": "exec-audit",
+            "message_id": "msg-audit",
+            "session_id": "sess-audit",
+            "worker_id": "worker-audit",
+            "target_agent_type": "weather-agent",
+            "status": "COMPLETED",
+            "agent_configs_version": 5,
+            "agent_configs_snapshot_key": "exec-audit",
+            "agent_config_audit": {
+                "target_agent_type": "weather-agent",
+                "snapshot_hash": "sha256:audit",
+            },
+        }
+    )
+
+    assert snapshot["agent_configs_version"] == 5
+    assert snapshot["agent_configs_snapshot_key"] == "exec-audit"
+    assert snapshot["agent_config_audit"]["snapshot_hash"] == "sha256:audit"
+
+
 class MockPipeline:
     """Mock Redis pipeline for testing."""
 
@@ -94,6 +120,10 @@ class MockPipeline:
         self.commands.append(("expire", name, ttl))
         return self
 
+    def delete(self, name):
+        self.commands.append(("delete", name))
+        return self
+
     async def execute(self):
         for cmd in self.commands:
             if cmd[0] == "hset":
@@ -112,6 +142,8 @@ class MockPipeline:
                 await self.redis.hincrby(cmd[1], cmd[2], cmd[3])
             elif cmd[0] == "expire":
                 await self.redis.expire(cmd[1], cmd[2])
+            elif cmd[0] == "delete":
+                await self.redis.delete(cmd[1])
         return []
 
 
@@ -873,6 +905,40 @@ async def test_update_execution_fields_updates_metadata_without_timeline_noise()
     assert after["trace_url"] == "https://langfuse.local/trace/trace-2"
     assert after["timeline"] == before["timeline"]
     assert after["status"] == "QUEUED"
+
+
+def test_update_execution_fields_refreshes_worker_execution_snapshot():
+    """Dashboard worker history must see metadata added after save_execution."""
+
+    async def scenario():
+        redis_mock = MockRedis()
+        registry = WorkerRegistry(redis_mock)
+
+        await registry.save_execution(
+            {
+                "execution_id": "exec-audit-refresh",
+                "message_id": "msg-audit-refresh",
+                "session_id": "sess-audit-refresh",
+                "worker_id": "worker-audit-refresh",
+                "target_agent_type": "weather-agent",
+                "status": "RUNNING",
+            }
+        )
+        await registry.update_execution_fields(
+            "exec-audit-refresh",
+            "sess-audit-refresh",
+            agent_config_audit={
+                "target_agent_type": "weather-agent",
+                "snapshot_hash": "sha256:after-save",
+            },
+        )
+
+        worker_executions = await registry.get_worker_executions("worker-audit-refresh")
+        assert worker_executions[0]["agent_config_audit"]["snapshot_hash"] == (
+            "sha256:after-save"
+        )
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.asyncio

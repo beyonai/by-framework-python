@@ -16,6 +16,7 @@ from by_framework.util.http_client import (
 )
 
 logger = get_logger("by_framework.discovery_http")
+sleep_async = asyncio.sleep
 
 
 class DiscoveryHttpClient:
@@ -177,7 +178,7 @@ class DiscoveryHttpClient:
             logger.warning(
                 "Node-switching retry in %.1fs for service %s", delay, service_name
             )
-            await asyncio.sleep(delay)
+            await sleep_async(delay)
             return await self._request_with_discovery(
                 method,
                 service_name,
@@ -330,7 +331,7 @@ class DiscoveryHttpClient:
             logger.warning(
                 "Node-switching retry in %.1fs for service %s", delay, service_name
             )
-            await asyncio.sleep(delay)
+            await sleep_async(delay)
             return await self.download(
                 service_name,
                 path,
@@ -562,7 +563,7 @@ class DiscoveryHttpClient:
                     except Exception:
                         pass
 
-            await asyncio.sleep(delay)
+            await sleep_async(delay)
             return await self._upload_with_discovery(
                 service_name,
                 path,

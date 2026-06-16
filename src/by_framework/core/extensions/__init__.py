@@ -8,6 +8,7 @@ managed through the form of plugins.
 """
 
 from .agent_config import AgentConfig, CallbackType
+from .agent_config_audit import build_agent_config_audit_projection
 from .plugin import (
     AgentConfigsSnapshot,
     Plugin,
@@ -24,6 +25,7 @@ __all__ = [
     "AgentConfig",
     "AgentConfigsSnapshot",
     "CallbackType",
+    "build_agent_config_audit_projection",
     "PluginManifest",
     "Plugin",
     "PluginBuildContext",

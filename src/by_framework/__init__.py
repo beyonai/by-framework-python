@@ -5,6 +5,7 @@ Allows developers to quickly start a Redis-based agent node by inheriting
 from `GatewayWorker` and running `run_worker`.
 """
 
+from .admin import WorkerManager
 from .client.byai_client import ByaiGatewayClient
 from .client.client import (
     CancelTaskResponse,
@@ -99,7 +100,6 @@ from .core.registry import (
     check_worker_online,
 )
 from .core.wakeup_controller import WakeupController, WakeupProvider
-from .admin import WorkerManager
 from .core.workspace import WorkspaceManager
 from .worker.app import run_worker
 from .worker.byai_context import ByaiAgentContext, ByaiAgentTask

@@ -140,3 +140,7 @@ class WorkerManager:
     async def clear_worker_admin_state(self, worker_id: str) -> None:
         """Remove all admin state for a worker, restoring default-active behaviour."""
         await self.registry.clear_worker_admin_state(worker_id)
+
+    async def allow_worker_rejoin(self, worker_id: str) -> None:
+        """Allow a previously evicted offline worker ID to join on next startup."""
+        await self.clear_worker_admin_state(worker_id)

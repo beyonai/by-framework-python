@@ -32,6 +32,7 @@ from by_framework.common.emitter import DataLayoutBuilder
 from by_framework.common.logger import logger
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.extensions import AgentConfigsSnapshot, PluginRegistry
+from by_framework.core.extensions.agent_config_audit import build_agent_config_audit_projection
 from by_framework.core.protocol.agent_state import AgentState
 from by_framework.core.protocol.commands import (
     CancelTaskCommand,
@@ -155,6 +156,7 @@ class GatewayWorker(ABC):
         self,
         execution: Optional["RunningExecution"],
         session_id: str,
+        target_agent_type: str,
     ) -> AgentConfigsSnapshot:
         """Resolve the config snapshot bound to the current execution."""
         if execution and execution.is_resumed:
@@ -240,11 +242,16 @@ class GatewayWorker(ABC):
                     execution.execution_id,
                     snapshot,
                 )
+                audit_projection = build_agent_config_audit_projection(
+                    snapshot=snapshot,
+                    target_agent_type=target_agent_type,
+                )
                 await registry.update_execution_fields(
                     execution.execution_id,
                     session_id,
                     agent_configs_version=snapshot.version,
                     agent_configs_snapshot_key=snapshot_key,
+                    agent_config_audit=audit_projection,
                 )
             except Exception as err:
                 logger.exception(
@@ -547,6 +554,7 @@ class GatewayWorker(ABC):
         agent_config_snapshot = await self._resolve_agent_configs_snapshot(
             execution,
             header.session_id,
+            header.target_agent_type,
         )
 
         context = self.get_context_class()(

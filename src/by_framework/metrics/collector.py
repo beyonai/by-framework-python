@@ -12,7 +12,7 @@ import os
 import time
 from typing import Any, Optional
 
-from by_framework.common.logger import logger
+from by_framework.common.logger import logger, observability_log_extra
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.metrics.snapshot import (
     build_history_point,
@@ -169,7 +169,11 @@ class MetricsCollector:
             _collector_cycles_total.labels(result="success").inc()
         except Exception as err:  # pylint: disable=broad-exception-caught
             _collector_cycles_total.labels(result="snapshot_failed").inc()
-            logger.debug("MetricsCollector snapshot failed: %s", err)
+            logger.debug(
+                "MetricsCollector snapshot failed: %s",
+                err,
+                **observability_log_extra(worker_id=self.worker_id),
+            )
 
     async def _acquire_or_renew_lock(self) -> bool:
         """Return True if this worker now holds the collector lock.
@@ -195,7 +199,11 @@ class MetricsCollector:
                 return True
             return False
         except Exception as err:  # pylint: disable=broad-exception-caught
-            logger.debug("MetricsCollector lock acquire failed: %s", err)
+            logger.debug(
+                "MetricsCollector lock acquire failed: %s",
+                err,
+                **observability_log_extra(worker_id=self.worker_id),
+            )
             return False
 
     async def _release_lock(self) -> None:

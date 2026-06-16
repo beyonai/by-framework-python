@@ -4,6 +4,15 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from by_framework.metrics.catalog import (
+    MetricDefinition,
+    MetricKind,
+    MetricUnit,
+    get_metric_catalog,
+    get_metric_catalog_payload,
+    get_metric_definition,
+    metric_definition_to_dict,
+)
 from by_framework.metrics.collector import MetricsCollector
 from by_framework.metrics.read_client import (
     MetricsDiagnostic,
@@ -79,6 +88,39 @@ if PROMETHEUS_AVAILABLE:
         ["agent_type", "policy", "status"],
         buckets=(10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000),
     )
+    executions_started_total = Counter(
+        "by_framework_executions_started_total",
+        "Executions accepted by the framework by target agent type.",
+        ["agent_type"],
+    )
+    executions_completed_total = Counter(
+        "by_framework_executions_completed_total",
+        "Executions that reached a terminal status.",
+        ["status", "agent_type"],
+    )
+    executions_failed_total = Counter(
+        "by_framework_executions_failed_total",
+        "Terminal failed executions by agent type and error type.",
+        ["agent_type", "error_type"],
+    )
+    execution_queue_duration_seconds = Histogram(
+        "by_framework_execution_queue_duration_seconds",
+        "Time an execution waited before worker processing started.",
+        ["agent_type"],
+        buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30),
+    )
+    execution_run_duration_seconds = Histogram(
+        "by_framework_execution_run_duration_seconds",
+        "Worker processing duration for terminal executions.",
+        ["status", "agent_type"],
+        buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
+    )
+    execution_total_duration_seconds = Histogram(
+        "by_framework_execution_total_duration_seconds",
+        "End-to-end execution duration from enqueue to terminal state.",
+        ["status", "agent_type"],
+        buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
+    )
 else:
     execution_status_total = DummyMetric(
         "by_framework_execution_status_total",
@@ -100,6 +142,36 @@ else:
         "Time spent in AvailabilityRouter.prepare_delivery before message dispatch.",
         ["agent_type", "policy", "status"],
     )
+    executions_started_total = DummyMetric(
+        "by_framework_executions_started_total",
+        "Executions accepted by the framework by target agent type.",
+        ["agent_type"],
+    )
+    executions_completed_total = DummyMetric(
+        "by_framework_executions_completed_total",
+        "Executions that reached a terminal status.",
+        ["status", "agent_type"],
+    )
+    executions_failed_total = DummyMetric(
+        "by_framework_executions_failed_total",
+        "Terminal failed executions by agent type and error type.",
+        ["agent_type", "error_type"],
+    )
+    execution_queue_duration_seconds = DummyMetric(
+        "by_framework_execution_queue_duration_seconds",
+        "Time an execution waited before worker processing started.",
+        ["agent_type"],
+    )
+    execution_run_duration_seconds = DummyMetric(
+        "by_framework_execution_run_duration_seconds",
+        "Worker processing duration for terminal executions.",
+        ["status", "agent_type"],
+    )
+    execution_total_duration_seconds = DummyMetric(
+        "by_framework_execution_total_duration_seconds",
+        "End-to-end execution duration from enqueue to terminal state.",
+        ["status", "agent_type"],
+    )
 
 
 def record_execution_metrics(
@@ -112,14 +184,39 @@ def record_execution_metrics(
 ) -> None:
     """Record worker execution metrics safely."""
     try:
+        if status in {"COMPLETED", "FAILED", "CANCELLED"}:
+            executions_completed_total.labels(
+                status=status, agent_type=agent_type
+            ).inc()
+        if status == "FAILED":
+            executions_failed_total.labels(
+                agent_type=agent_type, error_type="unknown"
+            ).inc()
         execution_status_total.labels(
             status=status, agent_type=agent_type, worker_id=worker_id
         ).inc()
         execution_latency_ms.labels(
             status=status, agent_type=agent_type, worker_id=worker_id
         ).observe(execution_ms)
+        execution_run_duration_seconds.labels(
+            status=status, agent_type=agent_type
+        ).observe(max(0.0, execution_ms / 1000))
+        execution_total_duration_seconds.labels(
+            status=status, agent_type=agent_type
+        ).observe(max(0.0, execution_ms / 1000))
         if queue_wait_ms_val is not None and queue_wait_ms_val >= 0:
             queue_wait_ms.labels(agent_type=agent_type).observe(queue_wait_ms_val)
+            execution_queue_duration_seconds.labels(agent_type=agent_type).observe(
+                queue_wait_ms_val / 1000
+            )
+    except Exception:  # pylint: disable=broad-exception-caught
+        pass
+
+
+def record_execution_started_metrics(*, agent_type: str) -> None:
+    """Record that framework work started processing for an agent type."""
+    try:
+        executions_started_total.labels(agent_type=agent_type).inc()
     except Exception:  # pylint: disable=broad-exception-caught
         pass
 
@@ -211,10 +308,18 @@ __all__ = [
     "MetricsReadClient",
     "MetricsReadResult",
     "MetricsWindow",
+    "MetricDefinition",
+    "MetricKind",
+    "MetricUnit",
     "PROMETHEUS_AVAILABLE",
     "build_observability_diagnostics_metrics",
     "generate_latest_metrics",
+    "get_metric_catalog",
+    "get_metric_catalog_payload",
+    "get_metric_definition",
     "get_registry",
+    "metric_definition_to_dict",
     "record_availability_metrics",
+    "record_execution_started_metrics",
     "record_execution_metrics",
 ]
