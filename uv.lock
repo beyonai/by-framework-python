@@ -404,7 +404,7 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "by-framework-dashboard"
-version = "0.1.0"
+version = "0.1.1.dev0"
 source = { editable = "libs/by-framework-dashboard" }
 dependencies = [
     { name = "by-framework" },
