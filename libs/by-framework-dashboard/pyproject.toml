@@ -1,6 +1,6 @@
 [project]
 name = "by-framework-dashboard"
-version = "0.1.0"
+version = "0.1.1.dev0"
 description = "Dashboard UI and HTTP server for by-framework observability"
 requires-python = ">=3.12"
 dependencies = [
