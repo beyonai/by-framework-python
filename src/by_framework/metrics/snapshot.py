@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Optional
 
 from by_framework.common.constants import RedisKeys
+from by_framework.common.logger import logger
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.registry import WorkerRegistry
 
@@ -1200,41 +1201,44 @@ async def _get_observable_workers(
     }
 
 
+async def _cluster_aware_scan_ids_by_prefix(
+    redis: Redis, prefix: str, scan_limit: int
+) -> tuple[list[str], bool]:
+    """Enumerate key-name suffixes matching `{prefix}*` via SCAN.
+
+    SCAN is a single-node command in standalone Redis, but
+    `redis.asyncio.cluster.RedisCluster.scan_iter()` (verified against the
+    pinned redis-py version's source) already targets every primary node
+    and merges each node's cursor internally, so no manual per-node
+    iteration is needed here — this helper just needs to call `scan_iter`
+    and every by-framework-supported client (standalone or cluster)
+    provides it.
+
+    Used by all metrics/snapshot.py code that needs to enumerate Redis
+    keys by prefix, instead of each call site reimplementing this.
+    """
+    pattern = f"{prefix}*"
+    limit = max(scan_limit, 0)
+    ids: list[str] = []
+    scan_iter = getattr(redis, "scan_iter", None)
+    if not callable(scan_iter):
+        return [], False
+
+    async for key in scan_iter(match=pattern, count=max(limit or 100, 100)):
+        key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+        if key_text.startswith(prefix):
+            ids.append(key_text.removeprefix(prefix))
+        if limit and len(ids) >= limit:
+            break
+    return sorted(set(ids)), True
+
+
 async def _scan_online_worker_ids(
     redis: Redis, scan_limit: int
 ) -> tuple[list[str], bool]:
-    prefix = RedisKeys.worker_online_lease("")
-    pattern = f"{prefix}*"
-    limit = max(scan_limit, 0)
-    worker_ids: list[str] = []
-    scan_iter = getattr(redis, "scan_iter", None)
-    if callable(scan_iter):
-        async for key in scan_iter(match=pattern, count=max(limit or 100, 100)):
-            key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
-            if key_text.startswith(prefix):
-                worker_ids.append(key_text.removeprefix(prefix))
-            if limit and len(worker_ids) >= limit:
-                break
-        return sorted(set(worker_ids)), True
-
-    scan = getattr(redis, "scan", None)
-    if not callable(scan):
-        return [], False
-
-    cursor: int | str = 0
-    while True:
-        cursor, keys = await scan(
-            cursor=cursor, match=pattern, count=max(limit or 100, 100)
-        )
-        for key in keys:
-            key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
-            if key_text.startswith(prefix):
-                worker_ids.append(key_text.removeprefix(prefix))
-            if limit and len(worker_ids) >= limit:
-                return sorted(set(worker_ids)), True
-        if str(cursor) == "0":
-            break
-    return sorted(set(worker_ids)), True
+    return await _cluster_aware_scan_ids_by_prefix(
+        redis, RedisKeys.worker_online_lease(""), scan_limit
+    )
 
 
 async def _get_admin_managed_worker_ids(
@@ -1247,7 +1251,9 @@ async def _get_admin_managed_worker_ids(
         item.decode("utf-8") if isinstance(item, bytes) else str(item)
         for item in indexed_raw
     }
-    scanned_ids, scan_supported = await _scan_worker_admin_ids(redis, scan_limit)
+    scanned_ids, scan_supported = await _cluster_aware_scan_ids_by_prefix(
+        redis, RedisKeys.worker_admin(""), scan_limit
+    )
     worker_ids = sorted(indexed_ids | set(scanned_ids))
     limited_ids = worker_ids[: max(scan_limit, 0)] if scan_limit else worker_ids
     return limited_ids, {
@@ -1258,44 +1264,6 @@ async def _get_admin_managed_worker_ids(
         "returned_workers": len(limited_ids),
         "truncated": len(worker_ids) > len(limited_ids),
     }
-
-
-async def _scan_worker_admin_ids(
-    redis: Redis,
-    scan_limit: int,
-) -> tuple[list[str], bool]:
-    prefix = RedisKeys.worker_admin("")
-    pattern = f"{prefix}*"
-    limit = max(scan_limit, 0)
-    worker_ids: list[str] = []
-    scan_iter = getattr(redis, "scan_iter", None)
-    if callable(scan_iter):
-        async for key in scan_iter(match=pattern, count=max(limit or 100, 100)):
-            key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
-            if key_text.startswith(prefix):
-                worker_ids.append(key_text.removeprefix(prefix))
-            if limit and len(worker_ids) >= limit:
-                break
-        return sorted(set(worker_ids)), True
-
-    scan = getattr(redis, "scan", None)
-    if not callable(scan):
-        return [], False
-
-    cursor: int | str = 0
-    while True:
-        cursor, keys = await scan(
-            cursor=cursor, match=pattern, count=max(limit or 100, 100)
-        )
-        for key in keys:
-            key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
-            if key_text.startswith(prefix):
-                worker_ids.append(key_text.removeprefix(prefix))
-            if limit and len(worker_ids) >= limit:
-                return sorted(set(worker_ids)), True
-        if str(cursor) == "0":
-            break
-    return sorted(set(worker_ids)), True
 
 
 def _decode_worker_presence_for_snapshot(raw: Any) -> tuple[int, bool]:
@@ -1317,17 +1285,30 @@ def _decode_worker_presence_for_snapshot(raw: Any) -> tuple[int, bool]:
 async def _batch_fetch_admin_states(
     redis: Redis, worker_ids: list[str]
 ) -> dict[str, dict[str, Any]]:
-    """Pipeline-fetch admin state HASHes for all workers in one round-trip."""
+    """Concurrently fetch admin state HASHes for all workers.
+
+    worker_admin(id) keys belong to different worker entities, so bundling
+    them into one pipeline is a cross-entity, CROSSSLOT-prone operation
+    under Cluster. Each worker's read is issued independently instead, so
+    a single worker's read failure can't take down the whole batch.
+    """
     if not worker_ids:
         return {}
-    pipe = redis.pipeline()
-    for wid in worker_ids:
-        pipe.hgetall(RedisKeys.worker_admin(wid))
-    results = await pipe.execute()
-    return {
-        worker_id: _decode_hash_mapping(raw)
-        for worker_id, raw in zip(worker_ids, results)
-    }
+
+    async def _fetch_one(worker_id: str) -> dict[str, Any]:
+        try:
+            raw = await redis.hgetall(RedisKeys.worker_admin(worker_id))
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "_batch_fetch_admin_states: read failed for %s",
+                worker_id,
+                exc_info=True,
+            )
+            return {}
+        return _decode_hash_mapping(raw)
+
+    results = await asyncio.gather(*[_fetch_one(wid) for wid in worker_ids])
+    return dict(zip(worker_ids, results))
 
 
 def _decode_hash_mapping(raw: Any) -> dict[str, Any]:
