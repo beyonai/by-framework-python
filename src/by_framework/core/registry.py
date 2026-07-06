@@ -292,7 +292,7 @@ class WorkerRegistry:
             for item in old_agent_types_raw
         }
 
-        await self.redis.sadd(RedisKeys.KNOWN_WORKERS, worker_id)
+        await self.redis.sadd(RedisKeys.known_workers(), worker_id)
         for stale_agent_type in old_agent_types - new_agent_types:
             await self.redis.srem(
                 RedisKeys.agent_type_members(stale_agent_type), worker_id
@@ -341,7 +341,7 @@ class WorkerRegistry:
         if not result:
             return False
 
-        await self.redis.sadd(RedisKeys.KNOWN_WORKERS, worker_id)
+        await self.redis.sadd(RedisKeys.known_workers(), worker_id)
         return True
 
     async def register_worker(self, worker_id: str, agent_types: List[str]):
@@ -361,7 +361,7 @@ class WorkerRegistry:
             RedisKeys.worker_declared_agent_types(worker_id)
         )
         await self.redis.delete(RedisKeys.worker_declared_agent_types(worker_id))
-        await self.redis.srem(RedisKeys.KNOWN_WORKERS, worker_id)
+        await self.redis.srem(RedisKeys.known_workers(), worker_id)
         for agent_type_raw in agent_types_raw:
             agent_type = (
                 agent_type_raw.decode()
@@ -454,7 +454,7 @@ class WorkerRegistry:
             and last active time.
         """
         redis_inst = self.redis
-        worker_ids_raw = await redis_inst.smembers(RedisKeys.KNOWN_WORKERS)
+        worker_ids_raw = await redis_inst.smembers(RedisKeys.known_workers())
         worker_ids = [w.decode() if isinstance(w, bytes) else w for w in worker_ids_raw]
 
         result = {}
@@ -513,7 +513,7 @@ class WorkerRegistry:
         if not ok:
             raise ValueError(f"worker_id already in use: {worker_id}")
         self._lock_tokens[worker_id] = token
-        await self.redis.sadd(RedisKeys.KNOWN_WORKERS, worker_id)
+        await self.redis.sadd(RedisKeys.known_workers(), worker_id)
         return token
 
     async def refresh_worker_id_lock(
@@ -1299,7 +1299,7 @@ class WorkerRegistry:
         pipe.hset(key, "lifecycle", lifecycle)
         pipe.hset(key, "reason", reason)
         pipe.hset(key, "updated_at", now)
-        pipe.sadd(RedisKeys.ADMIN_WORKERS, worker_id)
+        pipe.sadd(RedisKeys.admin_workers(), worker_id)
         await pipe.execute()
 
     async def get_worker_admin_state(self, worker_id: str) -> dict[str, Any]:
@@ -1327,7 +1327,7 @@ class WorkerRegistry:
         """Remove the admin lifecycle key, restoring default-active behaviour."""
         pipe = self.redis.pipeline()
         pipe.delete(RedisKeys.worker_admin(worker_id))
-        pipe.srem(RedisKeys.ADMIN_WORKERS, worker_id)
+        pipe.srem(RedisKeys.admin_workers(), worker_id)
         await pipe.execute()
 
     async def remove_worker_from_type_members(self, worker_id: str) -> None:
