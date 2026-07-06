@@ -6,6 +6,7 @@ are centrally managed in this file. Do not hardcode literal strings in business 
 """
 
 import os
+from typing import Optional
 
 
 def get_key_schema_version() -> str:
@@ -43,6 +44,37 @@ class RedisKeys:
         if get_key_schema_version() == "v2":
             return f"{cls.V2_PREFIX}{v2_suffix}"
         return v1_key
+
+    @classmethod
+    def _worker_scan_pattern(cls, v1_prefix: str, v2_field: str) -> str:
+        """SCAN MATCH glob pattern matching every worker key in this family.
+
+        Under v1 the worker_id is the last path segment (prefix + id, no
+        suffix). Under v2 it's wrapped in a Cluster hash tag in the middle
+        of the key (prefix + "{" + id + "}" + suffix) — a bare "{prefix}*"
+        pattern (or a str.startswith("{prefix}") check) would never match a
+        real v2 key, since "{"/"}" are literal characters in Redis's glob
+        matching (only *, ?, [seq] are special), not wildcards.
+        """
+        if get_key_schema_version() == "v2":
+            return f"{cls.V2_PREFIX}registry:worker:{{*}}:{v2_field}"
+        return f"{v1_prefix}*"
+
+    @classmethod
+    def _worker_id_from_scanned_key(
+        cls, key: str, v1_prefix: str, v2_field: str
+    ) -> Optional[str]:
+        """Extract worker_id from a key returned by scanning with the
+        pattern from _worker_scan_pattern(v1_prefix, v2_field)."""
+        if get_key_schema_version() == "v2":
+            prefix = f"{cls.V2_PREFIX}registry:worker:{{"
+            suffix = f"}}:{v2_field}"
+            if key.startswith(prefix) and key.endswith(suffix):
+                return key[len(prefix) : -len(suffix)]
+            return None
+        if key.startswith(v1_prefix):
+            return key[len(v1_prefix) :]
+        return None
 
     # --- Queues and Streams ---
     @classmethod
@@ -319,6 +351,20 @@ class RedisKeys:
         )
 
     @classmethod
+    def worker_online_lease_scan_pattern(cls) -> str:
+        """SCAN MATCH glob pattern matching every worker_online_lease key."""
+        return cls._worker_scan_pattern(
+            "byai_gateway:registry:worker:online:", "online"
+        )
+
+    @classmethod
+    def worker_id_from_online_lease_key(cls, key: str) -> Optional[str]:
+        """Extract worker_id from a key found via worker_online_lease_scan_pattern()."""
+        return cls._worker_id_from_scanned_key(
+            key, "byai_gateway:registry:worker:online:", "online"
+        )
+
+    @classmethod
     def worker_status(cls, worker_id: str) -> str:
         """HASH storing aggregate execution counters for a Worker."""
         return cls._versioned(
@@ -377,6 +423,18 @@ class RedisKeys:
         return cls._versioned(
             v1_key=f"byai_gateway:registry:worker:admin:{worker_id}",
             v2_suffix=f"registry:worker:{{{worker_id}}}:admin",
+        )
+
+    @classmethod
+    def worker_admin_scan_pattern(cls) -> str:
+        """SCAN MATCH glob pattern matching every worker_admin key."""
+        return cls._worker_scan_pattern("byai_gateway:registry:worker:admin:", "admin")
+
+    @classmethod
+    def worker_id_from_admin_key(cls, key: str) -> Optional[str]:
+        """Extract worker_id from a key found via worker_admin_scan_pattern()."""
+        return cls._worker_id_from_scanned_key(
+            key, "byai_gateway:registry:worker:admin:", "admin"
         )
 
     @classmethod

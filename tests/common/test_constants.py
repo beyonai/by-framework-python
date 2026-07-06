@@ -2,6 +2,7 @@
 Tests for by_framework.common.constants module.
 """
 
+import fnmatch
 import os
 import unittest
 
@@ -24,6 +25,48 @@ class _KeySchemaVersionTestCase(unittest.TestCase):
 
     def set_schema_version(self, version: str) -> None:
         os.environ["REDIS_KEY_SCHEMA_VERSION"] = version
+
+
+class TestRedisKeysWorkerScanPatterns(_KeySchemaVersionTestCase):
+    """Tests for the SCAN-based worker discovery helpers under v1/v2.
+
+    Redis's SCAN/KEYS MATCH glob only treats `*`, `?`, `[seq]` as special —
+    `{`/`}` are literal characters, same as Python's fnmatch semantics used
+    here as a faithful proxy for "would Redis actually match this pattern"
+    without needing a real server.
+    """
+
+    def test_online_lease_scan_pattern_matches_a_real_v1_key(self):
+        self.set_schema_version("v1")
+        real_key = RedisKeys.worker_online_lease("worker-online")
+        pattern = RedisKeys.worker_online_lease_scan_pattern()
+        self.assertTrue(fnmatch.fnmatchcase(real_key, pattern))
+        self.assertEqual(
+            RedisKeys.worker_id_from_online_lease_key(real_key), "worker-online"
+        )
+
+    def test_online_lease_scan_pattern_matches_a_real_v2_key(self):
+        self.set_schema_version("v2")
+        real_key = RedisKeys.worker_online_lease("worker-online")
+        pattern = RedisKeys.worker_online_lease_scan_pattern()
+        self.assertTrue(fnmatch.fnmatchcase(real_key, pattern))
+        self.assertEqual(
+            RedisKeys.worker_id_from_online_lease_key(real_key), "worker-online"
+        )
+
+    def test_admin_scan_pattern_matches_a_real_v1_key(self):
+        self.set_schema_version("v1")
+        real_key = RedisKeys.worker_admin("worker-scanned")
+        pattern = RedisKeys.worker_admin_scan_pattern()
+        self.assertTrue(fnmatch.fnmatchcase(real_key, pattern))
+        self.assertEqual(RedisKeys.worker_id_from_admin_key(real_key), "worker-scanned")
+
+    def test_admin_scan_pattern_matches_a_real_v2_key(self):
+        self.set_schema_version("v2")
+        real_key = RedisKeys.worker_admin("worker-scanned")
+        pattern = RedisKeys.worker_admin_scan_pattern()
+        self.assertTrue(fnmatch.fnmatchcase(real_key, pattern))
+        self.assertEqual(RedisKeys.worker_id_from_admin_key(real_key), "worker-scanned")
 
 
 class TestRedisKeysSameEntityWorkerGroupVersioning(_KeySchemaVersionTestCase):

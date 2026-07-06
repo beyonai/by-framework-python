@@ -83,6 +83,31 @@ class TestRedisClient(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(kwargs["host"], "redis.example.com")
             self.assertEqual(kwargs["port"], 6380)
 
+    async def test_init_redis_config_none_max_conns_keeps_explicit_kwarg(
+        self,
+    ):
+        """An explicitly-passed max_connections kwarg must win when
+        config.max_connections is None ("not specified"), not be silently
+        discarded — this is what worker/app.py's cluster branch relies on
+        to scale the connection pool with max_concurrency."""
+        with patch("by_framework.common.redis_client.Redis") as mock_redis_cls:
+            init_redis(config=RedisConfig(max_connections=None), max_connections=60)
+
+            _, kwargs = mock_redis_cls.call_args
+            self.assertEqual(kwargs["max_connections"], 60)
+
+    async def test_init_redis_config_max_connections_set_still_wins_over_explicit_kwarg(
+        self,
+    ):
+        """When config.max_connections IS explicitly set, it still takes
+        precedence over a separately-passed max_connections kwarg (config
+        represents the caller's fuller intent when both are given)."""
+        with patch("by_framework.common.redis_client.Redis") as mock_redis_cls:
+            init_redis(config=RedisConfig(max_connections=100), max_connections=60)
+
+            _, kwargs = mock_redis_cls.call_args
+            self.assertEqual(kwargs["max_connections"], 100)
+
     async def test_init_redis_singleton(self):
         """Verify that init_redis returns a singleton."""
         with patch("by_framework.common.redis_client.Redis") as mock_redis_cls:

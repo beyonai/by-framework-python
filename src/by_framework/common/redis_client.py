@@ -52,7 +52,11 @@ def init_redis(
             password = config.password or None
             username = config.username
             decode_responses = config.decode_responses
-            max_connections = config.max_connections
+            # config.max_connections of None means "not specified" - don't
+            # let it silently discard an explicitly-passed max_connections
+            # kwarg (e.g. worker/app.py's max_concurrency-derived value).
+            if config.max_connections is not None:
+                max_connections = config.max_connections
 
             if config.mode == "cluster" and get_key_schema_version() != "v2":
                 raise RedisConnectionError(

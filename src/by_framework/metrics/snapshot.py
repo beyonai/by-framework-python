@@ -8,7 +8,7 @@ import asyncio
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from by_framework.common.constants import RedisKeys
 from by_framework.common.logger import logger
@@ -1201,10 +1201,13 @@ async def _get_observable_workers(
     }
 
 
-async def _cluster_aware_scan_ids_by_prefix(
-    redis: Redis, prefix: str, scan_limit: int
+async def _cluster_aware_scan_ids(
+    redis: Redis,
+    pattern: str,
+    parse_id: Callable[[str], Optional[str]],
+    scan_limit: int,
 ) -> tuple[list[str], bool]:
-    """Enumerate key-name suffixes matching `{prefix}*` via SCAN.
+    """Enumerate IDs matching `pattern` via SCAN, extracted with `parse_id`.
 
     SCAN is a single-node command in standalone Redis, but
     `redis.asyncio.cluster.RedisCluster.scan_iter()` (verified against the
@@ -1214,10 +1217,15 @@ async def _cluster_aware_scan_ids_by_prefix(
     and every by-framework-supported client (standalone or cluster)
     provides it.
 
+    `pattern`/`parse_id` must come from a matching pair of RedisKeys
+    methods (e.g. `worker_online_lease_scan_pattern`/
+    `worker_id_from_online_lease_key`) — a bare prefix + str.startswith
+    doesn't work under v2, since the ID is wrapped in a Cluster hash tag
+    in the middle of the key, not appended at the end.
+
     Used by all metrics/snapshot.py code that needs to enumerate Redis
-    keys by prefix, instead of each call site reimplementing this.
+    keys by pattern, instead of each call site reimplementing this.
     """
-    pattern = f"{prefix}*"
     limit = max(scan_limit, 0)
     ids: list[str] = []
     scan_iter = getattr(redis, "scan_iter", None)
@@ -1226,8 +1234,9 @@ async def _cluster_aware_scan_ids_by_prefix(
 
     async for key in scan_iter(match=pattern, count=max(limit or 100, 100)):
         key_text = key.decode("utf-8") if isinstance(key, bytes) else str(key)
-        if key_text.startswith(prefix):
-            ids.append(key_text.removeprefix(prefix))
+        parsed_id = parse_id(key_text)
+        if parsed_id is not None:
+            ids.append(parsed_id)
         if limit and len(ids) >= limit:
             break
     return sorted(set(ids)), True
@@ -1236,8 +1245,11 @@ async def _cluster_aware_scan_ids_by_prefix(
 async def _scan_online_worker_ids(
     redis: Redis, scan_limit: int
 ) -> tuple[list[str], bool]:
-    return await _cluster_aware_scan_ids_by_prefix(
-        redis, RedisKeys.worker_online_lease(""), scan_limit
+    return await _cluster_aware_scan_ids(
+        redis,
+        RedisKeys.worker_online_lease_scan_pattern(),
+        RedisKeys.worker_id_from_online_lease_key,
+        scan_limit,
     )
 
 
@@ -1251,8 +1263,11 @@ async def _get_admin_managed_worker_ids(
         item.decode("utf-8") if isinstance(item, bytes) else str(item)
         for item in indexed_raw
     }
-    scanned_ids, scan_supported = await _cluster_aware_scan_ids_by_prefix(
-        redis, RedisKeys.worker_admin(""), scan_limit
+    scanned_ids, scan_supported = await _cluster_aware_scan_ids(
+        redis,
+        RedisKeys.worker_admin_scan_pattern(),
+        RedisKeys.worker_id_from_admin_key,
+        scan_limit,
     )
     worker_ids = sorted(indexed_ids | set(scanned_ids))
     limited_ids = worker_ids[: max(scan_limit, 0)] if scan_limit else worker_ids
