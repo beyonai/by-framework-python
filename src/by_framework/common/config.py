@@ -6,7 +6,7 @@ Provides typed configuration loaded from environment variables.
 
 import os
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
 
 from by_framework.common.constants import RedisKeys
 
@@ -22,6 +22,10 @@ class RedisConfig:
     username: Optional[str] = None
     decode_responses: bool = True
     max_connections: Optional[int] = None
+    mode: Literal["standalone", "cluster"] = "standalone"
+    cluster_nodes: Optional[list[tuple[str, int]]] = None
+    socket_connect_timeout: int = 5
+    socket_timeout: int = 10
 
     @classmethod
     def from_env(cls) -> "RedisConfig":
@@ -29,6 +33,14 @@ class RedisConfig:
         password = os.environ.get("REDIS_PASSWORD", "")
         username = os.environ.get("REDIS_USERNAME") or None
         max_connections = os.environ.get("REDIS_MAX_CONNECTIONS")
+        mode = os.environ.get("REDIS_MODE", "standalone")
+        cluster_nodes_str = os.environ.get("REDIS_CLUSTER_NODES")
+        cluster_nodes = None
+        if cluster_nodes_str:
+            cluster_nodes = []
+            for node in cluster_nodes_str.split(","):
+                node_host, node_port = node.rsplit(":", 1)
+                cluster_nodes.append((node_host, int(node_port)))
         return cls(
             host=os.environ.get("REDIS_HOST", "localhost"),
             port=int(os.environ.get("REDIS_PORT", "6379")),
@@ -36,6 +48,8 @@ class RedisConfig:
             password=password,
             username=username,
             max_connections=int(max_connections) if max_connections else None,
+            mode=mode,
+            cluster_nodes=cluster_nodes,
         )
 
 

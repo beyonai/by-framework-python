@@ -6,7 +6,10 @@ Provides singleton Redis client initialization and management.
 from typing import Optional
 
 from redis.asyncio import Redis
+from redis.asyncio.cluster import ClusterNode, RedisCluster
 
+from .config import RedisConfig
+from .constants import get_key_schema_version
 from .exceptions import RedisConnectionError, StreamGroupExistsError
 
 _redis_client: Optional[Redis] = None
@@ -22,6 +25,7 @@ def _handle_redis_error(e: Exception, operation: str = "Redis operation") -> Exc
 
 
 def init_redis(
+    config: Optional[RedisConfig] = None,
     host: str = "localhost",
     port: int = 6379,
     db: int = 0,
@@ -35,22 +39,54 @@ def init_redis(
 
     If already initialized and you don't want to recreate, it will be
     reused directly (can re-init after close_redis()).
+
+    A RedisConfig can be passed via `config` instead of individual kwargs;
+    when provided, its fields take precedence over the individual params.
     """
     global _redis_client
     if _redis_client is None:
+        if config is not None:
+            host = config.host
+            port = config.port
+            db = config.db
+            password = config.password or None
+            username = config.username
+            decode_responses = config.decode_responses
+            max_connections = config.max_connections
+
+            if config.mode == "cluster" and get_key_schema_version() != "v2":
+                raise RedisConnectionError(
+                    "REDIS_MODE=cluster requires REDIS_KEY_SCHEMA_VERSION=v2 "
+                    "(v1 key format has no hash tags and will hit CROSSSLOT "
+                    "errors under Cluster). Set REDIS_KEY_SCHEMA_VERSION=v2 "
+                    "and complete the key migration first."
+                )
+
         if max_connections is not None:
             kwargs["max_connections"] = max_connections
 
         try:
-            _redis_client = Redis(
-                host=host,
-                port=port,
-                db=db,
-                password=password,
-                username=username,
-                decode_responses=decode_responses,
-                **kwargs,
-            )
+            if config is not None and config.mode == "cluster":
+                _redis_client = RedisCluster(
+                    startup_nodes=[
+                        ClusterNode(node_host, node_port)
+                        for node_host, node_port in (config.cluster_nodes or [])
+                    ],
+                    password=password,
+                    username=username,
+                    decode_responses=decode_responses,
+                    **kwargs,
+                )
+            else:
+                _redis_client = Redis(
+                    host=host,
+                    port=port,
+                    db=db,
+                    password=password,
+                    username=username,
+                    decode_responses=decode_responses,
+                    **kwargs,
+                )
         except Exception as e:
             raise RedisConnectionError(f"Failed to initialize Redis client: {e}") from e
     return _redis_client
