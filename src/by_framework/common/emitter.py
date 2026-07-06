@@ -36,6 +36,8 @@ class DataLayoutBuilder(Protocol):
         tool_responses: Optional[List[Dict[str, Any]]] = None,
         order_id: Optional[str] = None,
         parent_order_id: Optional[str] = None,
+        object_type: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build the event data payload."""
         raise NotImplementedError
@@ -66,6 +68,8 @@ class DefaultSseLayoutBuilder(DataLayoutBuilder):
         tool_responses: Optional[List[Dict[str, Any]]] = None,
         order_id: Optional[str] = None,
         parent_order_id: Optional[str] = None,
+        object_type: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build deep structure compatible with native BaiYingChatCompletion."""
         return {
@@ -77,6 +81,8 @@ class DefaultSseLayoutBuilder(DataLayoutBuilder):
             "agentId": source_agent_type if source_agent_type else None,
             "orderId": order_id,
             "parentOrderId": parent_order_id,
+            "objectType": object_type,
+            "status": status,
             "choices": [
                 {
                     "index": 0,
@@ -192,6 +198,8 @@ class GatewayDataEmitter:
         parent_message_id: str = "",
         event_type: Optional[str] = None,
         content_type: Optional[str] = None,
+        object_type: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> None:
         """Emit a stream chunk event."""
         if isinstance(event, str):
@@ -214,6 +222,8 @@ class GatewayDataEmitter:
                 tool_responses=event.tool_responses,
                 order_id=message_id,
                 parent_order_id=parent_message_id,
+                object_type=object_type,
+                status=status,
             ),
             metadata=event.metadata,
         )

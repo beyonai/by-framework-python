@@ -321,6 +321,8 @@ class AgentContext:
         content_type: Optional[str] = None,
         message_id: Optional[str] = None,
         parent_message_id: Optional[str] = None,
+        object_type: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> None:
         """Emit a streaming chunk event.
 
@@ -378,6 +380,8 @@ class AgentContext:
             parent_message_id=emitted_parent_message_id,
             event_type=event_type,
             content_type=content_type,
+            object_type=object_type,
+            status=status,
         )
 
         # 3. If it's a stream end marker, trigger persistence to history
