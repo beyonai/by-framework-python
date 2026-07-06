@@ -3,10 +3,12 @@
 import asyncio
 import inspect
 import pkgutil
+from dataclasses import replace
 from importlib import import_module
 from types import ModuleType
-from typing import Awaitable, Callable, List, Optional, Type, Union
+from typing import (Awaitable, Callable, List, Literal, Optional, Tuple, Type, Union)
 
+from by_framework.common.config import RedisConfig
 from by_framework.common.emitter import DataLayoutBuilder
 from by_framework.common.logger import logger
 from by_framework.common.redis_client import close_redis, init_redis
@@ -84,9 +86,9 @@ def _build_auto_trace_plugin() -> Plugin | None:
 async def _run_worker_async(
     worker_class: Type[GatewayWorker],
     worker_id: str,
-    redis_host: str,
-    redis_port: int,
-    redis_db: int,
+    redis_host: Optional[str],
+    redis_port: Optional[int],
+    redis_db: Optional[int],
     redis_password: Optional[str],
     redis_username: Optional[str],
     workspace_dir: str,
@@ -104,6 +106,8 @@ async def _run_worker_async(
     plugin_dir: Optional[str] = None,
     storage: Optional[FileStorage] = None,
     layout_builder: Optional[DataLayoutBuilder] = None,
+    redis_mode: Optional[Literal["standalone", "cluster"]] = None,
+    redis_cluster_nodes: Optional[List[Tuple[str, int]]] = None,
     **worker_kwargs,
 ):
     """Async worker runner initialization."""
@@ -121,27 +125,37 @@ async def _run_worker_async(
             # Default auto-link: concurrency + 10 management connections
             actual_redis_max_conns = max_concurrency + 10
 
-    # 2. Establish Redis connection (must be inside event loop)
-    from by_framework.common.config import RedisConfig as SDKRedisConfig
-
-    env_config = SDKRedisConfig.from_env()
-    if env_config.mode == "cluster":
-        redis_client = init_redis(
-            config=env_config,
-            max_connections=actual_redis_max_conns,
-        )
+    # 2. Establish Redis connection (must be inside event loop). Explicit
+    # args always take precedence over env vars, for every field, in both
+    # standalone and cluster mode - one unified resolution path so third
+    # parties can configure either mode purely programmatically or purely
+    # via env vars, without the two modes behaving inconsistently.
+    env_config = RedisConfig.from_env()
+    effective_config = replace(
+        env_config,
+        host=redis_host if redis_host is not None else env_config.host,
+        port=redis_port if redis_port is not None else env_config.port,
+        db=redis_db if redis_db is not None else env_config.db,
+        password=(
+            redis_password if redis_password is not None else env_config.password
+        ),
+        username=(
+            redis_username if redis_username is not None else env_config.username
+        ),
+        mode=redis_mode if redis_mode is not None else env_config.mode,
+        cluster_nodes=(
+            redis_cluster_nodes
+            if redis_cluster_nodes is not None
+            else env_config.cluster_nodes
+        ),
+    )
+    redis_client = init_redis(
+        config=effective_config, max_connections=actual_redis_max_conns
+    )
+    if effective_config.mode == "cluster":
         logger.info(
             "Worker Redis initialized in Cluster mode (nodes=%s)",
-            env_config.cluster_nodes,
-        )
-    else:
-        redis_client = init_redis(
-            host=redis_host,
-            port=redis_port,
-            db=redis_db,
-            password=redis_password,
-            username=redis_username,
-            max_connections=actual_redis_max_conns,
+            effective_config.cluster_nodes,
         )
 
     # 2.1 Configure history message storage backend
@@ -231,9 +245,9 @@ async def _run_worker_async(
 def run_worker(
     worker_class: Type[GatewayWorker],
     worker_id: str = "worker-1",
-    redis_host: str = "localhost",
-    redis_port: int = 6379,
-    redis_db: int = 0,
+    redis_host: Optional[str] = None,
+    redis_port: Optional[int] = None,
+    redis_db: Optional[int] = None,
     redis_password: Optional[str] = None,
     redis_username: Optional[str] = None,
     workspace_dir: str = "/tmp/gateway-workspace",
@@ -251,11 +265,24 @@ def run_worker(
     plugin_dir: Optional[str] = None,
     storage: Optional[FileStorage] = None,
     layout_builder: Optional[DataLayoutBuilder] = None,
+    redis_mode: Optional[Literal["standalone", "cluster"]] = None,
+    redis_cluster_nodes: Optional[List[Tuple[str, int]]] = None,
     **worker_kwargs,
 ):
     """
     Quick entry point for starting By-Framework Worker, for direct use by
     third-party businesses.
+
+    Redis configuration: every redis_* argument defaults to None, meaning
+    "not specified" - when not passed, the value is read from the
+    corresponding REDIS_* environment variable (REDIS_HOST, REDIS_PORT,
+    REDIS_DB, REDIS_PASSWORD, REDIS_USERNAME, REDIS_MODE,
+    REDIS_CLUSTER_NODES), falling back to "localhost"/6379/standalone if
+    neither is set. An explicitly-passed argument always takes precedence
+    over its env var, for every field, in both standalone and cluster mode
+    - so either mode can be configured purely programmatically (e.g.
+    ``redis_mode="cluster", redis_cluster_nodes=[("h1", 6379)]``) or purely
+    via env vars, without the two modes behaving inconsistently.
 
     Plugin support:
     - **Auto mode**: System automatically discovers and loads all subclasses
@@ -299,6 +326,8 @@ def run_worker(
                 plugin_dir=plugin_dir,
                 storage=storage,
                 layout_builder=layout_builder,
+                redis_mode=redis_mode,
+                redis_cluster_nodes=redis_cluster_nodes,
                 **worker_kwargs,
             )
         )
