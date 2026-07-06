@@ -1,6 +1,9 @@
+import os
 import unittest
 from unittest.mock import patch
 
+from by_framework.common.config import RedisConfig
+from by_framework.common.exceptions import RedisConnectionError
 from by_framework.common.redis_client import close_redis, get_redis, init_redis
 
 
@@ -12,6 +15,73 @@ class TestRedisClient(unittest.IsolatedAsyncioTestCase):
 
         if rc._redis_client is not None:
             rc._redis_client = None
+
+    async def test_init_redis_cluster_mode_requires_v2_schema(self):
+        """Cluster mode with the default (v1) key schema must fail fast,
+        synchronously, without constructing any client."""
+        old_value = os.environ.get("REDIS_KEY_SCHEMA_VERSION")
+        os.environ.pop("REDIS_KEY_SCHEMA_VERSION", None)
+        try:
+            with (
+                patch("by_framework.common.redis_client.Redis") as mock_redis_cls,
+                patch(
+                    "by_framework.common.redis_client.RedisCluster"
+                ) as mock_cluster_cls,
+            ):
+                with self.assertRaises(RedisConnectionError):
+                    init_redis(
+                        config=RedisConfig(
+                            mode="cluster",
+                            cluster_nodes=[("unreachable-host", 6379)],
+                        )
+                    )
+                mock_redis_cls.assert_not_called()
+                mock_cluster_cls.assert_not_called()
+        finally:
+            if old_value is not None:
+                os.environ["REDIS_KEY_SCHEMA_VERSION"] = old_value
+            else:
+                os.environ.pop("REDIS_KEY_SCHEMA_VERSION", None)
+
+    async def test_init_redis_cluster_mode_with_v2_schema_builds_cluster_client(self):
+        """Cluster mode + v2 schema constructs RedisCluster, not standalone Redis."""
+        old_value = os.environ.get("REDIS_KEY_SCHEMA_VERSION")
+        os.environ["REDIS_KEY_SCHEMA_VERSION"] = "v2"
+        try:
+            with (
+                patch("by_framework.common.redis_client.Redis") as mock_redis_cls,
+                patch(
+                    "by_framework.common.redis_client.RedisCluster"
+                ) as mock_cluster_cls,
+            ):
+                init_redis(
+                    config=RedisConfig(
+                        mode="cluster",
+                        cluster_nodes=[("h1", 6379), ("h2", 6380)],
+                    )
+                )
+
+                mock_redis_cls.assert_not_called()
+                mock_cluster_cls.assert_called_once()
+                _, kwargs = mock_cluster_cls.call_args
+                self.assertEqual(
+                    [(n.host, n.port) for n in kwargs["startup_nodes"]],
+                    [("h1", 6379), ("h2", 6380)],
+                )
+        finally:
+            if old_value is not None:
+                os.environ["REDIS_KEY_SCHEMA_VERSION"] = old_value
+            else:
+                os.environ.pop("REDIS_KEY_SCHEMA_VERSION", None)
+
+    async def test_init_redis_from_config_standalone(self):
+        """Verify that a standalone RedisConfig builds the standalone client."""
+        with patch("by_framework.common.redis_client.Redis") as mock_redis_cls:
+            init_redis(config=RedisConfig(host="redis.example.com", port=6380))
+
+            args, kwargs = mock_redis_cls.call_args
+            self.assertEqual(kwargs["host"], "redis.example.com")
+            self.assertEqual(kwargs["port"], 6380)
 
     async def test_init_redis_singleton(self):
         """Verify that init_redis returns a singleton."""

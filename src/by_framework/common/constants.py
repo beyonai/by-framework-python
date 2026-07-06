@@ -5,6 +5,22 @@ All Redis Stream names, Hash Keys, Set Keys and other configuration items
 are centrally managed in this file. Do not hardcode literal strings in business code.
 """
 
+import os
+
+
+def get_key_schema_version() -> str:
+    """Return the configured Redis key schema version ("v1" or "v2").
+
+    Controlled by REDIS_KEY_SCHEMA_VERSION, defaulting to "v1" (the current
+    unprefixed key format). Cluster mode requires "v2" (see redis_client.init_redis).
+    """
+    version = os.environ.get("REDIS_KEY_SCHEMA_VERSION", "v1")
+    if version not in ("v1", "v2"):
+        raise ValueError(
+            f"Invalid REDIS_KEY_SCHEMA_VERSION: {version!r} (must be 'v1' or 'v2')"
+        )
+    return version
+
 
 class RedisKeys:
     """Gateway SDK global Redis Key naming conventions and constants."""

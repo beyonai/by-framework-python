@@ -29,6 +29,14 @@ class TestRedisConfig(unittest.TestCase):
         self.assertTrue(config.decode_responses)
         self.assertIsNone(config.max_connections)
 
+    def test_cluster_fields_defaults(self):
+        """Test that cluster-mode fields default to standalone-safe values."""
+        config = RedisConfig()
+        self.assertEqual(config.mode, "standalone")
+        self.assertIsNone(config.cluster_nodes)
+        self.assertEqual(config.socket_connect_timeout, 5)
+        self.assertEqual(config.socket_timeout, 10)
+
     def test_frozen_immutability(self):
         """Test that frozen dataclass is immutable."""
         config = RedisConfig()
@@ -59,6 +67,39 @@ class TestRedisConfig(unittest.TestCase):
             for k, v in old_values.items():
                 if v is not None:
                     os.environ[k] = v
+
+    def test_from_env_parses_mode(self):
+        """Test that from_env reads REDIS_MODE, defaulting to standalone."""
+        old_value = os.environ.get("REDIS_MODE")
+        try:
+            os.environ.pop("REDIS_MODE", None)
+            self.assertEqual(RedisConfig.from_env().mode, "standalone")
+
+            os.environ["REDIS_MODE"] = "cluster"
+            self.assertEqual(RedisConfig.from_env().mode, "cluster")
+        finally:
+            if old_value is not None:
+                os.environ["REDIS_MODE"] = old_value
+            else:
+                os.environ.pop("REDIS_MODE", None)
+
+    def test_from_env_parses_cluster_nodes(self):
+        """Test that from_env parses REDIS_CLUSTER_NODES into (host, port) tuples."""
+        old_value = os.environ.get("REDIS_CLUSTER_NODES")
+        try:
+            os.environ.pop("REDIS_CLUSTER_NODES", None)
+            self.assertIsNone(RedisConfig.from_env().cluster_nodes)
+
+            os.environ["REDIS_CLUSTER_NODES"] = "h1:6379,h2:6380"
+            self.assertEqual(
+                RedisConfig.from_env().cluster_nodes,
+                [("h1", 6379), ("h2", 6380)],
+            )
+        finally:
+            if old_value is not None:
+                os.environ["REDIS_CLUSTER_NODES"] = old_value
+            else:
+                os.environ.pop("REDIS_CLUSTER_NODES", None)
 
     def test_from_env_with_custom_values(self):
         """Test from_env with custom environment variables."""
