@@ -1,6 +1,8 @@
 """Tests for observability dashboard snapshots."""
 
 import asyncio
+import fnmatch
+from unittest.mock import patch
 
 import pytest
 
@@ -550,6 +552,57 @@ async def test_worker_snapshot_discovers_admin_worker_via_scan():
     assert snapshot["worker_scan"]["admin"]["source"] == "admin_index_and_scan"
     summaries = {worker["worker_id"]: worker for worker in snapshot["workers"]}
     assert summaries["worker-scanned"]["lifecycle"] == "suspended"
+
+
+class _FnmatchScanRedis(StreamAwareRedis):
+    """StreamAwareRedis variant whose scan_iter actually respects the MATCH
+    glob pattern (like real Redis SCAN), instead of ignoring it and always
+    yielding a hardcoded key. Needed to catch bugs in the scan pattern
+    itself, not just in client-side key parsing."""
+
+    async def scan_iter(self, match=None, count=None):
+        del count
+        for key in set(self.kv.keys()) | set(self.data.keys()):
+            if match is None or fnmatch.fnmatchcase(key, match):
+                yield key
+
+
+@pytest.mark.asyncio
+async def test_worker_snapshot_discovers_online_worker_via_scan_under_v2():
+    """Regression: the online-lease scan pattern must actually match real
+    v2-format keys (worker_id wrapped in a Cluster hash tag), both as a
+    SCAN MATCH glob and for client-side worker_id extraction — not just
+    happen to work under the default v1 schema."""
+    with patch.dict("os.environ", {"REDIS_KEY_SCHEMA_VERSION": "v2"}, clear=False):
+        redis = _FnmatchScanRedis()
+        registry = WorkerRegistry(redis)
+        await registry.register_worker_membership("worker-online", ["planner"])
+        await registry.heartbeat_worker("worker-online")
+
+        snapshot = await build_worker_observability_snapshot(redis)
+
+    assert snapshot["worker_scan"]["source"] == "online_lease_scan"
+    assert snapshot["workers"][0]["worker_id"] == "worker-online"
+
+
+@pytest.mark.asyncio
+async def test_worker_snapshot_discovers_admin_worker_via_scan_under_v2():
+    """Same regression, for the admin-worker scan path. Writes the
+    worker_admin hash directly (bypassing the admin_workers() index) so
+    this test only passes if scan discovery itself actually works."""
+    with patch.dict("os.environ", {"REDIS_KEY_SCHEMA_VERSION": "v2"}, clear=False):
+        redis = _FnmatchScanRedis()
+        await redis.hset(
+            RedisKeys.worker_admin("worker-scanned-v2"),
+            mapping={"lifecycle": "suspended", "reason": "scanned"},
+        )
+
+        snapshot = await build_worker_observability_snapshot(redis)
+
+    assert snapshot["worker_scan"]["admin"]["source"] == "admin_index_and_scan"
+    assert snapshot["worker_scan"]["admin"]["scanned_workers"] >= 1
+    summaries = {worker["worker_id"]: worker for worker in snapshot["workers"]}
+    assert summaries["worker-scanned-v2"]["lifecycle"] == "suspended"
 
 
 @pytest.mark.asyncio
