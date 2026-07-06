@@ -1299,8 +1299,20 @@ class WorkerRegistry:
         pipe.hset(key, "lifecycle", lifecycle)
         pipe.hset(key, "reason", reason)
         pipe.hset(key, "updated_at", now)
-        pipe.sadd(RedisKeys.admin_workers(), worker_id)
         await pipe.execute()
+        # admin_workers() is a global index spanning every worker entity, so it
+        # can't share a Cluster hash tag with worker_admin(id) — write it as a
+        # separate, best-effort call. worker_admin(id) is the source of truth
+        # for reads; a transient index-write failure only affects the
+        # dashboard's "list all admin-controlled workers" view.
+        try:
+            await self.redis.sadd(RedisKeys.admin_workers(), worker_id)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "set_worker_admin_state: admin_workers index update failed for %s",
+                worker_id,
+                exc_info=True,
+            )
 
     async def get_worker_admin_state(self, worker_id: str) -> dict[str, Any]:
         """Return the admin-controlled state for a worker.
@@ -1325,10 +1337,15 @@ class WorkerRegistry:
 
     async def clear_worker_admin_state(self, worker_id: str) -> None:
         """Remove the admin lifecycle key, restoring default-active behaviour."""
-        pipe = self.redis.pipeline()
-        pipe.delete(RedisKeys.worker_admin(worker_id))
-        pipe.srem(RedisKeys.admin_workers(), worker_id)
-        await pipe.execute()
+        await self.redis.delete(RedisKeys.worker_admin(worker_id))
+        try:
+            await self.redis.srem(RedisKeys.admin_workers(), worker_id)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "clear_worker_admin_state: admin_workers index update failed for %s",
+                worker_id,
+                exc_info=True,
+            )
 
     async def remove_worker_from_type_members(self, worker_id: str) -> None:
         """SREM worker_id from every agent_type:members set it currently belongs to.

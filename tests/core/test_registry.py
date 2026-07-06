@@ -1137,3 +1137,50 @@ async def test_is_worker_online():
     # Unknown worker should not be online
     is_online = await registry.is_worker_online("unknown_worker")
     assert is_online is False
+
+
+class _AdminIndexFailingRedis(MockRedis):
+    """MockRedis variant whose sadd/srem fail only for the admin_workers()
+    index, to verify the worker_admin(id) key is independent of it."""
+
+    async def sadd(self, name, value):
+        if name == RedisKeys.admin_workers():
+            raise ConnectionError("simulated admin_workers index write failure")
+        return await super().sadd(name, value)
+
+    async def srem(self, name, value):
+        if name == RedisKeys.admin_workers():
+            raise ConnectionError("simulated admin_workers index write failure")
+        return await super().srem(name, value)
+
+
+@pytest.mark.asyncio
+async def test_set_worker_admin_state_survives_admin_workers_index_failure():
+    """The admin_workers() index write is best-effort: if it fails, the
+    per-worker worker_admin(id) hash (source of truth for reads) must still
+    have been written and be readable."""
+    redis_mock = _AdminIndexFailingRedis()
+    registry = WorkerRegistry(redis_mock)
+
+    await registry.set_worker_admin_state("worker-1", "suspended", reason="abuse")
+
+    state = await registry.get_worker_admin_state("worker-1")
+    assert state["lifecycle"] == "suspended"
+    assert state["reason"] == "abuse"
+
+
+@pytest.mark.asyncio
+async def test_clear_worker_admin_state_survives_admin_workers_index_failure():
+    """clear_worker_admin_state must delete the worker_admin(id) key even if
+    the best-effort admin_workers() index removal fails."""
+    redis_mock = _AdminIndexFailingRedis()
+    registry = WorkerRegistry(redis_mock)
+    redis_mock.data[RedisKeys.worker_admin("worker-1")] = {
+        "lifecycle": "suspended",
+        "reason": "abuse",
+    }
+
+    await registry.clear_worker_admin_state("worker-1")
+
+    state = await registry.get_worker_admin_state("worker-1")
+    assert state == {}
