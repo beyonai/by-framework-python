@@ -43,7 +43,13 @@ class TraceWriteClient:
         )
 
     async def record_trace(self, record: TraceRecord) -> None:
-        """Persist trace-level metadata and lookup indexes."""
+        """Persist trace-level metadata and lookup indexes.
+
+        trace_meta is written in its own atomic pipeline. The session/agent
+        lookup indexes are cross-entity relative to trace_meta, so they're
+        written as independent, best-effort calls afterward — a failure
+        there must not affect the trace_meta write that already landed.
+        """
         try:
             payload = record.to_dict()
             if not payload.get("trace_id"):
@@ -67,25 +73,25 @@ class TraceWriteClient:
                     int(payload.get("end_ts", start_ts) or start_ts),
                 )
             await self._call_pipeline(pipe, "expire", meta_key, self.ttl_seconds)
-            if payload.get("session_id"):
-                await self._index_trace(
-                    pipe,
-                    RedisKeys.trace_index_session(str(payload["session_id"])),
-                    trace_id,
-                    start_ts,
-                )
-            if payload.get("root_agent_type"):
-                await self._index_trace(
-                    pipe,
-                    RedisKeys.trace_index_agent(str(payload["root_agent_type"])),
-                    trace_id,
-                    start_ts,
-                )
             result = pipe.execute()
             if isawaitable(result):
                 await result
         except Exception as err:  # pylint: disable=broad-exception-caught
             logger.warning("TraceWriteClient.record_trace skipped: %s", err)
+            return
+
+        if payload.get("session_id"):
+            await self._index_trace(
+                RedisKeys.trace_index_session(str(payload["session_id"])),
+                trace_id,
+                start_ts,
+            )
+        if payload.get("root_agent_type"):
+            await self._index_trace(
+                RedisKeys.trace_index_agent(str(payload["root_agent_type"])),
+                trace_id,
+                start_ts,
+            )
 
     async def record_span(self, record: SpanRecord) -> None:
         """Persist a trace-tree span."""
@@ -144,11 +150,19 @@ class TraceWriteClient:
         except Exception as err:  # pylint: disable=broad-exception-caught
             logger.warning("TraceWriteClient.record_event skipped: %s", err)
 
-    async def _index_trace(
-        self, pipe: Any, index_key: str, trace_id: str, score: int
-    ) -> None:
-        await self._call_pipeline(pipe, "zadd", index_key, {trace_id: int(score or 0)})
-        await self._call_pipeline(pipe, "expire", index_key, self.ttl_seconds)
+    async def _index_trace(self, index_key: str, trace_id: str, score: int) -> None:
+        """Best-effort write to a trace lookup index (session/agent).
+
+        Cross-entity relative to trace_meta, so it's written independently;
+        failure here is logged and never propagated to the caller.
+        """
+        try:
+            await self.redis.zadd(index_key, {trace_id: int(score or 0)})
+            await self.redis.expire(index_key, self.ttl_seconds)
+        except Exception as err:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "TraceWriteClient: trace index write failed for %s: %s", index_key, err
+            )
 
     @staticmethod
     async def _call_pipeline(pipe: Any, method_name: str, *args: Any) -> None:

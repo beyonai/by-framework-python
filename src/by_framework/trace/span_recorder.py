@@ -426,6 +426,10 @@ class RedisSpanExporter:
             else 0
         )
         updated_at = max(existing_updated_at, end_ts)
+        # trace_meta/trace_spans share a Cluster hash tag (trace_id) since
+        # Phase 2a, so this group can stay atomic. The session/worker/agent
+        # indexes below are cross-entity relative to the trace group and are
+        # written as independent, best-effort calls instead.
         pipe = self.redis.pipeline()
         if isawaitable(pipe):
             pipe = await pipe
@@ -462,38 +466,49 @@ class RedisSpanExporter:
         await self._call_pipeline(
             pipe, "rpush", spans_key, json.dumps(payload, ensure_ascii=False)
         )
-        if payload.get("session_id"):
-            index_key = RedisKeys.trace_index_session(str(payload["session_id"]))
-            await self._call_pipeline(
-                pipe,
-                "zadd",
-                index_key,
-                {trace_id: start_ts},
-            )
-            await self._call_pipeline(pipe, "expire", index_key, self.ttl_seconds)
-        if payload.get("worker_id"):
-            index_key = RedisKeys.trace_index_worker(str(payload["worker_id"]))
-            await self._call_pipeline(
-                pipe,
-                "zadd",
-                index_key,
-                {trace_id: start_ts},
-            )
-            await self._call_pipeline(pipe, "expire", index_key, self.ttl_seconds)
-        if payload.get("target_agent_type"):
-            index_key = RedisKeys.trace_index_agent(str(payload["target_agent_type"]))
-            await self._call_pipeline(
-                pipe,
-                "zadd",
-                index_key,
-                {trace_id: start_ts},
-            )
-            await self._call_pipeline(pipe, "expire", index_key, self.ttl_seconds)
         await self._call_pipeline(pipe, "expire", meta_key, self.ttl_seconds)
         await self._call_pipeline(pipe, "expire", spans_key, self.ttl_seconds)
         result = pipe.execute()
         if isawaitable(result):
             await result
+
+        if payload.get("session_id"):
+            await self._write_trace_index(
+                RedisKeys.trace_index_session(str(payload["session_id"])),
+                trace_id,
+                start_ts,
+            )
+        if payload.get("worker_id"):
+            await self._write_trace_index(
+                RedisKeys.trace_index_worker(str(payload["worker_id"])),
+                trace_id,
+                start_ts,
+            )
+        if payload.get("target_agent_type"):
+            await self._write_trace_index(
+                RedisKeys.trace_index_agent(str(payload["target_agent_type"])),
+                trace_id,
+                start_ts,
+            )
+
+    async def _write_trace_index(
+        self, index_key: str, trace_id: str, score: int
+    ) -> None:
+        """Best-effort write to a trace lookup index (session/worker/agent).
+
+        Cross-entity relative to the trace group, so it's written
+        independently and its failure must not affect the trace_meta/
+        trace_spans write that already landed above.
+        """
+        try:
+            await self.redis.zadd(index_key, {trace_id: int(score or 0)})
+            await self.redis.expire(index_key, self.ttl_seconds)
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "RedisSpanExporter: trace index write failed for %s",
+                index_key,
+                exc_info=True,
+            )
 
     @staticmethod
     async def _call_pipeline(pipe: Any, method_name: str, *args: Any) -> None:

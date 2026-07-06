@@ -80,6 +80,50 @@ class SpanRedis:
         return MockPipeline(self)
 
 
+class _WorkerIndexFailingSpanRedis(SpanRedis):
+    """SpanRedis variant whose zadd fails only for the trace_index_worker
+    key, to verify the trace group (meta+spans) and the other cross-entity
+    indexes are independent best-effort writes."""
+
+    async def zadd(self, name, mapping):
+        if name == RedisKeys.trace_index_worker("worker-safe"):
+            raise ConnectionError("simulated trace_index_worker write failure")
+        return await super().zadd(name, mapping)
+
+
+@pytest.mark.asyncio
+async def test_export_span_survives_trace_index_worker_failure():
+    """trace_index_worker is a cross-entity index write, split apart from
+    the trace group's atomic meta+spans write. If it fails, trace_meta/
+    trace_spans must still be correctly readable by trace_id, and the
+    other (unrelated) indexes must still have been written."""
+    redis = _WorkerIndexFailingSpanRedis()
+    exporter = RedisSpanExporter(redis, ttl_seconds=321)
+
+    await exporter.export_span(
+        TraceSpan(
+            trace_id="trace-safe",
+            span_id="span-1",
+            parent_span_id="",
+            operation="client.dispatch",
+            component="client",
+            start_ts=100,
+            end_ts=150,
+            status="OK",
+            session_id="sess-safe",
+            worker_id="worker-safe",
+            target_agent_type="planner",
+        )
+    )
+
+    assert redis.data[RedisKeys.trace_meta("trace-safe")]["trace_id"] == "trace-safe"
+    assert redis.data[RedisKeys.trace_meta("trace-safe")]["status"] == "OK"
+    assert len(redis.data[RedisKeys.trace_spans("trace-safe")]) == 1
+    assert "trace-safe" in redis.data[RedisKeys.trace_index_session("sess-safe")]
+    assert "trace-safe" in redis.data[RedisKeys.trace_index_agent("planner")]
+    assert RedisKeys.trace_index_worker("worker-safe") not in redis.data
+
+
 @pytest.mark.asyncio
 async def test_redis_span_exporter_redacts_sensitive_metadata_and_expires_indexes():
     """Redis trace storage redacts secrets and applies TTL to lookup indexes."""
