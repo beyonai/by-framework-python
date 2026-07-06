@@ -529,6 +529,30 @@ async def test_split_worker_snapshot_prefers_online_lease_scan():
 
 
 @pytest.mark.asyncio
+async def test_worker_snapshot_discovers_admin_worker_via_scan():
+    """Admin-managed workers are discoverable via the cluster-aware scan
+    helper too, not only via the admin_workers() index set — exercising
+    the same scan_iter path _scan_online_worker_ids already uses."""
+    redis = StreamAwareRedis()
+
+    async def scan_iter(match=None, count=None):
+        del match, count
+        yield RedisKeys.worker_admin("worker-scanned")
+
+    redis.scan_iter = scan_iter
+    await redis.hset(
+        RedisKeys.worker_admin("worker-scanned"),
+        mapping={"lifecycle": "suspended", "reason": "scanned"},
+    )
+
+    snapshot = await build_worker_observability_snapshot(redis)
+
+    assert snapshot["worker_scan"]["admin"]["source"] == "admin_index_and_scan"
+    summaries = {worker["worker_id"]: worker for worker in snapshot["workers"]}
+    assert summaries["worker-scanned"]["lifecycle"] == "suspended"
+
+
+@pytest.mark.asyncio
 async def test_worker_snapshot_includes_offline_evicted_admin_worker():
     """Worker endpoint includes evicted workers even after online lease is gone."""
     redis = StreamAwareRedis()
@@ -546,6 +570,36 @@ async def test_worker_snapshot_includes_offline_evicted_admin_worker():
     assert worker["lifecycle_reason"] == "decommission"
     assert worker["last_seen"] == 0
     assert worker["agent_types"] == []
+
+
+@pytest.mark.asyncio
+async def test_worker_snapshot_survives_one_worker_admin_state_read_failure():
+    """A read failure for one worker's worker_admin(id) hash must not
+    prevent the other workers' admin states (or the whole snapshot) from
+    being returned. worker_admin(id) keys belong to different worker
+    entities, so batch-fetching them must not be one all-or-nothing
+    pipeline (a cross-entity CROSSSLOT hazard under Cluster) — each
+    worker's read is independent."""
+
+    class FailingAdminStateRedis(StreamAwareRedis):
+
+        async def hgetall(self, name):
+            if name == RedisKeys.worker_admin("worker-bad"):
+                raise ConnectionError("simulated worker_admin read failure")
+            return await super().hgetall(name)
+
+    redis = FailingAdminStateRedis()
+    registry = WorkerRegistry(redis)
+    await registry.set_worker_admin_state("worker-ok", "suspended", reason="test")
+    await registry.set_worker_admin_state("worker-bad", "suspended", reason="test")
+
+    snapshot = await build_worker_observability_snapshot(redis)
+
+    summaries = {worker["worker_id"]: worker for worker in snapshot["workers"]}
+    assert summaries["worker-ok"]["lifecycle"] == "suspended"
+    # worker-bad's read failed: falls back to the default "active" lifecycle
+    # rather than taking down the whole snapshot.
+    assert summaries["worker-bad"]["lifecycle"] == "active"
 
 
 @pytest.mark.asyncio
