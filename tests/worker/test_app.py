@@ -108,6 +108,46 @@ async def test_run_worker_async_flow():
 
 
 @pytest.mark.asyncio
+async def test_run_worker_async_initializes_cluster_client_when_mode_is_cluster():
+    """REDIS_MODE=cluster must route init_redis through config=, not the
+    individual host/port args, so REDIS_CLUSTER_NODES is actually honored."""
+    with (
+        patch.dict(
+            "os.environ",
+            {"REDIS_MODE": "cluster", "REDIS_CLUSTER_NODES": "h1:6379,h2:6380"},
+            clear=False,
+        ),
+        patch("by_framework.worker.app.init_redis") as mock_init_redis,
+        patch("by_framework.worker.app.close_redis", new_callable=AsyncMock),
+        patch("by_framework.worker.app.WorkerRegistry"),
+        patch("by_framework.worker.app.WorkspaceManager"),
+        patch("by_framework.worker.app.WorkerRunner") as mock_runner,
+    ):
+        mock_init_redis.return_value = MagicMock()
+        mock_runner.return_value.start = AsyncMock()
+
+        await _run_worker_async(
+            worker_class=MyTestWorker,
+            worker_id="test-w1",
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=0,
+            redis_password=None,
+            redis_username=None,
+            workspace_dir="/tmp/test-ws",
+            consumer_group="test-group",
+            max_concurrency=10,
+            fetch_count=5,
+        )
+
+        mock_init_redis.assert_called_once()
+        _, kwargs = mock_init_redis.call_args
+        assert "config" in kwargs
+        assert kwargs["config"].mode == "cluster"
+        assert kwargs["config"].cluster_nodes == [("h1", 6379), ("h2", 6380)]
+
+
+@pytest.mark.asyncio
 async def test_run_worker_async_attaches_layout_builder():
     """Verify _run_worker_async wires layout_builder onto the worker."""
     layout_builder = CustomLayoutBuilder()

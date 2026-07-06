@@ -6,6 +6,8 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock
 
+from redis.asyncio.cluster import ClusterNode, RedisCluster
+
 from by_framework.worker.heartbeat import WorkerHeartbeat
 
 
@@ -57,6 +59,33 @@ class TestWorkerHeartbeat(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(heartbeat.interval, 15)
         self.assertEqual(heartbeat.lease_ttl_seconds, 30)
         self.assertIsNone(heartbeat._task)
+
+    async def test_create_isolated_redis_clones_a_cluster_client(self):
+        """The heartbeat thread needs its own Redis connection, cloned from
+        the main client's connection parameters. Under Cluster mode, this
+        must return a fresh RedisCluster (not None, and not crash on
+        constructor-invalid kwargs like connection_class/response_callbacks
+        that RedisCluster.connection_kwargs carries but __init__ doesn't
+        accept)."""
+        cluster_redis = RedisCluster(
+            startup_nodes=[ClusterNode("h1", 6379), ClusterNode("h2", 6380)],
+            password="secret",
+            decode_responses=True,
+        )
+        mock_registry = MockRegistry()
+        heartbeat = WorkerHeartbeat(
+            worker_id="worker-1",
+            agent_types=["agent-a"],
+            redis_client=cluster_redis,
+            registry=mock_registry,
+        )
+
+        isolated = await heartbeat._create_isolated_redis()
+
+        self.assertIsInstance(isolated, RedisCluster)
+        self.assertIsNot(isolated, cluster_redis)
+        self.assertEqual(isolated.connection_kwargs.get("password"), "secret")
+        self.assertTrue(isolated.connection_kwargs.get("decode_responses"))
 
     async def test_start_initial_registration(self):
         """Test that start() performs initial registration."""
