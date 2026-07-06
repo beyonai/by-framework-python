@@ -108,6 +108,9 @@ class WorkerRunner:
         # Refreshed by the heartbeat thread every heartbeat interval.
         # Avoids per-iteration Redis SISMEMBER calls in the consume loop.
         self._denied_agent_types: frozenset[str] = frozenset()
+        # Round-robin cursor for fetch_messages' phase-two blocking read, so
+        # no agent_type is permanently starved of the blocking slot.
+        self._primary_cursor: int = 0
         self._consumer_last_tick_monotonic = 0.0
         stream_block_seconds = float(WorkerConfig.stream_block_ms) / 1000.0
         self._consumer_health_timeout_seconds = max(
@@ -200,6 +203,17 @@ class WorkerRunner:
         """
         Fetch messages from streams without processing them.
 
+        Two-phase read to stay Cluster-safe: different agent_type ctrl
+        streams are different entities/slots, so they can never be combined
+        into one XREADGROUP call.
+
+        Phase one: concurrent non-blocking XREADGROUP, one call per active
+        stream. If any stream returned messages, return immediately.
+        Phase two: only if every stream came back empty, one blocking
+        XREADGROUP against a single "primary" stream, chosen by round-robin
+        across the declared agent_types so no agent_type is starved of the
+        blocking slot.
+
         Returns:
             List of (stream_name, message_id, data_dict) tuples.
         """
@@ -210,16 +224,41 @@ class WorkerRunner:
             await asyncio.sleep(float(block) / 1000.0)
             return []
 
-        messages = await self.redis.xreadgroup(
+        stream_names = list(streams.keys())
+
+        async def read_nonblocking(stream_name: str):
+            return await self.redis.xreadgroup(
+                groupname=self.group_name,
+                consumername=self.consumer_name,
+                streams={stream_name: STREAM_READ_LAST_ID},
+                count=count,
+            )
+
+        first_pass = await asyncio.gather(
+            *[read_nonblocking(stream_name) for stream_name in stream_names]
+        )
+        results = await self._parse_xreadgroup_results(first_pass)
+        if results:
+            return results
+
+        primary = stream_names[self._primary_cursor % len(stream_names)]
+        self._primary_cursor += 1
+        blocked = await self.redis.xreadgroup(
             groupname=self.group_name,
             consumername=self.consumer_name,
-            streams=streams,
+            streams={primary: STREAM_READ_LAST_ID},
             count=count,
             block=block,
         )
+        return await self._parse_xreadgroup_results([blocked])
 
+    @staticmethod
+    async def _parse_xreadgroup_results(batches: list) -> list[tuple[str, str, dict]]:
+        """Flatten and parse one or more XREADGROUP responses."""
         results = []
-        if messages:
+        for messages in batches:
+            if not messages:
+                continue
             for stream_bytes, msg_list in messages:
                 stream_name = decode_message_id(stream_bytes)
                 for msg_id_bytes, msg_data in msg_list:
