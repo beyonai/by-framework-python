@@ -272,6 +272,32 @@ class WorkerHeartbeat:
     async def _create_isolated_redis(self) -> Optional[Redis]:
         """Create a fresh Redis connection for the heartbeat thread."""
         try:
+            from redis.asyncio.cluster import RedisCluster
+
+            if isinstance(self.redis, RedisCluster):
+                import inspect
+
+                conn_kwargs = dict(self.redis.connection_kwargs)
+                # RedisCluster.connection_kwargs carries extra keys (e.g.
+                # connection_class, response_callbacks) that aren't valid
+                # RedisCluster.__init__ params and would raise "unexpected
+                # keyword argument" if passed through unfiltered.
+                sig = inspect.signature(RedisCluster.__init__)
+                valid_params = set(sig.parameters.keys())
+                conn_kwargs = {
+                    k: v for k, v in conn_kwargs.items() if k in valid_params
+                }
+
+                for key in (
+                    "retry",
+                    "retry_on_timeout",
+                    "retry_on_error",
+                    "response_callbacks",
+                ):
+                    conn_kwargs.pop(key, None)
+                startup_nodes = list(self.redis.nodes_manager.startup_nodes.values())
+                return RedisCluster(startup_nodes=startup_nodes, **conn_kwargs)
+
             if not hasattr(self.redis, "connection_pool"):
                 return None
             pool = self.redis.connection_pool

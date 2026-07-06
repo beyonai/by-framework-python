@@ -122,14 +122,27 @@ async def _run_worker_async(
             actual_redis_max_conns = max_concurrency + 10
 
     # 2. Establish Redis connection (must be inside event loop)
-    redis_client = init_redis(
-        host=redis_host,
-        port=redis_port,
-        db=redis_db,
-        password=redis_password,
-        username=redis_username,
-        max_connections=actual_redis_max_conns,
-    )
+    from by_framework.common.config import RedisConfig as SDKRedisConfig
+
+    env_config = SDKRedisConfig.from_env()
+    if env_config.mode == "cluster":
+        redis_client = init_redis(
+            config=env_config,
+            max_connections=actual_redis_max_conns,
+        )
+        logger.info(
+            "Worker Redis initialized in Cluster mode (nodes=%s)",
+            env_config.cluster_nodes,
+        )
+    else:
+        redis_client = init_redis(
+            host=redis_host,
+            port=redis_port,
+            db=redis_db,
+            password=redis_password,
+            username=redis_username,
+            max_connections=actual_redis_max_conns,
+        )
 
     # 2.1 Configure history message storage backend
     # The storage backend itself decides which operations are supported
