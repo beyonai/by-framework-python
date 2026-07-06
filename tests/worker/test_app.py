@@ -86,15 +86,17 @@ async def test_run_worker_async_flow():
             fetch_count=5,
         )
 
-        # 1. Verify Redis initialization
-        mock_init_redis.assert_called_once_with(
-            host="localhost",
-            port=6379,
-            db=0,
-            password=None,
-            username=None,
-            max_connections=20,  # max_concurrency (10) + 10
-        )
+        # 1. Verify Redis initialization - routes through the unified
+        # config= path (same for standalone and cluster mode)
+        mock_init_redis.assert_called_once()
+        _, init_redis_kwargs = mock_init_redis.call_args
+        assert init_redis_kwargs["config"].host == "localhost"
+        assert init_redis_kwargs["config"].port == 6379
+        assert init_redis_kwargs["config"].db == 0
+        assert init_redis_kwargs["config"].password == ""
+        assert init_redis_kwargs["config"].username is None
+        assert init_redis_kwargs["config"].mode == "standalone"
+        assert init_redis_kwargs["max_connections"] == 20  # max_concurrency (10) + 10
 
         # 2. Verify core component instantiation
         mock_worker_registry.assert_called_once()
@@ -105,6 +107,122 @@ async def test_run_worker_async_flow():
 
         # 4. Verify resource cleanup
         mock_close_redis.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_worker_async_standalone_falls_back_to_env_when_arg_not_passed():
+    """Standalone mode must respect REDIS_HOST/REDIS_PASSWORD env vars when
+    the caller doesn't pass the corresponding explicit arg — today it
+    doesn't, since the standalone branch never consults
+    RedisConfig.from_env() at all."""
+    with (
+        patch.dict(
+            "os.environ",
+            {"REDIS_HOST": "env-host", "REDIS_PASSWORD": "env-secret"},
+            clear=False,
+        ),
+        patch("by_framework.worker.app.init_redis") as mock_init_redis,
+        patch("by_framework.worker.app.close_redis", new_callable=AsyncMock),
+        patch("by_framework.worker.app.WorkerRegistry"),
+        patch("by_framework.worker.app.WorkspaceManager"),
+        patch("by_framework.worker.app.WorkerRunner") as mock_runner,
+    ):
+        mock_init_redis.return_value = MagicMock()
+        mock_runner.return_value.start = AsyncMock()
+
+        await _run_worker_async(
+            worker_class=MyTestWorker,
+            worker_id="test-w1",
+            redis_host=None,
+            redis_port=None,
+            redis_db=None,
+            redis_password=None,
+            redis_username=None,
+            workspace_dir="/tmp/test-ws",
+            consumer_group="test-group",
+            max_concurrency=10,
+            fetch_count=5,
+        )
+
+        mock_init_redis.assert_called_once()
+        _, kwargs = mock_init_redis.call_args
+        assert kwargs["config"].host == "env-host"
+        assert kwargs["config"].password == "env-secret"
+        assert kwargs["config"].mode == "standalone"
+
+
+@pytest.mark.asyncio
+async def test_run_worker_async_explicit_arg_overrides_env_in_standalone_mode():
+    """An explicit arg must still win over an env var set for the same field."""
+    with (
+        patch.dict(
+            "os.environ",
+            {"REDIS_HOST": "env-host", "REDIS_PASSWORD": "env-secret"},
+            clear=False,
+        ),
+        patch("by_framework.worker.app.init_redis") as mock_init_redis,
+        patch("by_framework.worker.app.close_redis", new_callable=AsyncMock),
+        patch("by_framework.worker.app.WorkerRegistry"),
+        patch("by_framework.worker.app.WorkspaceManager"),
+        patch("by_framework.worker.app.WorkerRunner") as mock_runner,
+    ):
+        mock_init_redis.return_value = MagicMock()
+        mock_runner.return_value.start = AsyncMock()
+
+        await _run_worker_async(
+            worker_class=MyTestWorker,
+            worker_id="test-w1",
+            redis_host="explicit-host",
+            redis_port=None,
+            redis_db=None,
+            redis_password="explicit-secret",
+            redis_username=None,
+            workspace_dir="/tmp/test-ws",
+            consumer_group="test-group",
+            max_concurrency=10,
+            fetch_count=5,
+        )
+
+        _, kwargs = mock_init_redis.call_args
+        assert kwargs["config"].host == "explicit-host"
+        assert kwargs["config"].password == "explicit-secret"
+
+
+@pytest.mark.asyncio
+async def test_run_worker_async_supports_fully_programmatic_cluster_config():
+    """Cluster mode must be fully configurable via explicit args alone, with
+    no env vars at all - true parity with standalone's configurability,
+    which is the whole point of unifying the two resolution paths."""
+    with (
+        patch("by_framework.worker.app.init_redis") as mock_init_redis,
+        patch("by_framework.worker.app.close_redis", new_callable=AsyncMock),
+        patch("by_framework.worker.app.WorkerRegistry"),
+        patch("by_framework.worker.app.WorkspaceManager"),
+        patch("by_framework.worker.app.WorkerRunner") as mock_runner,
+    ):
+        mock_init_redis.return_value = MagicMock()
+        mock_runner.return_value.start = AsyncMock()
+
+        await _run_worker_async(
+            worker_class=MyTestWorker,
+            worker_id="test-w1",
+            redis_host=None,
+            redis_port=None,
+            redis_db=None,
+            redis_password="cluster-secret",
+            redis_username=None,
+            workspace_dir="/tmp/test-ws",
+            consumer_group="test-group",
+            max_concurrency=10,
+            fetch_count=5,
+            redis_mode="cluster",
+            redis_cluster_nodes=[("h1", 6379), ("h2", 6380)],
+        )
+
+        _, kwargs = mock_init_redis.call_args
+        assert kwargs["config"].mode == "cluster"
+        assert kwargs["config"].cluster_nodes == [("h1", 6379), ("h2", 6380)]
+        assert kwargs["config"].password == "cluster-secret"
 
 
 @pytest.mark.asyncio
@@ -458,4 +576,7 @@ def test_run_worker_sync_entry():
         args, _ = mock_run_async.call_args
         # positional: worker_class, worker_id, redis_host, ...
         assert args[1] == "sync-w1"
-        assert args[2] == "localhost"
+        # redis_host defaults to None (not "localhost") - "not specified",
+        # falls back to REDIS_HOST env var / RedisConfig's own default
+        # inside _run_worker_async, not here.
+        assert args[2] is None
