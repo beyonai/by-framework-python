@@ -23,6 +23,7 @@ class SseMessageType(str, Enum):
 class SseReasonMessageType(str, Enum):
     """SSE reasoning message type enum."""
 
+    json_block = "2020" # tool json arguments
     think_title = "3003"  # thinking process title
     think_sub_title = "3005"  # thinking process subtitle
     think_resource = "3004"  # thinking process reference
