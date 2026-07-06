@@ -145,7 +145,7 @@ class ServiceRegistry:
         )
         self._current_instance.last_heartbeat = now_ms
         # 3. Add service name to global index
-        await self.redis.sadd(RedisKeys.SD_SERVICES, service_name)
+        await self.redis.sadd(RedisKeys.sd_services(), service_name)
 
         # 4. Start recurring heartbeats only when requested.
         if heartbeat_interval > RedisKeys.SD_NO_HEARTBEAT:

@@ -360,7 +360,7 @@ async def test_register_worker_compatibility_wrapper():
     with pytest.warns(DeprecationWarning, match="register_worker"):
         await registry.register_worker("worker-1", ["super_assistant"])
     assert OLD_ACTIVE_WORKERS not in redis_mock.data
-    assert "worker-1" in redis_mock.data[RedisKeys.KNOWN_WORKERS]
+    assert "worker-1" in redis_mock.data[RedisKeys.known_workers()]
     assert redis_mock.data[RedisKeys.worker_declared_agent_types("worker-1")] == {
         "super_assistant"
     }
@@ -378,7 +378,7 @@ async def test_unregister_worker_compatibility_wrapper_warns():
         await registry.unregister_worker("worker-1")
 
     assert OLD_ACTIVE_WORKERS not in redis_mock.data
-    assert "worker-1" not in redis_mock.data[RedisKeys.KNOWN_WORKERS]
+    assert "worker-1" not in redis_mock.data[RedisKeys.known_workers()]
     assert RedisKeys.worker_declared_agent_types("worker-1") not in redis_mock.data
 
 
@@ -393,7 +393,7 @@ async def test_register_worker_membership_only_updates_membership_sets():
     )
 
     assert OLD_ACTIVE_WORKERS not in redis_mock.data
-    assert redis_mock.data[RedisKeys.KNOWN_WORKERS] == {"worker-1"}
+    assert redis_mock.data[RedisKeys.known_workers()] == {"worker-1"}
     assert redis_mock.data[RedisKeys.worker_declared_agent_types("worker-1")] == {
         "super_assistant",
         "code_agent",
@@ -436,7 +436,7 @@ async def test_heartbeat_worker_only_updates_presence():
     assert presence["last_seen"] > 0
     assert presence["ip_address"] == "10.0.0.7"
     assert OLD_ACTIVE_WORKERS not in redis_mock.data
-    assert redis_mock.data[RedisKeys.KNOWN_WORKERS] == {"worker-1"}
+    assert redis_mock.data[RedisKeys.known_workers()] == {"worker-1"}
     assert redis_mock.expires[RedisKeys.worker_online_lease("worker-1")] == (
         RedisKeys.WORKER_DEFAULT_LEASE_TTL_SECONDS
     )
@@ -502,7 +502,7 @@ async def test_unregister_worker_membership_only_removes_membership_sets():
     assert redis_mock.kv[RedisKeys.worker_online_lease("worker-1")] == online_snapshot
     assert RedisKeys.worker_declared_agent_types("worker-1") not in redis_mock.data
     assert redis_mock.data[RedisKeys.agent_type_members("super_assistant")] == set()
-    assert "worker-1" not in redis_mock.data[RedisKeys.KNOWN_WORKERS]
+    assert "worker-1" not in redis_mock.data[RedisKeys.known_workers()]
 
 
 @pytest.mark.asyncio
@@ -520,7 +520,7 @@ async def test_mark_worker_inactive_only_removes_online_state():
     assert redis_mock.data[RedisKeys.worker_declared_agent_types("worker-1")] == {
         "super_assistant"
     }
-    assert "worker-1" in redis_mock.data[RedisKeys.KNOWN_WORKERS]
+    assert "worker-1" in redis_mock.data[RedisKeys.known_workers()]
 
 
 @pytest.mark.asyncio

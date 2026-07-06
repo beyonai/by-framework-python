@@ -1152,7 +1152,7 @@ async def _get_observable_workers(
         total_known = len(worker_ids)
         source = "online_lease_scan"
     else:
-        worker_ids_raw = await redis.smembers(RedisKeys.KNOWN_WORKERS)
+        worker_ids_raw = await redis.smembers(RedisKeys.known_workers())
         worker_ids = sorted(
             worker_id.decode("utf-8")
             if isinstance(worker_id, bytes)
@@ -1242,7 +1242,7 @@ async def _get_admin_managed_worker_ids(
     scan_limit: int,
 ) -> tuple[list[str], dict[str, Any]]:
     """Return workers with explicit admin lifecycle state, including offline ones."""
-    indexed_raw = await redis.smembers(RedisKeys.ADMIN_WORKERS)
+    indexed_raw = await redis.smembers(RedisKeys.admin_workers())
     indexed_ids = {
         item.decode("utf-8") if isinstance(item, bytes) else str(item)
         for item in indexed_raw
