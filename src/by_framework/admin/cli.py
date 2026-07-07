@@ -13,7 +13,8 @@ from rich.console import Console
 from rich.table import Table
 
 from by_framework.admin.worker_manager import WorkerManager
-from by_framework.common.redis_client import init_redis_from_url
+from by_framework.common.config import RedisConfig
+from by_framework.common.redis_client import init_redis, init_redis_from_url
 from by_framework.core.registry import WorkerRegistry
 from by_framework.metrics.snapshot import (
     build_observability_snapshot,
@@ -27,7 +28,11 @@ from by_framework.metrics.snapshot import (
 app = typer.Typer(
     name="by-admin",
     no_args_is_help=True,
-    help="by-framework cluster admin CLI",
+    help=(
+        "by-framework cluster admin CLI. For Redis Cluster, omit --redis-url "
+        "and set REDIS_MODE=cluster, REDIS_CLUSTER_NODES, and "
+        "REDIS_KEY_SCHEMA_VERSION=v2."
+    ),
 )
 worker_app = typer.Typer(no_args_is_help=True)
 type_app = typer.Typer(no_args_is_help=True)
@@ -43,7 +48,8 @@ app.add_typer(metrics_app, name="metrics", help="Metrics and observability")
 
 console = Console()
 err_console = Console(stderr=True)
-_redis_url = "redis://localhost:6379/0"
+_DEFAULT_REDIS_URL = "redis://localhost:6379/0"
+_redis_url: Optional[str] = None
 
 
 @app.callback()
@@ -52,13 +58,16 @@ def _global(
         None,
         "--redis-url",
         envvar=["BYAI_REDIS_URL", "REDIS_URL"],
-        help="Redis connection URL  [env: BYAI_REDIS_URL]",
+        help=(
+            "Standalone Redis connection URL [env: BYAI_REDIS_URL]. "
+            "For Redis Cluster, omit this and use REDIS_MODE=cluster with "
+            "REDIS_CLUSTER_NODES."
+        ),
     ),
 ):
     """by-framework cluster admin CLI."""
     global _redis_url
-    if redis_url:
-        _redis_url = redis_url
+    _redis_url = redis_url
 
 
 def _run(coro):  # type: ignore[no-untyped-def]
@@ -70,8 +79,14 @@ def _die(msg: str, code: int = 1) -> None:
     raise typer.Exit(code)
 
 
-def _get_redis():
-    return init_redis_from_url(_redis_url)
+def _get_redis(redis_url: Optional[str] = None):
+    configured_url = redis_url if redis_url is not None else _redis_url
+    if configured_url:
+        return init_redis_from_url(configured_url)
+    config = RedisConfig.from_env()
+    if config.mode == "cluster":
+        return init_redis(config=config)
+    return init_redis_from_url(_DEFAULT_REDIS_URL)
 
 
 # --------------------------------------------------------------------------- #
