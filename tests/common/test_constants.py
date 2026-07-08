@@ -478,12 +478,18 @@ class TestGetKeySchemaVersion(unittest.TestCase):
 
     def setUp(self):
         self._old_value = os.environ.get("REDIS_KEY_SCHEMA_VERSION")
+        self._old_cluster_host = os.environ.get("REDIS_CLUSTER_HOST")
+        os.environ.pop("REDIS_CLUSTER_HOST", None)
 
     def tearDown(self):
         if self._old_value is not None:
             os.environ["REDIS_KEY_SCHEMA_VERSION"] = self._old_value
         else:
             os.environ.pop("REDIS_KEY_SCHEMA_VERSION", None)
+        if self._old_cluster_host is not None:
+            os.environ["REDIS_CLUSTER_HOST"] = self._old_cluster_host
+        else:
+            os.environ.pop("REDIS_CLUSTER_HOST", None)
 
     def test_defaults_to_v1(self):
         """Test that the schema version defaults to v1 when unset."""
@@ -500,6 +506,21 @@ class TestGetKeySchemaVersion(unittest.TestCase):
         os.environ["REDIS_KEY_SCHEMA_VERSION"] = "v3"
         with self.assertRaises(ValueError):
             get_key_schema_version()
+
+    def test_defaults_to_v2_when_cluster_host_set(self):
+        """REDIS_CLUSTER_HOST alone (no explicit schema version) implies v2."""
+        os.environ.pop("REDIS_KEY_SCHEMA_VERSION", None)
+        os.environ["REDIS_CLUSTER_HOST"] = "h1:6379,h2:6380"
+        self.assertEqual(get_key_schema_version(), "v2")
+
+    def test_explicit_value_wins_over_cluster_host(self):
+        """An explicit REDIS_KEY_SCHEMA_VERSION always wins, even if it
+        contradicts REDIS_CLUSTER_HOST's implied v2 - redis_client.init_redis's
+        fail-fast check is what catches this combination, not silent
+        auto-correction here."""
+        os.environ["REDIS_CLUSTER_HOST"] = "h1:6379"
+        os.environ["REDIS_KEY_SCHEMA_VERSION"] = "v1"
+        self.assertEqual(get_key_schema_version(), "v1")
 
 
 if __name__ == "__main__":

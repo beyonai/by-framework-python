@@ -49,6 +49,7 @@ class TestRedisConfig(unittest.TestCase):
         env_vars = [
             "REDIS_HOST",
             "REDIS_PORT",
+            "REDIS_DATABASE",
             "REDIS_DB",
             "REDIS_PASSWORD",
             "REDIS_USERNAME",
@@ -100,6 +101,52 @@ class TestRedisConfig(unittest.TestCase):
                 os.environ["REDIS_CLUSTER_NODES"] = old_value
             else:
                 os.environ.pop("REDIS_CLUSTER_NODES", None)
+
+    def test_from_env_reads_redis_database(self):
+        """Test that from_env reads db from REDIS_DATABASE."""
+        env_vars = ["REDIS_DATABASE", "REDIS_DB"]
+        old_values = {k: os.environ.get(k) for k in env_vars}
+        try:
+            for k in env_vars:
+                os.environ.pop(k, None)
+            os.environ["REDIS_DATABASE"] = "3"
+            self.assertEqual(RedisConfig.from_env().db, 3)
+        finally:
+            for k, v in old_values.items():
+                if v is not None:
+                    os.environ[k] = v
+                else:
+                    os.environ.pop(k, None)
+
+    def test_from_env_falls_back_to_deprecated_redis_db(self):
+        """Test that from_env falls back to REDIS_DB when REDIS_DATABASE is unset."""
+        env_vars = ["REDIS_DATABASE", "REDIS_DB"]
+        old_values = {k: os.environ.get(k) for k in env_vars}
+        try:
+            os.environ.pop("REDIS_DATABASE", None)
+            os.environ["REDIS_DB"] = "5"
+            self.assertEqual(RedisConfig.from_env().db, 5)
+        finally:
+            for k, v in old_values.items():
+                if v is not None:
+                    os.environ[k] = v
+                else:
+                    os.environ.pop(k, None)
+
+    def test_from_env_redis_database_takes_precedence_over_deprecated_redis_db(self):
+        """Test that REDIS_DATABASE wins over REDIS_DB when both are set."""
+        env_vars = ["REDIS_DATABASE", "REDIS_DB"]
+        old_values = {k: os.environ.get(k) for k in env_vars}
+        try:
+            os.environ["REDIS_DATABASE"] = "2"
+            os.environ["REDIS_DB"] = "9"
+            self.assertEqual(RedisConfig.from_env().db, 2)
+        finally:
+            for k, v in old_values.items():
+                if v is not None:
+                    os.environ[k] = v
+                else:
+                    os.environ.pop(k, None)
 
     def test_from_env_cluster_host_implies_cluster_mode(self):
         """Setting REDIS_CLUSTER_HOST alone (no REDIS_MODE) switches to cluster mode."""
