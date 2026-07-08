@@ -12,7 +12,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from typer.testing import CliRunner
 
+from by_framework.admin import cli
 from by_framework.admin.cli import app
+from by_framework.common.config import RedisConfig
 
 runner = CliRunner()
 
@@ -41,6 +43,17 @@ _ALL_WORKERS = {"worker-a": _WORKER_A, "worker-b": _WORKER_B}
 def _mock_redis():
     """Return a MagicMock that satisfies init_redis_from_url."""
     return MagicMock()
+
+
+def _cluster_env(monkeypatch):
+    cli._redis_url = None  # pylint: disable=protected-access
+    monkeypatch.setenv("REDIS_MODE", "cluster")
+    monkeypatch.setenv("REDIS_CLUSTER_NODES", "h1:6379,h2:6380")
+    monkeypatch.setenv("REDIS_USERNAME", "cluster-user")
+    monkeypatch.setenv("REDIS_PASSWORD", "cluster-secret")
+    monkeypatch.setenv("REDIS_KEY_SCHEMA_VERSION", "v2")
+    monkeypatch.delenv("BYAI_REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
 
 
 # --------------------------------------------------------------------------- #
@@ -373,3 +386,102 @@ def test_redis_url_env_var(mock_init, mock_registry_cls, monkeypatch):
 
     runner.invoke(app, ["worker", "list"])
     mock_init.assert_called_with("redis://envhost:6379/2")
+
+
+def test_help_mentions_cluster_env_configuration():
+    result = runner.invoke(app, ["--help"])
+
+    assert result.exit_code == 0
+    assert "REDIS_MODE=cluster" in result.output
+    assert "REDIS_CLUSTER_NODES" in result.output
+    assert "REDIS_KEY_SCHEMA_VERSION=v2" in result.output
+
+
+@patch("by_framework.admin.cli.init_redis", return_value=_mock_redis())
+@patch("by_framework.admin.cli.init_redis_from_url", return_value=_mock_redis())
+def test_get_redis_uses_cluster_config_from_env(
+    mock_init_from_url, mock_init, monkeypatch
+):
+    _cluster_env(monkeypatch)
+
+    redis = cli._get_redis()  # pylint: disable=protected-access
+
+    assert redis is mock_init.return_value
+    mock_init_from_url.assert_not_called()
+    mock_init.assert_called_once()
+    config = mock_init.call_args.kwargs["config"]
+    assert isinstance(config, RedisConfig)
+    assert config.mode == "cluster"
+    assert config.cluster_nodes == [("h1", 6379), ("h2", 6380)]
+    assert config.username == "cluster-user"
+    assert config.password == "cluster-secret"
+
+
+@patch("by_framework.admin.cli.init_redis", return_value=_mock_redis())
+@patch("by_framework.admin.cli.init_redis_from_url", return_value=_mock_redis())
+def test_get_redis_prefers_explicit_url_over_cluster_env(
+    mock_init_from_url, mock_init, monkeypatch
+):
+    _cluster_env(monkeypatch)
+
+    redis = cli._get_redis("redis://operator-host:6379/0")  # pylint: disable=protected-access
+
+    assert redis is mock_init_from_url.return_value
+    mock_init_from_url.assert_called_once_with("redis://operator-host:6379/0")
+    mock_init.assert_not_called()
+
+
+@patch("by_framework.admin.cli.init_redis", side_effect=RuntimeError("v2 required"))
+def test_get_redis_cluster_mode_surfaces_schema_error(mock_init, monkeypatch):
+    monkeypatch.setenv("REDIS_MODE", "cluster")
+    monkeypatch.setenv("REDIS_CLUSTER_NODES", "h1:6379,h2:6380")
+    monkeypatch.setenv("REDIS_KEY_SCHEMA_VERSION", "v1")
+
+    try:
+        cli._get_redis()  # pylint: disable=protected-access
+    except RuntimeError as err:
+        assert "v2 required" in str(err)
+    else:
+        raise AssertionError("cluster schema error was not surfaced")
+
+    mock_init.assert_called_once()
+
+
+@patch("by_framework.admin.cli.WorkerRegistry")
+@patch("by_framework.admin.cli.init_redis", return_value=_mock_redis())
+def test_worker_list_uses_cluster_config(mock_init, mock_registry_cls, monkeypatch):
+    _cluster_env(monkeypatch)
+    mock_registry = MagicMock()
+    mock_registry.get_all_workers = AsyncMock(return_value={})
+    mock_registry_cls.return_value = mock_registry
+
+    result = runner.invoke(app, ["worker", "list"])
+
+    assert result.exit_code == 0
+    assert mock_init.call_args.kwargs["config"].mode == "cluster"
+
+
+@patch("by_framework.admin.cli.WorkerManager")
+@patch("by_framework.admin.cli.init_redis", return_value=_mock_redis())
+def test_type_deny_uses_cluster_config(mock_init, mock_mgr_cls, monkeypatch):
+    _cluster_env(monkeypatch)
+    mock_mgr = MagicMock()
+    mock_mgr.deny_worker_for_type = AsyncMock()
+    mock_mgr_cls.return_value = mock_mgr
+
+    result = runner.invoke(app, ["type", "deny", "chat", "worker-a"])
+
+    assert result.exit_code == 0
+    assert mock_init.call_args.kwargs["config"].mode == "cluster"
+
+
+@patch("by_framework.admin.cli.build_observability_snapshot", new_callable=AsyncMock)
+@patch("by_framework.admin.cli.init_redis", return_value=_mock_redis())
+def test_metrics_snapshot_uses_cluster_config(mock_init, mock_snapshot, monkeypatch):
+    _cluster_env(monkeypatch)
+    mock_snapshot.return_value = _SNAPSHOT
+
+    result = runner.invoke(app, ["metrics", "snapshot"])
+
+    assert result.exit_code == 0
+    assert mock_init.call_args.kwargs["config"].mode == "cluster"
