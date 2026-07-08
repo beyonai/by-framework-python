@@ -31,8 +31,9 @@ app = typer.Typer(
     help=(
         "by-framework cluster admin CLI. For Redis Cluster, omit --redis-url "
         "and set REDIS_CLUSTER_HOST (comma-separated host:port list; implies "
-        "cluster mode) and REDIS_KEY_SCHEMA_VERSION=v2. REDIS_MODE=cluster + "
-        "REDIS_CLUSTER_NODES also still works."
+        "both cluster mode and REDIS_KEY_SCHEMA_VERSION=v2 unless set "
+        "explicitly). REDIS_MODE=cluster + REDIS_CLUSTER_NODES + "
+        "REDIS_KEY_SCHEMA_VERSION=v2 also still works."
     ),
 )
 worker_app = typer.Typer(no_args_is_help=True)

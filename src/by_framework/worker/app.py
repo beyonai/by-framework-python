@@ -276,14 +276,17 @@ def run_worker(
     Redis configuration: every redis_* argument defaults to None, meaning
     "not specified" - when not passed, the value is read from the
     corresponding REDIS_* environment variable (REDIS_HOST, REDIS_PORT,
-    REDIS_DB, REDIS_PASSWORD, REDIS_USERNAME, REDIS_MODE, REDIS_CLUSTER_HOST,
-    REDIS_CLUSTER_NODES), falling back to "localhost"/6379/standalone if
-    none is set. Setting REDIS_CLUSTER_HOST (comma-separated "host:port"
-    list) alone is enough to switch to cluster mode - no separate
-    REDIS_MODE=cluster required, though an explicit REDIS_MODE still wins if
-    set. An explicitly-passed argument always takes precedence over its env
-    var, for every field, in both standalone and cluster mode - so either
-    mode can be configured purely programmatically (e.g.
+    REDIS_DATABASE, REDIS_PASSWORD, REDIS_USERNAME, REDIS_MODE,
+    REDIS_CLUSTER_HOST, REDIS_CLUSTER_NODES), falling back to
+    "localhost"/6379/standalone if none is set. REDIS_DATABASE replaces
+    REDIS_DB (still works as a deprecated fallback, logging a warning).
+    Setting REDIS_CLUSTER_HOST (comma-separated "host:port" list) alone is
+    enough to switch to cluster mode - no separate REDIS_MODE=cluster
+    required, though an explicit REDIS_MODE still wins if set; it also
+    implies REDIS_KEY_SCHEMA_VERSION=v2 unless that's set explicitly. An
+    explicitly-passed argument always takes precedence over its env var,
+    for every field, in both standalone and cluster mode - so either mode
+    can be configured purely programmatically (e.g.
     ``redis_mode="cluster", redis_cluster_nodes=[("h1", 6379)]``) or purely
     via env vars, without the two modes behaving inconsistently.
 
