@@ -29,12 +29,20 @@ class RedisConfig:
 
     @classmethod
     def from_env(cls) -> "RedisConfig":
-        """Load Redis configuration from environment variables."""
+        """Load Redis configuration from environment variables.
+
+        REDIS_CLUSTER_HOST (comma-separated "host:port" list) is the
+        preferred way to configure Cluster mode: just setting it is enough
+        to switch to cluster mode, no separate REDIS_MODE=cluster needed.
+        An explicit REDIS_MODE still takes precedence when set, so existing
+        explicit REDIS_MODE=cluster + REDIS_CLUSTER_NODES setups keep working.
+        """
         password = os.environ.get("REDIS_PASSWORD", "")
         username = os.environ.get("REDIS_USERNAME") or None
         max_connections = os.environ.get("REDIS_MAX_CONNECTIONS")
-        mode = os.environ.get("REDIS_MODE", "standalone")
-        cluster_nodes_str = os.environ.get("REDIS_CLUSTER_NODES")
+        cluster_host_str = os.environ.get("REDIS_CLUSTER_HOST")
+        cluster_nodes_str = cluster_host_str or os.environ.get("REDIS_CLUSTER_NODES")
+        mode = os.environ.get("REDIS_MODE") or ("cluster" if cluster_host_str else "standalone")
         cluster_nodes = None
         if cluster_nodes_str:
             cluster_nodes = []

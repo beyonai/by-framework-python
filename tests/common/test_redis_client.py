@@ -18,6 +18,7 @@ REDIS_ENV_VARS = (
     "REDIS_MAX_CONNECTIONS",
     "REDIS_MODE",
     "REDIS_CLUSTER_NODES",
+    "REDIS_CLUSTER_HOST",
     "REDIS_KEY_SCHEMA_VERSION",
 )
 
@@ -196,6 +197,34 @@ class TestRedisClient(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(kwargs["username"], "cluster-user")
                 self.assertEqual(kwargs["password"], "cluster-secret")
                 self.assertTrue(kwargs["decode_responses"])
+
+    async def test_get_redis_uses_cluster_host_env_without_explicit_mode(self):
+        """Setting only REDIS_CLUSTER_HOST (no REDIS_MODE) is enough to
+        switch the shared default lookup to cluster mode."""
+        with patch.dict(
+            os.environ,
+            {
+                "REDIS_CLUSTER_HOST": "10.10.168.203:6371,10.10.168.203:6372",
+                "REDIS_KEY_SCHEMA_VERSION": "v2",
+            },
+            clear=False,
+        ):
+            os.environ.pop("REDIS_MODE", None)
+            with (
+                patch("by_framework.common.redis_client.Redis") as mock_redis_cls,
+                patch(
+                    "by_framework.common.redis_client.RedisCluster"
+                ) as mock_cluster_cls,
+            ):
+                get_redis()
+
+                mock_redis_cls.assert_not_called()
+                mock_cluster_cls.assert_called_once()
+                _, kwargs = mock_cluster_cls.call_args
+                self.assertEqual(
+                    [(n.host, n.port) for n in kwargs["startup_nodes"]],
+                    [("10.10.168.203", 6371), ("10.10.168.203", 6372)],
+                )
 
     async def test_get_redis_cluster_env_requires_v2_schema(self):
         """Cluster env config fails fast before constructing a client."""

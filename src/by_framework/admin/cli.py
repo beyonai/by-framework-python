@@ -30,8 +30,9 @@ app = typer.Typer(
     no_args_is_help=True,
     help=(
         "by-framework cluster admin CLI. For Redis Cluster, omit --redis-url "
-        "and set REDIS_MODE=cluster, REDIS_CLUSTER_NODES, and "
-        "REDIS_KEY_SCHEMA_VERSION=v2."
+        "and set REDIS_CLUSTER_HOST (comma-separated host:port list; implies "
+        "cluster mode) and REDIS_KEY_SCHEMA_VERSION=v2. REDIS_MODE=cluster + "
+        "REDIS_CLUSTER_NODES also still works."
     ),
 )
 worker_app = typer.Typer(no_args_is_help=True)
@@ -60,8 +61,8 @@ def _global(
         envvar=["BYAI_REDIS_URL", "REDIS_URL"],
         help=(
             "Standalone Redis connection URL [env: BYAI_REDIS_URL]. "
-            "For Redis Cluster, omit this and use REDIS_MODE=cluster with "
-            "REDIS_CLUSTER_NODES."
+            "For Redis Cluster, omit this and set REDIS_CLUSTER_HOST "
+            "(comma-separated host:port list)."
         ),
     ),
 ):
