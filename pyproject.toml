@@ -1,6 +1,6 @@
 [project]
 name = "by-framework"
-version = "0.2.2.dev8"
+version = "0.2.2.dev9"
 description = "分布式 Agent 调度框架"
 readme = "README.md"
 requires-python = ">=3.12"
