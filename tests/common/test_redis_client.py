@@ -1,10 +1,26 @@
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
+from by_framework.client.client import GatewayClient
 from by_framework.common.config import RedisConfig
 from by_framework.common.exceptions import RedisConnectionError
 from by_framework.common.redis_client import close_redis, get_redis, init_redis
+from by_framework.core.discovery import DiscoveryClient, ServiceRegistry
+from by_framework.core.registry import WorkerRegistry
+
+REDIS_ENV_VARS = (
+    "REDIS_HOST",
+    "REDIS_PORT",
+    "REDIS_DB",
+    "REDIS_PASSWORD",
+    "REDIS_USERNAME",
+    "REDIS_MAX_CONNECTIONS",
+    "REDIS_MODE",
+    "REDIS_CLUSTER_NODES",
+    "REDIS_CLUSTER_HOST",
+    "REDIS_KEY_SCHEMA_VERSION",
+)
 
 
 class TestRedisClient(unittest.IsolatedAsyncioTestCase):
@@ -134,6 +150,149 @@ class TestRedisClient(unittest.IsolatedAsyncioTestCase):
             client = get_redis()
             self.assertEqual(mock_redis_cls.call_count, 1)
             self.assertIsNotNone(client)
+
+    async def test_get_redis_uses_standalone_defaults_without_env(self):
+        """The default singleton path remains localhost standalone compatible."""
+        with patch.dict(os.environ, {}, clear=False):
+            for name in REDIS_ENV_VARS:
+                os.environ.pop(name, None)
+
+            with patch("by_framework.common.redis_client.Redis") as mock_redis_cls:
+                get_redis()
+
+                _, kwargs = mock_redis_cls.call_args
+                self.assertEqual(kwargs["host"], "localhost")
+                self.assertEqual(kwargs["port"], 6379)
+                self.assertEqual(kwargs["db"], 0)
+                self.assertTrue(kwargs["decode_responses"])
+
+    async def test_get_redis_uses_cluster_config_from_env(self):
+        """The shared default lookup honors REDIS_MODE=cluster env config."""
+        with patch.dict(
+            os.environ,
+            {
+                "REDIS_MODE": "cluster",
+                "REDIS_CLUSTER_NODES": "h1:6379,h2:6380",
+                "REDIS_USERNAME": "cluster-user",
+                "REDIS_PASSWORD": "cluster-secret",
+                "REDIS_KEY_SCHEMA_VERSION": "v2",
+            },
+            clear=False,
+        ):
+            with (
+                patch("by_framework.common.redis_client.Redis") as mock_redis_cls,
+                patch(
+                    "by_framework.common.redis_client.RedisCluster"
+                ) as mock_cluster_cls,
+            ):
+                get_redis()
+
+                mock_redis_cls.assert_not_called()
+                mock_cluster_cls.assert_called_once()
+                _, kwargs = mock_cluster_cls.call_args
+                self.assertEqual(
+                    [(n.host, n.port) for n in kwargs["startup_nodes"]],
+                    [("h1", 6379), ("h2", 6380)],
+                )
+                self.assertEqual(kwargs["username"], "cluster-user")
+                self.assertEqual(kwargs["password"], "cluster-secret")
+                self.assertTrue(kwargs["decode_responses"])
+
+    async def test_get_redis_uses_cluster_host_env_without_explicit_mode(self):
+        """Setting only REDIS_CLUSTER_HOST (no REDIS_MODE) is enough to
+        switch the shared default lookup to cluster mode."""
+        with patch.dict(
+            os.environ,
+            {
+                "REDIS_CLUSTER_HOST": "10.10.168.203:6371,10.10.168.203:6372",
+                "REDIS_KEY_SCHEMA_VERSION": "v2",
+            },
+            clear=False,
+        ):
+            os.environ.pop("REDIS_MODE", None)
+            with (
+                patch("by_framework.common.redis_client.Redis") as mock_redis_cls,
+                patch(
+                    "by_framework.common.redis_client.RedisCluster"
+                ) as mock_cluster_cls,
+            ):
+                get_redis()
+
+                mock_redis_cls.assert_not_called()
+                mock_cluster_cls.assert_called_once()
+                _, kwargs = mock_cluster_cls.call_args
+                self.assertEqual(
+                    [(n.host, n.port) for n in kwargs["startup_nodes"]],
+                    [("10.10.168.203", 6371), ("10.10.168.203", 6372)],
+                )
+
+    async def test_get_redis_cluster_env_requires_v2_schema(self):
+        """Cluster env config fails fast before constructing a client."""
+        with patch.dict(
+            os.environ,
+            {
+                "REDIS_MODE": "cluster",
+                "REDIS_CLUSTER_NODES": "h1:6379,h2:6380",
+            },
+            clear=False,
+        ):
+            os.environ.pop("REDIS_KEY_SCHEMA_VERSION", None)
+            with (
+                patch("by_framework.common.redis_client.Redis") as mock_redis_cls,
+                patch(
+                    "by_framework.common.redis_client.RedisCluster"
+                ) as mock_cluster_cls,
+            ):
+                with self.assertRaises(RedisConnectionError):
+                    get_redis()
+
+                mock_redis_cls.assert_not_called()
+                mock_cluster_cls.assert_not_called()
+
+    async def test_default_component_construction_uses_cluster_env(self):
+        """Public constructors using the shared default get a cluster client."""
+        with patch.dict(
+            os.environ,
+            {
+                "REDIS_MODE": "cluster",
+                "REDIS_CLUSTER_NODES": "h1:6379,h2:6380",
+                "REDIS_KEY_SCHEMA_VERSION": "v2",
+            },
+            clear=False,
+        ):
+            with patch(
+                "by_framework.common.redis_client.RedisCluster"
+            ) as mock_cluster_cls:
+                service_registry = ServiceRegistry()
+                worker_registry = WorkerRegistry()
+                gateway_client = GatewayClient()
+
+                mock_cluster_cls.assert_called_once()
+                self.assertIs(service_registry.redis, mock_cluster_cls.return_value)
+                self.assertIs(worker_registry.redis, mock_cluster_cls.return_value)
+                self.assertIs(gateway_client.redis, mock_cluster_cls.return_value)
+
+    async def test_explicit_redis_clients_take_precedence(self):
+        """Injected Redis clients are not replaced by the shared default lookup."""
+        redis = MagicMock()
+
+        with (
+            patch("by_framework.core.discovery.get_redis") as discovery_get_redis,
+            patch("by_framework.core.registry.get_redis") as registry_get_redis,
+            patch("by_framework.client.client.get_redis") as client_get_redis,
+        ):
+            service_registry = ServiceRegistry(redis_client=redis)
+            discovery_client = DiscoveryClient(redis_client=redis)
+            worker_registry = WorkerRegistry(redis_client=redis)
+            gateway_client = GatewayClient(redis_client=redis)
+
+            discovery_get_redis.assert_not_called()
+            registry_get_redis.assert_not_called()
+            client_get_redis.assert_not_called()
+            self.assertIs(service_registry.redis, redis)
+            self.assertIs(discovery_client.redis, redis)
+            self.assertIs(worker_registry.redis, redis)
+            self.assertIs(gateway_client.redis, redis)
 
     async def test_close_redis(self):
         """Verify that close_redis closes the connection and clears the singleton."""

@@ -101,6 +101,53 @@ class TestRedisConfig(unittest.TestCase):
             else:
                 os.environ.pop("REDIS_CLUSTER_NODES", None)
 
+    def test_from_env_cluster_host_implies_cluster_mode(self):
+        """Setting REDIS_CLUSTER_HOST alone (no REDIS_MODE) switches to cluster mode."""
+        env_vars = ["REDIS_MODE", "REDIS_CLUSTER_HOST", "REDIS_CLUSTER_NODES"]
+        old_values = {k: os.environ.get(k) for k in env_vars}
+        try:
+            for k in env_vars:
+                os.environ.pop(k, None)
+
+            config = RedisConfig.from_env()
+            self.assertEqual(config.mode, "standalone")
+            self.assertIsNone(config.cluster_nodes)
+
+            os.environ["REDIS_CLUSTER_HOST"] = (
+                "10.10.168.203:6371,10.10.168.203:6372,10.10.168.203:6373"
+            )
+            config = RedisConfig.from_env()
+            self.assertEqual(config.mode, "cluster")
+            self.assertEqual(
+                config.cluster_nodes,
+                [
+                    ("10.10.168.203", 6371),
+                    ("10.10.168.203", 6372),
+                    ("10.10.168.203", 6373),
+                ],
+            )
+        finally:
+            for k, v in old_values.items():
+                if v is not None:
+                    os.environ[k] = v
+                else:
+                    os.environ.pop(k, None)
+
+    def test_from_env_explicit_redis_mode_overrides_cluster_host(self):
+        """An explicit REDIS_MODE still wins over REDIS_CLUSTER_HOST's implied mode."""
+        env_vars = ["REDIS_MODE", "REDIS_CLUSTER_HOST"]
+        old_values = {k: os.environ.get(k) for k in env_vars}
+        try:
+            os.environ["REDIS_MODE"] = "standalone"
+            os.environ["REDIS_CLUSTER_HOST"] = "h1:6379"
+            self.assertEqual(RedisConfig.from_env().mode, "standalone")
+        finally:
+            for k, v in old_values.items():
+                if v is not None:
+                    os.environ[k] = v
+                else:
+                    os.environ.pop(k, None)
+
     def test_from_env_with_custom_values(self):
         """Test from_env with custom environment variables."""
         old_values = {

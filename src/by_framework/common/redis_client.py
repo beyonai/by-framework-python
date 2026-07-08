@@ -112,11 +112,11 @@ def init_redis_from_url(url: str) -> Redis:
 def get_redis() -> Redis:
     """Get the initialized global Redis client.
 
-    If not initialized, will automatically initialize with default config.
+    If not initialized, automatically initialize from environment config.
     """
     global _redis_client  # pylint: disable=global-variable-not-assigned
     if _redis_client is None:
-        return init_redis()
+        return init_redis(config=RedisConfig.from_env())
     return _redis_client
 
 
