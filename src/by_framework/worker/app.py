@@ -131,6 +131,17 @@ async def _run_worker_async(
     # parties can configure either mode purely programmatically or purely
     # via env vars, without the two modes behaving inconsistently.
     env_config = RedisConfig.from_env()
+    if redis_mode is not None:
+        effective_mode = redis_mode
+    elif redis_cluster_nodes:
+        # Mirrors REDIS_CLUSTER_HOST's env-var precedence: passing
+        # redis_cluster_nodes alone is enough to imply cluster mode, no
+        # separate redis_mode="cluster" required. Without this, passing
+        # redis_cluster_nodes alone would silently stay in standalone mode
+        # and the nodes list would be dropped on the floor.
+        effective_mode = "cluster"
+    else:
+        effective_mode = env_config.mode
     effective_config = replace(
         env_config,
         host=redis_host if redis_host is not None else env_config.host,
@@ -142,7 +153,7 @@ async def _run_worker_async(
         username=(
             redis_username if redis_username is not None else env_config.username
         ),
-        mode=redis_mode if redis_mode is not None else env_config.mode,
+        mode=effective_mode,
         cluster_nodes=(
             redis_cluster_nodes
             if redis_cluster_nodes is not None
@@ -276,16 +287,23 @@ def run_worker(
     Redis configuration: every redis_* argument defaults to None, meaning
     "not specified" - when not passed, the value is read from the
     corresponding REDIS_* environment variable (REDIS_HOST, REDIS_PORT,
-    REDIS_DB, REDIS_PASSWORD, REDIS_USERNAME, REDIS_MODE, REDIS_CLUSTER_HOST,
-    REDIS_CLUSTER_NODES), falling back to "localhost"/6379/standalone if
-    none is set. Setting REDIS_CLUSTER_HOST (comma-separated "host:port"
-    list) alone is enough to switch to cluster mode - no separate
-    REDIS_MODE=cluster required, though an explicit REDIS_MODE still wins if
-    set. An explicitly-passed argument always takes precedence over its env
-    var, for every field, in both standalone and cluster mode - so either
-    mode can be configured purely programmatically (e.g.
-    ``redis_mode="cluster", redis_cluster_nodes=[("h1", 6379)]``) or purely
-    via env vars, without the two modes behaving inconsistently.
+    REDIS_DATABASE, REDIS_PASSWORD, REDIS_USERNAME, REDIS_MODE,
+    REDIS_CLUSTER_HOST, REDIS_CLUSTER_NODES), falling back to
+    "localhost"/6379/standalone if none is set. REDIS_DATABASE replaces
+    REDIS_DB (still works as a deprecated fallback, logging a warning).
+    Setting REDIS_CLUSTER_HOST (comma-separated "host:port" list) alone is
+    enough to switch to cluster mode - no separate REDIS_MODE=cluster
+    required, though an explicit REDIS_MODE still wins if set; it also
+    implies REDIS_KEY_SCHEMA_VERSION=v2 unless that's set explicitly. An
+    explicitly-passed argument always takes precedence over its env var,
+    for every field, in both standalone and cluster mode. The same
+    single-argument convenience carries over to the programmatic path:
+    passing just ``redis_cluster_nodes=[("h1", 6379)]`` (no ``redis_mode``)
+    is enough to switch to cluster mode, mirroring REDIS_CLUSTER_HOST -
+    ``redis_mode`` only needs to be passed to explicitly force a mode
+    (e.g. pin a script to standalone regardless of REDIS_CLUSTER_HOST).
+    So either mode can be configured purely programmatically or purely via
+    env vars, without the two paths behaving inconsistently.
 
     Plugin support:
     - **Auto mode**: System automatically discovers and loads all subclasses

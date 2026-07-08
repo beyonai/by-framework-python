@@ -12,6 +12,7 @@ from by_framework.core.registry import WorkerRegistry
 REDIS_ENV_VARS = (
     "REDIS_HOST",
     "REDIS_PORT",
+    "REDIS_DATABASE",
     "REDIS_DB",
     "REDIS_PASSWORD",
     "REDIS_USERNAME",

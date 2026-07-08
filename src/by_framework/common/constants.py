@@ -12,10 +12,20 @@ from typing import Optional
 def get_key_schema_version() -> str:
     """Return the configured Redis key schema version ("v1" or "v2").
 
-    Controlled by REDIS_KEY_SCHEMA_VERSION, defaulting to "v1" (the current
-    unprefixed key format). Cluster mode requires "v2" (see redis_client.init_redis).
+    Controlled by REDIS_KEY_SCHEMA_VERSION, which always wins when set
+    explicitly. When it isn't set, REDIS_CLUSTER_HOST being configured
+    implies "v2" (cluster mode requires v2 - v1 keys have no hash tags and
+    hit CROSSSLOT errors under Cluster; see redis_client.init_redis's
+    fail-fast check); otherwise it defaults to "v1" (the legacy unprefixed
+    key format). This mirrors RedisConfig.from_env()'s REDIS_MODE/
+    REDIS_CLUSTER_HOST precedence, but deliberately does NOT infer "v2"
+    from an explicit REDIS_MODE=cluster alone (without REDIS_CLUSTER_HOST)
+    - that legacy explicit-mode path still requires
+    REDIS_KEY_SCHEMA_VERSION=v2 to be set by hand.
     """
-    version = os.environ.get("REDIS_KEY_SCHEMA_VERSION", "v1")
+    version = os.environ.get("REDIS_KEY_SCHEMA_VERSION")
+    if version is None:
+        version = "v2" if os.environ.get("REDIS_CLUSTER_HOST") else "v1"
     if version not in ("v1", "v2"):
         raise ValueError(
             f"Invalid REDIS_KEY_SCHEMA_VERSION: {version!r} (must be 'v1' or 'v2')"

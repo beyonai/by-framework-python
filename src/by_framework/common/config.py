@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 from by_framework.common.constants import RedisKeys
+from by_framework.common.logger import logger
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,9 @@ class RedisConfig:
         to switch to cluster mode, no separate REDIS_MODE=cluster needed.
         An explicit REDIS_MODE still takes precedence when set, so existing
         explicit REDIS_MODE=cluster + REDIS_CLUSTER_NODES setups keep working.
+
+        REDIS_DATABASE replaces REDIS_DB (which still works as a deprecated
+        fallback, logging a warning, during the transition period).
         """
         password = os.environ.get("REDIS_PASSWORD", "")
         username = os.environ.get("REDIS_USERNAME") or None
@@ -51,10 +55,15 @@ class RedisConfig:
             for node in cluster_nodes_str.split(","):
                 node_host, node_port = node.rsplit(":", 1)
                 cluster_nodes.append((node_host, int(node_port)))
+        db_str = os.environ.get("REDIS_DATABASE")
+        if db_str is None:
+            db_str = os.environ.get("REDIS_DB")
+            if db_str is not None:
+                logger.warning("REDIS_DB is deprecated, use REDIS_DATABASE instead")
         return cls(
             host=os.environ.get("REDIS_HOST", "localhost"),
             port=int(os.environ.get("REDIS_PORT", "6379")),
-            db=int(os.environ.get("REDIS_DB", "0")),
+            db=int(db_str) if db_str is not None else 0,
             password=password,
             username=username,
             max_connections=int(max_connections) if max_connections else None,
