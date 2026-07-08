@@ -226,6 +226,75 @@ async def test_run_worker_async_supports_fully_programmatic_cluster_config():
 
 
 @pytest.mark.asyncio
+async def test_run_worker_async_cluster_nodes_alone_implies_cluster_mode():
+    """Passing redis_cluster_nodes without redis_mode must imply cluster
+    mode, mirroring REDIS_CLUSTER_HOST's env-var precedence - otherwise the
+    nodes list would be silently dropped in standalone mode."""
+    with (
+        patch("by_framework.worker.app.init_redis") as mock_init_redis,
+        patch("by_framework.worker.app.close_redis", new_callable=AsyncMock),
+        patch("by_framework.worker.app.WorkerRegistry"),
+        patch("by_framework.worker.app.WorkspaceManager"),
+        patch("by_framework.worker.app.WorkerRunner") as mock_runner,
+    ):
+        mock_init_redis.return_value = MagicMock()
+        mock_runner.return_value.start = AsyncMock()
+
+        await _run_worker_async(
+            worker_class=MyTestWorker,
+            worker_id="test-w1",
+            redis_host=None,
+            redis_port=None,
+            redis_db=None,
+            redis_password=None,
+            redis_username=None,
+            workspace_dir="/tmp/test-ws",
+            consumer_group="test-group",
+            max_concurrency=10,
+            fetch_count=5,
+            redis_cluster_nodes=[("h1", 6379), ("h2", 6380)],
+        )
+
+        _, kwargs = mock_init_redis.call_args
+        assert kwargs["config"].mode == "cluster"
+        assert kwargs["config"].cluster_nodes == [("h1", 6379), ("h2", 6380)]
+
+
+@pytest.mark.asyncio
+async def test_run_worker_async_explicit_standalone_mode_overrides_cluster_nodes():
+    """An explicitly-passed redis_mode still wins over the redis_cluster_nodes
+    inference, for callers that need to force standalone regardless."""
+    with (
+        patch("by_framework.worker.app.init_redis") as mock_init_redis,
+        patch("by_framework.worker.app.close_redis", new_callable=AsyncMock),
+        patch("by_framework.worker.app.WorkerRegistry"),
+        patch("by_framework.worker.app.WorkspaceManager"),
+        patch("by_framework.worker.app.WorkerRunner") as mock_runner,
+    ):
+        mock_init_redis.return_value = MagicMock()
+        mock_runner.return_value.start = AsyncMock()
+
+        await _run_worker_async(
+            worker_class=MyTestWorker,
+            worker_id="test-w1",
+            redis_host=None,
+            redis_port=None,
+            redis_db=None,
+            redis_password=None,
+            redis_username=None,
+            workspace_dir="/tmp/test-ws",
+            consumer_group="test-group",
+            max_concurrency=10,
+            fetch_count=5,
+            redis_mode="standalone",
+            redis_cluster_nodes=[("h1", 6379)],
+        )
+
+        _, kwargs = mock_init_redis.call_args
+        assert kwargs["config"].mode == "standalone"
+
+
+@pytest.mark.asyncio
 async def test_run_worker_async_initializes_cluster_client_when_mode_is_cluster():
     """REDIS_MODE=cluster must route init_redis through config=, not the
     individual host/port args, so REDIS_CLUSTER_NODES is actually honored."""
