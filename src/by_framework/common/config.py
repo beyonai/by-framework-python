@@ -42,7 +42,9 @@ class RedisConfig:
         max_connections = os.environ.get("REDIS_MAX_CONNECTIONS")
         cluster_host_str = os.environ.get("REDIS_CLUSTER_HOST")
         cluster_nodes_str = cluster_host_str or os.environ.get("REDIS_CLUSTER_NODES")
-        mode = os.environ.get("REDIS_MODE") or ("cluster" if cluster_host_str else "standalone")
+        mode = os.environ.get("REDIS_MODE") or (
+            "cluster" if cluster_host_str else "standalone"
+        )
         cluster_nodes = None
         if cluster_nodes_str:
             cluster_nodes = []
