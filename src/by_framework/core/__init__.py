@@ -26,6 +26,7 @@ from .protocol import (
     BaiYingMessage,
     BaiYingMessageRole,
     BaseCommand,
+    CancelSessionResponse,
     CancelTaskCommand,
     CancelTaskResponse,
     DataMessage,
@@ -53,6 +54,7 @@ from .workspace import WorkspaceManager
 __all__ = [
     "SendMessageResponse",
     "CancelTaskResponse",
+    "CancelSessionResponse",
     "BaiYingMessage",
     "BaiYingMessageRole",
     "MessageContent",

@@ -8,6 +8,7 @@ from `GatewayWorker` and running `run_worker`.
 from .admin import WorkerManager
 from .client.byai_client import ByaiGatewayClient
 from .client.client import (
+    CancelSessionResponse,
     CancelTaskResponse,
     DataStreamEntry,
     GatewayClient,
@@ -148,6 +149,7 @@ __all__ = [
     "DataStreamEntry",
     "SendMessageResponse",
     "CancelTaskResponse",
+    "CancelSessionResponse",
     "run_worker",
     "logger",
     "setup_logging",
