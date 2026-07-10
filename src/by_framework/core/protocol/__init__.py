@@ -65,6 +65,7 @@ from .message import (
 )
 from .message_header import MessageHeader
 from .responses import (
+    CancelSessionResponse,
     CancelTaskResponse,
     CancelTaskResponseDict,
     SendMessageResponse,
@@ -81,6 +82,7 @@ from .results import (
 __all__ = [
     "SendMessageResponse",
     "CancelTaskResponse",
+    "CancelSessionResponse",
     "SendMessageResponseDict",
     "CancelTaskResponseDict",
     "AgentTaskResult",
