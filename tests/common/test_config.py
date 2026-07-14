@@ -195,6 +195,44 @@ class TestRedisConfig(unittest.TestCase):
                 else:
                     os.environ.pop(k, None)
 
+    def test_from_env_empty_cluster_host_is_treated_as_unset(self):
+        """An empty REDIS_CLUSTER_HOST (var present but blank) must not imply cluster mode."""
+        env_vars = ["REDIS_MODE", "REDIS_CLUSTER_HOST", "REDIS_CLUSTER_NODES"]
+        old_values = {k: os.environ.get(k) for k in env_vars}
+        try:
+            os.environ.pop("REDIS_MODE", None)
+            os.environ["REDIS_CLUSTER_HOST"] = ""
+            os.environ.pop("REDIS_CLUSTER_NODES", None)
+
+            config = RedisConfig.from_env()
+            self.assertEqual(config.mode, "standalone")
+            self.assertIsNone(config.cluster_nodes)
+        finally:
+            for k, v in old_values.items():
+                if v is not None:
+                    os.environ[k] = v
+                else:
+                    os.environ.pop(k, None)
+
+    def test_from_env_empty_cluster_host_falls_back_to_cluster_nodes(self):
+        """An empty REDIS_CLUSTER_HOST must not block fallback to REDIS_CLUSTER_NODES."""
+        env_vars = ["REDIS_MODE", "REDIS_CLUSTER_HOST", "REDIS_CLUSTER_NODES"]
+        old_values = {k: os.environ.get(k) for k in env_vars}
+        try:
+            os.environ["REDIS_MODE"] = "cluster"
+            os.environ["REDIS_CLUSTER_HOST"] = ""
+            os.environ["REDIS_CLUSTER_NODES"] = "h1:6379,h2:6380"
+
+            config = RedisConfig.from_env()
+            self.assertEqual(config.mode, "cluster")
+            self.assertEqual(config.cluster_nodes, [("h1", 6379), ("h2", 6380)])
+        finally:
+            for k, v in old_values.items():
+                if v is not None:
+                    os.environ[k] = v
+                else:
+                    os.environ.pop(k, None)
+
     def test_from_env_with_custom_values(self):
         """Test from_env with custom environment variables."""
         old_values = {
