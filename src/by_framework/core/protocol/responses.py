@@ -92,3 +92,14 @@ class CancelTaskResponse:
     timestamp: int
     error: str = ""
     cancelled_count: int = 0
+
+
+@dataclass(frozen=True)
+class CancelSessionResponse:
+    success: bool
+    session_id: str
+    status: str
+    timestamp: int
+    cancelled_count: int = 0
+    already_finished_count: int = 0
+    error: str = ""

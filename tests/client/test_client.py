@@ -1022,3 +1022,237 @@ async def test_client_cascading_cancel_root_completed_children_running():
     registry.mark_cancel_requested.assert_called_once_with(
         "exec-a", "sess-1", "user abort"
     )
+
+
+@pytest.mark.asyncio
+async def test_client_cancel_session_cancels_all_non_terminal_executions():
+    """Test that cancel_session cancels every non-terminal execution in a
+    session in one call, without needing a starting message_id."""
+    exec_a = {
+        "execution_id": "exec-a",
+        "message_id": "msg-a",
+        "session_id": "sess-1",
+        "worker_id": "worker-1",
+        "target_agent_type": "agent_a",
+        "status": "RUNNING",
+        "parent_message_id": "",
+    }
+    exec_b = {
+        "execution_id": "exec-b",
+        "message_id": "msg-b",
+        "session_id": "sess-1",
+        "worker_id": "worker-2",
+        "target_agent_type": "agent_b",
+        "status": "QUEUED",
+        "parent_message_id": "msg-a",
+    }
+
+    registry = AsyncMock()
+    registry.get_all_session_executions.return_value = [exec_a, exec_b]
+    redis = AsyncMock()
+    client = GatewayClient(registry=registry, redis_client=redis)
+
+    result = await client.cancel_session(session_id="sess-1", reason="user abort")
+
+    assert result.success is True
+    assert result.status == "CANCEL_REQUESTED"
+    assert result.cancelled_count == 2
+    assert result.already_finished_count == 0
+
+    assert registry.mark_execution_cancelling.call_count == 2
+    cancel_ids = [
+        call.args[0] for call in registry.mark_execution_cancelling.call_args_list
+    ]
+    assert "exec-a" in cancel_ids
+    assert "exec-b" in cancel_ids
+
+    assert redis.xadd.call_count == 2
+    target_streams = [call.args[0] for call in redis.xadd.call_args_list]
+    assert any("worker-1" in s for s in target_streams)
+    assert any("worker-2" in s for s in target_streams)
+
+
+@pytest.mark.asyncio
+async def test_client_cancel_session_flags_terminal_executions_without_cancelling():
+    """Terminal executions in the session should only be flagged with
+    cancel_requested (not re-marked cancelling, no CancelTaskCommand sent),
+    so a still-running descendant can't wake them back up via callback."""
+    exec_a = {
+        "execution_id": "exec-a",
+        "message_id": "msg-a",
+        "session_id": "sess-1",
+        "worker_id": "worker-1",
+        "target_agent_type": "agent_a",
+        "status": "COMPLETED",
+        "parent_message_id": "",
+    }
+    exec_b = {
+        "execution_id": "exec-b",
+        "message_id": "msg-b",
+        "session_id": "sess-1",
+        "worker_id": "worker-2",
+        "target_agent_type": "agent_b",
+        "status": "RUNNING",
+        "parent_message_id": "msg-a",
+    }
+
+    registry = AsyncMock()
+    registry.get_all_session_executions.return_value = [exec_a, exec_b]
+    redis = AsyncMock()
+    client = GatewayClient(registry=registry, redis_client=redis)
+
+    result = await client.cancel_session(session_id="sess-1", reason="user abort")
+
+    assert result.success is True
+    assert result.status == "CANCEL_REQUESTED"
+    assert result.cancelled_count == 1
+    assert result.already_finished_count == 1
+
+    # Only the non-terminal execution gets mark_execution_cancelling
+    registry.mark_execution_cancelling.assert_called_once_with(
+        "exec-b", "sess-1", "user abort"
+    )
+    # The terminal execution only gets flagged, not re-marked cancelling
+    registry.mark_cancel_requested.assert_called_once_with(
+        "exec-a", "sess-1", "user abort"
+    )
+
+    # Only one CancelTaskCommand sent, to the non-terminal execution's worker
+    assert redis.xadd.call_count == 1
+    target_streams = [call.args[0] for call in redis.xadd.call_args_list]
+    assert any("worker-2" in s for s in target_streams)
+    assert not any("worker-1" in s for s in target_streams)
+
+
+@pytest.mark.asyncio
+async def test_client_cancel_session_all_terminal_returns_already_finished():
+    """If every execution in the session is already terminal, cancel_session
+    should report failure with ALREADY_FINISHED and not dispatch anything."""
+    exec_a = {
+        "execution_id": "exec-a",
+        "message_id": "msg-a",
+        "session_id": "sess-1",
+        "worker_id": "worker-1",
+        "target_agent_type": "agent_a",
+        "status": "COMPLETED",
+        "parent_message_id": "",
+    }
+    exec_b = {
+        "execution_id": "exec-b",
+        "message_id": "msg-b",
+        "session_id": "sess-1",
+        "worker_id": "worker-2",
+        "target_agent_type": "agent_b",
+        "status": "FAILED",
+        "parent_message_id": "msg-a",
+    }
+
+    registry = AsyncMock()
+    registry.get_all_session_executions.return_value = [exec_a, exec_b]
+    redis = AsyncMock()
+    client = GatewayClient(registry=registry, redis_client=redis)
+
+    result = await client.cancel_session(session_id="sess-1", reason="user abort")
+
+    assert result.success is False
+    assert result.status == "ALREADY_FINISHED"
+    assert result.cancelled_count == 0
+    assert result.already_finished_count == 2
+
+    registry.mark_execution_cancelling.assert_not_called()
+    assert registry.mark_cancel_requested.call_count == 2
+    redis.xadd.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_client_cancel_session_empty_session_returns_not_found():
+    """A session with no executions at all should return NOT_FOUND, not be
+    confused with a session whose executions are all already finished."""
+    registry = AsyncMock()
+    registry.get_all_session_executions.return_value = []
+    redis = AsyncMock()
+    client = GatewayClient(registry=registry, redis_client=redis)
+
+    result = await client.cancel_session(session_id="sess-unknown", reason="")
+
+    assert result.success is False
+    assert result.status == "NOT_FOUND"
+    assert result.cancelled_count == 0
+    assert result.already_finished_count == 0
+
+    registry.mark_execution_cancelling.assert_not_called()
+    registry.mark_cancel_requested.assert_not_called()
+    redis.xadd.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_client_cancel_session_marks_registry_when_worker_not_assigned():
+    """A non-terminal execution that hasn't been claimed by a worker yet
+    (no worker_id) should still be marked cancelling, but no
+    CancelTaskCommand can be routed anywhere for it yet."""
+    exec_a = {
+        "execution_id": "exec-a",
+        "message_id": "msg-a",
+        "session_id": "sess-1",
+        "worker_id": "",
+        "target_agent_type": "agent_a",
+        "status": "QUEUED",
+        "parent_message_id": "",
+    }
+
+    registry = AsyncMock()
+    registry.get_all_session_executions.return_value = [exec_a]
+    redis = AsyncMock()
+    client = GatewayClient(registry=registry, redis_client=redis)
+
+    result = await client.cancel_session(session_id="sess-1", reason="user abort")
+
+    assert result.success is True
+    assert result.status == "CANCEL_REQUESTED"
+    assert result.cancelled_count == 1
+
+    registry.mark_execution_cancelling.assert_called_once_with(
+        "exec-a", "sess-1", "user abort"
+    )
+    redis.xadd.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_client_cancel_session_without_registry_raises():
+    """cancel_session should fail the same way cancel_task does when the
+    client was constructed without a WorkerRegistry."""
+    redis = AsyncMock()
+    client = GatewayClient(registry=None, redis_client=redis)
+
+    with pytest.raises(ValueError):
+        await client.cancel_session(session_id="sess-1")
+
+
+@pytest.mark.asyncio
+async def test_byai_client_cancel_session_inherited_unmodified():
+    """ByaiGatewayClient only overrides send_message; cancel_session should
+    be inherited from GatewayClient and behave identically."""
+    exec_a = {
+        "execution_id": "exec-a",
+        "message_id": "msg-a",
+        "session_id": "sess-1",
+        "worker_id": "worker-1",
+        "target_agent_type": "agent_a",
+        "status": "RUNNING",
+        "parent_message_id": "",
+    }
+
+    registry = AsyncMock()
+    registry.get_all_session_executions.return_value = [exec_a]
+    redis = AsyncMock()
+    client = ByaiGatewayClient(registry=registry, redis_client=redis)
+
+    result = await client.cancel_session(session_id="sess-1", reason="user abort")
+
+    assert result.success is True
+    assert result.status == "CANCEL_REQUESTED"
+    assert result.cancelled_count == 1
+    registry.mark_execution_cancelling.assert_called_once_with(
+        "exec-a", "sess-1", "user abort"
+    )
+    assert redis.xadd.call_count == 1

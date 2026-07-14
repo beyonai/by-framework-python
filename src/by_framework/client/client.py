@@ -37,6 +37,7 @@ from by_framework.core.protocol.commands import (
 from by_framework.core.protocol.data_message import DataMessage
 from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.core.protocol.responses import (
+    CancelSessionResponse,
     CancelTaskResponse,
     ExecutionStatus,
     SendMessageResponse,
@@ -579,6 +580,99 @@ class GatewayClient:
             status=ExecutionStatus.CANCEL_REQUESTED,
             timestamp=int(time.time() * 1000),
             cancelled_count=len(to_cancel),
+        )
+
+    async def cancel_session(
+        self,
+        session_id: str,
+        reason: str = "",
+        requested_by: str = "client",
+        cancel_mode: str = CancelMode.GRACEFUL,
+    ) -> CancelSessionResponse:
+        """Cancel every active execution registered under a session.
+
+        Unlike cancel_task, this does not require a starting message_id:
+        it cancels the whole session's active executions in one call.
+        """
+        if self.registry is None:
+            raise ValueError("GatewayClient requires a WorkerRegistry to cancel tasks")
+
+        all_executions = await self.registry.get_all_session_executions(session_id)
+
+        if not all_executions:
+            return CancelSessionResponse(
+                success=False,
+                session_id=session_id,
+                status=ExecutionStatus.NOT_FOUND,
+                timestamp=int(time.time() * 1000),
+                cancelled_count=0,
+                already_finished_count=0,
+            )
+
+        terminal_states = {"COMPLETED", "FAILED", "CANCELLED"}
+        to_cancel = [
+            node
+            for node in all_executions
+            if node.get("status", "") not in terminal_states
+        ]
+        terminal_nodes = [
+            node for node in all_executions if node.get("status", "") in terminal_states
+        ]
+
+        # Flag terminal executions so a still-running descendant can't wake
+        # them back up via callback, without changing their status.
+        for node in terminal_nodes:
+            await self.registry.mark_cancel_requested(
+                node.get("execution_id", ""), session_id, reason
+            )
+
+        if not to_cancel:
+            return CancelSessionResponse(
+                success=False,
+                session_id=session_id,
+                status=ExecutionStatus.ALREADY_FINISHED,
+                timestamp=int(time.time() * 1000),
+                cancelled_count=0,
+                already_finished_count=len(terminal_nodes),
+            )
+
+        for node in to_cancel:
+            node_execution_id = node.get("execution_id", "")
+            node_worker_id = node.get("worker_id", "")
+            node_message_id = node.get("message_id", "")
+
+            await self.registry.mark_execution_cancelling(
+                node_execution_id, session_id, reason
+            )
+
+            if node_worker_id:
+                cancel_command = CancelTaskCommand(
+                    header=MessageHeader(
+                        message_id=f"{CANCEL_MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}",
+                        session_id=session_id,
+                        trace_id=node.get("trace_id") or uuid.uuid4().hex,
+                        target_agent_type=node.get("target_agent_type", ""),
+                        parent_message_id=node_message_id,
+                    ),
+                    target_message_id=node_message_id,
+                    target_execution_id=node_execution_id,
+                    target_worker_id=node_worker_id,
+                    reason=reason,
+                    requested_by=requested_by,
+                    cancel_mode=cancel_mode,
+                )
+                await self.redis.xadd(
+                    RedisKeys.worker_ctrl_stream(node_worker_id),
+                    cancel_command.to_redis_payload(),
+                )
+
+        return CancelSessionResponse(
+            success=True,
+            session_id=session_id,
+            status=ExecutionStatus.CANCEL_REQUESTED,
+            timestamp=int(time.time() * 1000),
+            cancelled_count=len(to_cancel),
+            already_finished_count=len(terminal_nodes),
         )
 
     async def send_message(
