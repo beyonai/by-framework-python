@@ -522,6 +522,12 @@ class TestGetKeySchemaVersion(unittest.TestCase):
         os.environ["REDIS_KEY_SCHEMA_VERSION"] = "v1"
         self.assertEqual(get_key_schema_version(), "v1")
 
+    def test_empty_cluster_host_is_treated_as_unset(self):
+        """An empty REDIS_CLUSTER_HOST (var present but blank) must not imply v2."""
+        os.environ.pop("REDIS_KEY_SCHEMA_VERSION", None)
+        os.environ["REDIS_CLUSTER_HOST"] = ""
+        self.assertEqual(get_key_schema_version(), "v1")
+
 
 if __name__ == "__main__":
     unittest.main()
