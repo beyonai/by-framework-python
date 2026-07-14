@@ -196,7 +196,7 @@ class TestRedisConfig(unittest.TestCase):
                     os.environ.pop(k, None)
 
     def test_from_env_empty_cluster_host_is_treated_as_unset(self):
-        """An empty REDIS_CLUSTER_HOST (var present but blank) must not imply cluster mode."""
+        """A blank REDIS_CLUSTER_HOST (present but empty) doesn't imply cluster mode."""
         env_vars = ["REDIS_MODE", "REDIS_CLUSTER_HOST", "REDIS_CLUSTER_NODES"]
         old_values = {k: os.environ.get(k) for k in env_vars}
         try:
@@ -215,7 +215,7 @@ class TestRedisConfig(unittest.TestCase):
                     os.environ.pop(k, None)
 
     def test_from_env_empty_cluster_host_falls_back_to_cluster_nodes(self):
-        """An empty REDIS_CLUSTER_HOST must not block fallback to REDIS_CLUSTER_NODES."""
+        """A blank REDIS_CLUSTER_HOST must not block fallback to REDIS_CLUSTER_NODES."""
         env_vars = ["REDIS_MODE", "REDIS_CLUSTER_HOST", "REDIS_CLUSTER_NODES"]
         old_values = {k: os.environ.get(k) for k in env_vars}
         try:
