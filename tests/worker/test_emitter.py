@@ -4,7 +4,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from by_framework.common.emitter import (DefaultSseLayoutBuilder, GatewayDataEmitter)
-from by_framework.core.protocol.content_type import SseMessageType
+from by_framework.core.protocol.content_type import (
+    SseMessageType,
+    SseReasonMessageType,
+)
 
 
 class CustomLayoutBuilder:
@@ -129,6 +132,43 @@ async def test_default_sse_builder_owns_ask_user_form_payload():
             }
         ],
     }
+
+
+def test_default_sse_builder_preserves_structured_ask_user_questions():
+    builder = DefaultSseLayoutBuilder()
+    prompt = json.dumps(
+        {
+            "questions": [
+                {
+                    "question": "Which environment?",
+                    "options": ["development", "production"],
+                }
+            ]
+        }
+    )
+
+    data = builder.build_ask_user(prompt, "agent-1")
+
+    assert data["contentType"] == SseReasonMessageType.ask_user_question.value
+    assert data["choices"][0]["delta"]["content"] == prompt
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        '{"title": "Missing questions"}',
+        '[{"questions": []}]',
+        "not valid json",
+    ],
+)
+def test_default_sse_builder_wraps_non_question_prompts_in_input_form(prompt):
+    builder = DefaultSseLayoutBuilder()
+
+    data = builder.build_ask_user(prompt, "agent-1")
+    input_form = json.loads(data["choices"][0]["delta"]["content"])
+
+    assert data["contentType"] == SseReasonMessageType.task_user_input.value
+    assert input_form["pluginMachineFields"][0]["description"] == prompt
 
 
 @pytest.mark.asyncio
