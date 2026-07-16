@@ -1011,7 +1011,8 @@ class WorkerRegistry:
         old_execution = dict(current)
         current["status"] = status
         now = int(time.time() * 1000)
-        current["finished_at"] = now
+        if is_terminal_state(status):
+            current["finished_at"] = now
         current["updated_at"] = now
         if completion:
             for key, value in completion.items():

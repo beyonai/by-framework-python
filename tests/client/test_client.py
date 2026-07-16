@@ -1256,3 +1256,114 @@ async def test_byai_client_cancel_session_inherited_unmodified():
         "exec-a", "sess-1", "user abort"
     )
     assert redis.xadd.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_client_send_message_resume_reuses_existing_execution_id():
+    """Resuming a suspended execution must reuse its execution_id and must
+    not re-initialize the registry record for it. initialize_execution()
+    unconditionally overwrites the message_id -> execution_id mapping, which
+    would silently detach the ResumeCommand from the original (still
+    WAITING_USER) execution and orphan it."""
+    mock_redis = AsyncMock()
+    mock_registry = AsyncMock()
+    mock_registry.get_execution_by_message_id.return_value = {
+        "execution_id": "exec-original",
+        "message_id": "msg-1",
+        "session_id": "s1",
+        "status": "WAITING_USER",
+    }
+
+    client = GatewayClient(redis_client=mock_redis, registry=mock_registry)
+    await client.send_message(
+        target_agent_type="langgraph_agent",
+        session_id="s1",
+        content="user reply",
+        action_type="RESUME",
+        message_id="msg-1",
+        target_worker_id="worker-42",
+    )
+
+    mock_registry.get_execution_by_message_id.assert_awaited_once_with(
+        "msg-1", session_id="s1"
+    )
+    mock_registry.initialize_execution.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_client_send_message_resume_without_match_falls_back_to_new_execution():
+    """A RESUME whose message_id doesn't resolve to an existing execution
+    (e.g. a genuinely new resume-shaped message) falls back to today's
+    behavior: mint a fresh execution_id and initialize it in the registry."""
+    mock_redis = AsyncMock()
+    mock_registry = AsyncMock()
+    mock_registry.get_execution_by_message_id.return_value = None
+
+    client = GatewayClient(redis_client=mock_redis, registry=mock_registry)
+    await client.send_message(
+        target_agent_type="langgraph_agent",
+        session_id="s1",
+        content="user reply",
+        action_type="RESUME",
+        message_id="msg-unmatched",
+        target_worker_id="worker-42",
+    )
+
+    mock_registry.get_execution_by_message_id.assert_awaited_once_with(
+        "msg-unmatched", session_id="s1"
+    )
+    mock_registry.initialize_execution.assert_awaited_once()
+    initialized = mock_registry.initialize_execution.await_args.args[0]
+    assert initialized["message_id"] == "msg-unmatched"
+    assert initialized["execution_id"]
+
+
+@pytest.mark.asyncio
+async def test_client_send_message_ask_agent_does_not_query_registry_for_resume_match():
+    """A fresh ASK_AGENT dispatch always gets a new message_id, so there is
+    nothing to reattach to -- it should skip the resume lookup entirely and
+    keep minting+initializing a new execution as before."""
+    mock_redis = AsyncMock()
+    mock_registry = AsyncMock()
+
+    client = GatewayClient(redis_client=mock_redis, registry=mock_registry)
+    await client.send_message(
+        target_agent_type="langgraph_agent",
+        session_id="s1",
+        content="hello",
+        action_type="ASK_AGENT",
+        message_id="msg-new",
+        target_worker_id="worker-42",
+    )
+
+    mock_registry.get_execution_by_message_id.assert_not_called()
+    mock_registry.initialize_execution.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_client_send_message_resume_falls_back_when_registry_lacks_lookup():
+    """A registry double/implementation without get_execution_by_message_id
+    must not blow up a RESUME send -- mirror the defensive hasattr() guard
+    already used for initialize_execution() and fall back to minting a new
+    execution_id."""
+    mock_redis = AsyncMock()
+
+    class RegistryWithoutLookup:
+        async def initialize_execution(self, execution):
+            return None
+
+        async def is_worker_online(self, worker_id):
+            return True
+
+    client = GatewayClient(redis_client=mock_redis, registry=RegistryWithoutLookup())
+
+    response = await client.send_message(
+        target_agent_type="langgraph_agent",
+        session_id="s1",
+        content="user reply",
+        action_type="RESUME",
+        message_id="msg-1",
+        target_worker_id="worker-42",
+    )
+
+    assert response.success is True
