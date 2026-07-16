@@ -107,6 +107,22 @@ class DefaultSseLayoutBuilder(DataLayoutBuilder):
         parent_order_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build default BaiYing-compatible user input form payload."""
+        try:
+            parsed_prompt = json.loads(prompt)
+        except (json.JSONDecodeError, TypeError):
+            parsed_prompt = None
+
+        # Structured question prompts are already in the format expected by clients.
+        if isinstance(parsed_prompt, dict) and "questions" in parsed_prompt:
+            return self.build(
+                content=prompt,
+                role="assistant",
+                content_type=SseReasonMessageType.ask_user_question.value,
+                source_agent_type=source_agent_type,
+                order_id=order_id,
+                parent_order_id=parent_order_id,
+            )
+
         input_form = {
             "formStatus": 0,
             "pluginMachineFields": [

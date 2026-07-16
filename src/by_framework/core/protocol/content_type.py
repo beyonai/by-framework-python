@@ -33,6 +33,7 @@ class SseReasonMessageType(str, Enum):
     think_code_result = "3007"  # thinking process code execution result
     task_finished = "3009"  # task finished
     task_user_input = "3013"  # user input
+    ask_user_question = "3014"  # ask user question
     task_create_file = "3010"  # create file
     task_title = "3011"  # task title
     agent_card = "2015"  # agent card
