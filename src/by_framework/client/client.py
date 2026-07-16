@@ -785,7 +785,28 @@ class GatewayClient:
             content=params["content"],
             extra_payload=params["extra_payload"],
         )
-        execution_id = f"{EXECUTION_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+
+        # A RESUME reuses the message_id of the original AskAgentCommand so the
+        # worker can look the suspended execution back up. Reuse its
+        # execution_id too, and skip re-initializing the registry record for
+        # it below -- initialize_execution() would otherwise overwrite the
+        # message_id -> execution_id mapping and detach this resume from the
+        # execution it's meant to continue.
+        resumed_execution = None
+        if (
+            params["action_type"] == ActionType.RESUME.value
+            and self.registry
+            and hasattr(self.registry, "get_execution_by_message_id")
+        ):
+            resumed_execution = await self.registry.get_execution_by_message_id(
+                message_id, session_id=params["session_id"]
+            )
+
+        execution_id = (
+            resumed_execution["execution_id"]
+            if resumed_execution
+            else f"{EXECUTION_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+        )
 
         # 3. Resolve route and optionally probe agent type/liveness
         should_dispatch_control = True
@@ -931,8 +952,14 @@ class GatewayClient:
                 error_code=ExecutionStatus.ERR_AGENT_TYPE_UNAVAILABLE,
             )
 
-        # Initialize execution tracking
-        if self.registry and hasattr(self.registry, "initialize_execution"):
+        # Initialize execution tracking. Skipped for a RESUME that reattached
+        # to an existing execution -- that execution is already tracked, and
+        # re-initializing it here would overwrite its message_id mapping.
+        if (
+            not resumed_execution
+            and self.registry
+            and hasattr(self.registry, "initialize_execution")
+        ):
             try:
                 await self.registry.initialize_execution(
                     {

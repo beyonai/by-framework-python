@@ -505,6 +505,16 @@ class WorkerRunner:
                     header.message_id, session_id=header.session_id
                 )
 
+            if isinstance(command, ResumeCommand) and existing_execution is None:
+                logger.warning(
+                    "[%s] ResumeCommand did not resolve to an existing execution "
+                    "(message_id=%s, session_id=%s); starting a new, disconnected "
+                    "execution instead of continuing the suspended one.",
+                    self.worker.worker_id,
+                    header.message_id,
+                    header.session_id,
+                )
+
             # Skip terminal state replays
             if (
                 existing_execution

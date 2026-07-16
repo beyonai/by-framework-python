@@ -641,6 +641,38 @@ async def test_registry_tracks_execution_lifecycle():
     await registry.mark_execution_finished("exec-1", "sess-1", "CANCELLED")
     finished = await registry.get_execution("exec-1", "sess-1")
     assert finished["status"] == "CANCELLED"
+    assert finished["finished_at"] > 0
+
+
+@pytest.mark.asyncio
+async def test_mark_execution_finished_skips_finished_at_for_non_terminal_status():
+    """WAITING_USER (ask_user suspension) and other non-terminal statuses are
+    not "finished" -- stamping finished_at for them makes suspended
+    executions look completed to anything reading the registry (e.g.
+    metrics/snapshot.py's latency calculations)."""
+    redis_mock = MockRedis()
+    registry = WorkerRegistry(redis_mock)
+
+    execution = {
+        "execution_id": "exec-1",
+        "message_id": "msg-1",
+        "session_id": "sess-1",
+        "worker_id": "worker-1",
+        "target_agent_type": "langgraph_agent",
+        "status": "RUNNING",
+        "cancel_requested": False,
+    }
+    await registry.save_execution(execution)
+
+    await registry.mark_execution_finished("exec-1", "sess-1", "WAITING_USER")
+    suspended = await registry.get_execution("exec-1", "sess-1")
+    assert suspended["status"] == "WAITING_USER"
+    assert suspended.get("finished_at", 0) == 0
+
+    await registry.mark_execution_finished("exec-1", "sess-1", "COMPLETED")
+    finished = await registry.get_execution("exec-1", "sess-1")
+    assert finished["status"] == "COMPLETED"
+    assert finished["finished_at"] > 0
 
 
 @pytest.mark.asyncio

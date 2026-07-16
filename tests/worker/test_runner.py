@@ -17,6 +17,7 @@ from by_framework.core.protocol.commands import (
     AskAgentCommand,
     CancelTaskCommand,
     ReloadPluginsCommand,
+    ResumeCommand,
 )
 from by_framework.core.protocol.message_header import MessageHeader
 
@@ -780,6 +781,81 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
 
         worker.plugin_registry.log_hook_stats.assert_called_once()
         worker.plugin_registry.on_worker_shutdown.assert_awaited_once_with(worker)
+
+    async def test_runner_warns_when_resume_command_execution_lookup_misses(self):
+        """A ResumeCommand whose message_id/session_id don't resolve to an
+        existing execution silently starts a brand-new, disconnected
+        execution today. That failure mode should at least be visible in
+        logs instead of passing unnoticed."""
+        redis_mock = MockRedisRunner(message_to_return=[])
+        worker = DummyWorker()
+        worker.registry = AsyncMock()
+        worker.registry.get_execution_by_message_id.return_value = None
+
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            span_recorder=AsyncMock(),
+        )
+        runner._trace_writer = AsyncMock()
+        payload = ResumeCommand(
+            header=MessageHeader(
+                message_id="msg-orphan",
+                session_id="sess-orphan",
+                trace_id="trace-1",
+                target_agent_type="dummy_agent",
+            ),
+            content="user reply",
+        ).to_dict()
+
+        with self.assertLogs("by-framework", level="WARNING") as captured:
+            await runner._process_message_from_dict(
+                RedisKeys.ctrl_stream("dummy_agent"), "1-0", payload
+            )
+
+        self.assertTrue(
+            any(
+                "msg-orphan" in record and "sess-orphan" in record
+                for record in captured.output
+            ),
+            captured.output,
+        )
+
+    async def test_runner_does_not_warn_when_resume_command_execution_resolves(self):
+        """A ResumeCommand that correctly resolves to its suspended execution
+        should not trip the orphan-resume warning."""
+        redis_mock = MockRedisRunner(message_to_return=[])
+        worker = DummyWorker()
+        worker.registry = AsyncMock()
+        worker.registry.get_execution_by_message_id.return_value = {
+            "execution_id": "exec-1",
+            "message_id": "msg-1",
+            "session_id": "sess-1",
+            "status": "WAITING_USER",
+        }
+
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            span_recorder=AsyncMock(),
+        )
+        runner._trace_writer = AsyncMock()
+        payload = ResumeCommand(
+            header=MessageHeader(
+                message_id="msg-1",
+                session_id="sess-1",
+                trace_id="trace-1",
+                target_agent_type="dummy_agent",
+            ),
+            content="user reply",
+        ).to_dict()
+
+        with self.assertNoLogs("by-framework", level="WARNING"):
+            await runner._process_message_from_dict(
+                RedisKeys.ctrl_stream("dummy_agent"), "1-0", payload
+            )
 
     async def test_runner_invalid_control_message_is_acked_without_handler(self):
         """Test that invalid control messages are acked without calling the handler."""
