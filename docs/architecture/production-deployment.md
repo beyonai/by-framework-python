@@ -81,9 +81,10 @@ of quad-bullets.
    directly. `deploy/kubernetes/worker-deployment.yaml` deliberately omits a
    probe rather than wiring one to a proxy signal (e.g. bare `pgrep`) that
    doesn't actually reflect health — a probe that always reports "healthy"
-   is worse than no probe. Needs a real design decision (new HTTP port on
-   the Worker? a lightweight exec probe that shells out to `by-admin`? some
-   third option?) before it's implemented, not a quick fix.
+   is worse than no probe. **Designed, not yet implemented** — see
+   `docs/architecture/worker-readiness-endpoint.md` for the full design
+   record (a `/readyz` HTTP endpoint, readiness-only, opt-in via
+   `--health-port`) from the 2026-07-23 `/grilling` session.
 
 ## CI validation
 
