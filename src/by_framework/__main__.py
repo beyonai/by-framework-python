@@ -12,6 +12,17 @@ import importlib
 from .worker.app import run_worker
 
 
+def _parse_cluster_nodes(value: str):
+    """Parse a comma-separated "host:port,host:port" string, mirroring
+    RedisConfig.from_env()'s REDIS_CLUSTER_HOST/REDIS_CLUSTER_NODES parsing
+    so the CLI and env-var paths accept the same format."""
+    nodes = []
+    for node in value.split(","):
+        node_host, node_port = node.rsplit(":", 1)
+        nodes.append((node_host, int(node_port)))
+    return nodes
+
+
 def parse_args():
     """Parse command line arguments for the CLI runner."""
     parser = argparse.ArgumentParser(description="By-Framework CLI Runner")
@@ -25,12 +36,55 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--redis-host", type=str, default="localhost", help="Redis server hostname"
+        "--redis-host",
+        type=str,
+        default=None,
+        help="Redis server hostname (default: REDIS_HOST env var, then 'localhost')",
     )
     parser.add_argument(
-        "--redis-port", type=int, default=6379, help="Redis server port"
+        "--redis-port",
+        type=int,
+        default=None,
+        help="Redis server port (default: REDIS_PORT env var, then 6379)",
     )
-    parser.add_argument("--redis-db", type=int, default=0, help="Redis database number")
+    parser.add_argument(
+        "--redis-db",
+        type=int,
+        default=None,
+        help="Redis database number (default: REDIS_DATABASE env var, then 0)",
+    )
+    parser.add_argument(
+        "--redis-password",
+        type=str,
+        default=None,
+        help="Redis password (default: REDIS_PASSWORD env var)",
+    )
+    parser.add_argument(
+        "--redis-username",
+        type=str,
+        default=None,
+        help="Redis username, for ACL-enabled Redis (default: REDIS_USERNAME env var)",
+    )
+    parser.add_argument(
+        "--redis-mode",
+        type=str,
+        choices=["standalone", "cluster"],
+        default=None,
+        help=(
+            "Redis deployment mode (default: REDIS_MODE env var; implied by "
+            "--redis-cluster-nodes/REDIS_CLUSTER_HOST alone if neither is set)"
+        ),
+    )
+    parser.add_argument(
+        "--redis-cluster-nodes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated Redis Cluster seed nodes, 'host:port,host:port' "
+            "(default: REDIS_CLUSTER_HOST/REDIS_CLUSTER_NODES env var). "
+            "Passing this alone implies --redis-mode cluster."
+        ),
+    )
     parser.add_argument(
         "--worker-id", type=str, default="worker-1", help="Unique worker identifier"
     )
@@ -68,13 +122,26 @@ def main():
 
     print(f"Starting worker class: {worker_class.__name__} (ID: {args.worker_id})")
 
-    # Delegate to the common launcher
+    redis_cluster_nodes = (
+        _parse_cluster_nodes(args.redis_cluster_nodes)
+        if args.redis_cluster_nodes
+        else None
+    )
+
+    # Delegate to the common launcher. Every redis_* arg defaults to None
+    # here (not a literal like "localhost"), same as run_worker()'s own
+    # defaults, so an unset CLI flag actually falls through to the
+    # corresponding REDIS_* env var instead of silently shadowing it.
     run_worker(
         worker_class=worker_class,
         worker_id=args.worker_id,
         redis_host=args.redis_host,
         redis_port=args.redis_port,
         redis_db=args.redis_db,
+        redis_password=args.redis_password,
+        redis_username=args.redis_username,
+        redis_mode=args.redis_mode,
+        redis_cluster_nodes=redis_cluster_nodes,
         workspace_dir=args.workspace,
         max_concurrency=args.max_concurrency,
         fetch_count=args.fetch_count,

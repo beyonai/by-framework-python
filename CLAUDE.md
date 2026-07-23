@@ -163,6 +163,7 @@ Pre-commit hooks are configured in `.pre-commit-config.yaml` and run isort, ruff
 |---|---|
 | any source file | `docs/architecture/KEY_FILES.md` — find the file's entry |
 | Redis connection setup, cluster-mode, or key-schema versioning (`RedisConfig`, `RedisKeys`, `_get_redis()`, admin-index writes) | `docs/architecture/redis-cluster-mode.md` |
+| Worker deployment/production-readiness — README's 部署 section, `__main__.py` CLI flags, `run_worker()`'s signature, or shutdown/signal handling | `docs/architecture/production-deployment.md` |
 
 ## Maintaining this map
 
