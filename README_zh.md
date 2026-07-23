@@ -221,6 +221,11 @@ async def main():
 asyncio.run(main())
 ```
 
+可运行的完整版本见 [`examples/echo_worker.py`](examples/echo_worker.py)（Worker）和
+[`examples/send_and_verify.py`](examples/send_and_verify.py)（客户端，会一直等到收到回显再退出）——
+`deploy/` 下的 CI 冒烟测试用的就是这一对，见
+[`docs/architecture/production-deployment.md`](docs/architecture/production-deployment.md)。
+
 ---
 
 ## 核心概念
@@ -592,11 +597,27 @@ python -m by_framework --worker-class my_agent.MyAgent --worker-id worker-02 &
 python -m by_framework --worker-class my_agent.MyAgent --worker-id worker-03 &
 ```
 
+`&` 适合本地快速验证，但不是真正的进程编排——实际部署请使用
+[`deploy/`](deploy/) 目录下的参考 Dockerfile、Compose 文件和 Kubernetes
+Deployment：
+
+```bash
+# Docker Compose —— N 个受进程守护的副本，各自独立的 worker id、重启策略
+docker compose -f deploy/docker-compose.yml up --build --scale worker=3
+
+# Kubernetes —— 同样的思路，写成 Deployment
+kubectl apply -f deploy/kubernetes/worker-deployment.yaml
+```
+
+CLI 现在也支持 `--redis-password`、`--redis-username`、`--redis-mode`、
+`--redis-cluster-nodes`（与上面 Compose/Kubernetes 示例里用的 `REDIS_*`
+环境变量一一对应）——见 `python -m by_framework --help`。
+
 ### 可靠性
 
 - **消息持久化：** 消息存储在 Redis Streams 中，直到显式确认（`XACK`）。未确认的消息在 Worker 重启后重新投递。
 - **配置持久化：** Agent 配置快照持久化到 Redis，Worker 重启后恢复上次已知配置。
-- **优雅退出：** `WorkerRunner` 在退出前排空进行中的任务，确认已完成的工作。
+- **优雅退出：** `WorkerRunner` 在退出前排空进行中的任务，确认已完成的工作。这一逻辑同时挂在 `SIGINT`（Ctrl+C）和 `SIGTERM`——也就是 `docker stop`/Kubernetes Pod 终止实际发送的信号——上，因此在真实容器编排下也能触发，而不仅是交互式终端里的 Ctrl+C。请给 `stop_grace_period`/`terminationGracePeriodSeconds` 留出覆盖最长任务耗时的余量（见 `deploy/` 示例），因为宽限期后的强制 `SIGKILL` 会完全跳过排空过程。
 - **数据与控制分离：** 数据输出到会话级 Stream，与 Worker 扩缩容解耦。
 
 ### 日志

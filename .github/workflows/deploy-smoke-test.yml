@@ -1,0 +1,59 @@
+name: Deploy Smoke Test
+
+# Validates deploy/'s Dockerfile + docker-compose.yml actually deliver a
+# message through the full pipeline - client sends -> Redis control stream
+# -> Worker consumes -> Worker replies -> Redis data stream -> client reads
+# - using examples/echo_worker.py, built from THIS commit's source (not the
+# last PyPI release; see deploy/Dockerfile's BY_FRAMEWORK_SOURCE=local mode).
+# See docs/architecture/production-deployment.md.
+
+on:
+  pull_request:
+    paths:
+      - "deploy/**"
+      - "examples/**"
+      - "src/by_framework/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/deploy-smoke-test.yml"
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "deploy/**"
+      - "examples/**"
+      - "src/by_framework/**"
+  workflow_dispatch:
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    env:
+      BY_FRAMEWORK_SOURCE: local
+      WORKER_CLASS: examples.echo_worker.EchoWorker
+      REDIS_HOST: localhost
+      REDIS_PORT: "6379"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install by-framework (for the verify client script below)
+        run: uv sync
+
+      - name: Build and start Redis + Worker via deploy/docker-compose.yml
+        run: docker compose -f deploy/docker-compose.yml up --build -d
+
+      - name: Send a message and verify the Worker echoes it back
+        run: uv run python examples/send_and_verify.py
+
+      - name: Worker logs
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml logs worker
+
+      - name: Tear down
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v

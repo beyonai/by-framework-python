@@ -1,0 +1,49 @@
+# Minimal reference Deployment for a by-framework Worker. Replaces the
+# README's shell-`&` "水平扩展" example with a real, supervised, restart-on-
+# failure orchestration form. Adjust image/replicas/resources for your setup.
+#
+# No liveness/readiness probe is set here on purpose: the Worker process
+# exposes no HTTP/exec health surface today (tracked as a known gap in
+# docs/architecture/production-deployment.md, gap 5) - the only liveness
+# signal is the Redis-backed heartbeat TTL key, readable via
+# `by-admin worker list`/`worker info`, not a local probe target. Wiring a
+# probe to something that doesn't actually reflect health (e.g. bare
+# `pgrep`) would be worse than no probe - don't add one until a real
+# endpoint exists.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-agent-worker
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: my-agent-worker
+  template:
+    metadata:
+      labels:
+        app: my-agent-worker
+    spec:
+      # WorkerRunner._shutdown() drains in-flight tasks on SIGTERM before
+      # exiting; give it real room before Kubernetes escalates to SIGKILL.
+      # Must be >= the longest task this Worker is expected to run.
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: worker
+          image: my-agent-worker:latest
+          args: ["--worker-class", "my_agent.MyAgent"]
+          env:
+            - name: REDIS_HOST
+              value: redis
+            - name: REDIS_PORT
+              value: "6379"
+            # REDIS_PASSWORD/REDIS_USERNAME: prefer a Secret + secretKeyRef.
+            # REDIS_MODE/REDIS_CLUSTER_HOST: see docs/architecture/redis-cluster-mode.md.
+            - name: BYAI_WORKER_CONCURRENCY
+              value: "50"
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              memory: "512Mi"

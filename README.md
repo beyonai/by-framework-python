@@ -221,6 +221,13 @@ async def main():
 asyncio.run(main())
 ```
 
+A runnable version of this pair lives at
+[`examples/echo_worker.py`](examples/echo_worker.py) (Worker) and
+[`examples/send_and_verify.py`](examples/send_and_verify.py) (client — blocks
+until it sees the echoed reply) — the same pair `deploy/`'s CI smoke test
+drives end to end, see
+[`docs/architecture/production-deployment.md`](docs/architecture/production-deployment.md).
+
 ---
 
 ## Core Concepts
@@ -573,7 +580,7 @@ Tests are organized by module under `tests/`:
 
 ```bash
 # 1. Start Redis
-docker run -d --name by-redis -p 6379:6379 registry:7-alpine
+docker run -d --name by-redis -p 6379:6379 redis:7-alpine
 
 # 2. Start a Worker
 python -m by_framework \
@@ -592,11 +599,27 @@ python -m by_framework --worker-class my_agent.MyAgent --worker-id worker-02 &
 python -m by_framework --worker-class my_agent.MyAgent --worker-id worker-03 &
 ```
 
+`&` is fine for a quick local check but isn't real process supervision — for
+an actual deployment, use the reference Dockerfile, Compose file, and
+Kubernetes Deployment under [`deploy/`](deploy/):
+
+```bash
+# Docker Compose — N supervised replicas, distinct worker ids, restart policy
+docker compose -f deploy/docker-compose.yml up --build --scale worker=3
+
+# Kubernetes — same idea as a Deployment
+kubectl apply -f deploy/kubernetes/worker-deployment.yaml
+```
+
+The CLI also exposes `--redis-password`, `--redis-username`, `--redis-mode`,
+and `--redis-cluster-nodes` (all mirrored by the `REDIS_*` env vars used in
+the Compose/Kubernetes examples above) — see `python -m by_framework --help`.
+
 ### Reliability
 
 - **Message persistence:** Messages are stored in Redis Streams until explicitly acknowledged (`XACK`). Unacknowledged messages are redelivered on Worker restart.
 - **Durable config:** Agent config snapshots are persisted to Redis, so a restarted Worker recovers the last-known plugin configuration.
-- **Gradual shutdown:** `WorkerRunner` drains in-flight tasks before shutting down, acknowledging completed work.
+- **Graceful shutdown:** `WorkerRunner` drains in-flight tasks before shutting down, acknowledging completed work. This is wired to both `SIGINT` (Ctrl+C) and `SIGTERM` — the signal `docker stop`/Kubernetes pod termination actually send — so it fires under real container orchestration, not just an interactive terminal. Give it enough `stop_grace_period`/`terminationGracePeriodSeconds` to cover your longest task (see the `deploy/` examples), since a hard `SIGKILL` after the grace period skips the drain entirely.
 - **Separate data path:** Data output goes to session-scoped streams independently of control, so backend consumers are decoupled from Worker scaling.
 
 ### Logging

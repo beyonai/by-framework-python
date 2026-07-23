@@ -431,6 +431,36 @@ def test_get_redis_prefers_explicit_url_over_cluster_env(
     mock_init.assert_not_called()
 
 
+@patch("by_framework.admin.cli.init_redis", return_value=_mock_redis())
+@patch("by_framework.admin.cli.init_redis_from_url", return_value=_mock_redis())
+def test_get_redis_uses_standalone_config_from_env(
+    mock_init_from_url, mock_init, monkeypatch
+):
+    cli._redis_url = None  # pylint: disable=protected-access
+    monkeypatch.setenv("REDIS_HOST", "prod-standalone-host")
+    monkeypatch.setenv("REDIS_PORT", "6390")
+    monkeypatch.setenv("REDIS_PASSWORD", "standalone-secret")
+    monkeypatch.setenv("REDIS_DATABASE", "3")
+    monkeypatch.delenv("REDIS_MODE", raising=False)
+    monkeypatch.delenv("REDIS_CLUSTER_HOST", raising=False)
+    monkeypatch.delenv("REDIS_CLUSTER_NODES", raising=False)
+    monkeypatch.delenv("BYAI_REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+
+    redis = cli._get_redis()  # pylint: disable=protected-access
+
+    assert redis is mock_init.return_value
+    mock_init_from_url.assert_not_called()
+    mock_init.assert_called_once()
+    config = mock_init.call_args.kwargs["config"]
+    assert isinstance(config, RedisConfig)
+    assert config.mode == "standalone"
+    assert config.host == "prod-standalone-host"
+    assert config.port == 6390
+    assert config.password == "standalone-secret"
+    assert config.db == 3
+
+
 @patch("by_framework.admin.cli.init_redis", side_effect=RuntimeError("v2 required"))
 def test_get_redis_cluster_mode_surfaces_schema_error(mock_init, monkeypatch):
     monkeypatch.setenv("REDIS_MODE", "cluster")

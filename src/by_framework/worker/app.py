@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import pkgutil
+import signal
 from dataclasses import replace
 from importlib import import_module
 from types import ModuleType
@@ -253,6 +254,36 @@ async def _run_worker_async(
         await close_redis()
 
 
+async def _run_with_graceful_shutdown(coro: Awaitable) -> None:
+    """Drive `coro` to completion, cancelling it on SIGTERM/SIGINT so the
+    caller's own try/finally (WorkerRunner._shutdown's drain-in-flight-tasks
+    sequence) runs. Without this, only Ctrl+C (SIGINT, raised by the
+    interpreter as KeyboardInterrupt) triggered graceful shutdown -
+    `docker stop`/Kubernetes pod termination send SIGTERM by default, which
+    Python's default handler turns into an immediate, non-graceful exit."""
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(coro)
+
+    def _request_shutdown(sig: signal.Signals) -> None:
+        logger.info("Received %s, shutting down gracefully...", sig.name)
+        task.cancel()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _request_shutdown, sig)
+        except NotImplementedError:
+            # e.g. Windows' default event loop - falls back to the
+            # KeyboardInterrupt handling in run_worker() for SIGINT only.
+            logger.debug(
+                "Signal handler for %s not supported on this platform", sig.name
+            )
+
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 def run_worker(
     worker_class: Type[GatewayWorker],
     worker_id: str = "worker-1",
@@ -326,30 +357,32 @@ def run_worker(
 
     try:
         asyncio.run(
-            _run_worker_async(
-                worker_class,
-                worker_id,
-                redis_host,
-                redis_port,
-                redis_db,
-                redis_password,
-                redis_username,
-                workspace_dir,
-                consumer_group,
-                max_concurrency=max_concurrency,
-                fetch_count=fetch_count,
-                redis_max_connections=redis_max_connections,
-                plugin_list=plugin_list,
-                plugin_configurator=plugin_configurator,
-                plugin_hook_timeout_seconds=plugin_hook_timeout_seconds,
-                plugin_log_hook_stats_on_shutdown=plugin_log_hook_stats_on_shutdown,
-                history_backend=history_backend,
-                plugin_dir=plugin_dir,
-                storage=storage,
-                layout_builder=layout_builder,
-                redis_mode=redis_mode,
-                redis_cluster_nodes=redis_cluster_nodes,
-                **worker_kwargs,
+            _run_with_graceful_shutdown(
+                _run_worker_async(
+                    worker_class,
+                    worker_id,
+                    redis_host,
+                    redis_port,
+                    redis_db,
+                    redis_password,
+                    redis_username,
+                    workspace_dir,
+                    consumer_group,
+                    max_concurrency=max_concurrency,
+                    fetch_count=fetch_count,
+                    redis_max_connections=redis_max_connections,
+                    plugin_list=plugin_list,
+                    plugin_configurator=plugin_configurator,
+                    plugin_hook_timeout_seconds=plugin_hook_timeout_seconds,
+                    plugin_log_hook_stats_on_shutdown=plugin_log_hook_stats_on_shutdown,
+                    history_backend=history_backend,
+                    plugin_dir=plugin_dir,
+                    storage=storage,
+                    layout_builder=layout_builder,
+                    redis_mode=redis_mode,
+                    redis_cluster_nodes=redis_cluster_nodes,
+                    **worker_kwargs,
+                )
             )
         )
     except KeyboardInterrupt:
