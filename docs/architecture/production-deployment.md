@@ -97,9 +97,17 @@ breaking change is caught before it's ever published) and drives the full
 pipeline: `examples/send_and_verify.py` sends a message to
 `examples/echo_worker.py` via the real Redis control stream and asserts the
 echoed reply arrives on the real Redis data stream, retrying the send until
-the Worker container finishes registering (`FAIL_FAST` route policy raises
-if none is online yet — expected during container startup, not an error).
-Runs on every PR touching `deploy/**`, `examples/**`, or
+the Worker container finishes registering. This retry loop caught a real bug
+in itself the first time this workflow ran in CI (not just locally, where
+worker startup is fast enough the race never surfaces): under the default
+`FAIL_FAST` route policy, `send_message()` does **not** raise when no worker
+is online yet — it returns `SendMessageResponse(success=False, ...)` via
+`AvailabilityRouter`. The first version of `send_and_verify.py` only retried
+on a raised exception and never checked `.success`, so it silently treated a
+failed send (worker container still starting) as delivered and then waited
+out the full timeout for a reply to a message that was never actually
+enqueued. Fixed by retrying on `resp.success is False`. Runs on every PR
+touching `deploy/**`, `examples/**`, or
 `src/by_framework/**`.
 
 ## Rule: keep the deployment story from drifting again

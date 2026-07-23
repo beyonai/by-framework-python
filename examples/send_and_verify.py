@@ -22,15 +22,19 @@ SEND_RETRY_INTERVAL_SECONDS = 1.0
 
 async def _send_with_retry(client: GatewayClient, **kwargs):
     """Retry send_message until a Worker for the target agent type is
-    online. FAIL_FAST (the default route policy) raises ValueError
-    immediately if none is registered yet - the Worker container may still
-    be starting/heartbeating when this script first runs."""
+    online. Under FAIL_FAST (the default route policy), send_message does
+    NOT raise when none is online yet - it returns
+    SendMessageResponse(success=False, ...) via AvailabilityRouter instead,
+    which is easy to miss since nothing looks like a failure at the call
+    site. The Worker container may still be starting/registering when this
+    script first runs, so callers MUST check .success, not just "did this
+    not raise"."""
     while True:
-        try:
-            return await client.send_message(**kwargs)
-        except ValueError as exc:
-            print(f"waiting for an online worker: {exc}")
-            await asyncio.sleep(SEND_RETRY_INTERVAL_SECONDS)
+        resp = await client.send_message(**kwargs)
+        if resp.success:
+            return resp
+        print(f"waiting for an online worker: {resp.error or resp.status}")
+        await asyncio.sleep(SEND_RETRY_INTERVAL_SECONDS)
 
 
 async def main() -> int:
