@@ -21,6 +21,10 @@ of quad-bullets.
 - `README.md` / `README_zh.md` — "部署"/"Deployment" section
 - `libs/by-framework-dashboard/Dockerfile` — the only containerization
   example that exists in this repo today
+- `examples/echo_worker.py` / `examples/send_and_verify.py` — minimal
+  Worker + client pair used to exercise the full message pipeline
+- `.github/workflows/deploy-smoke-test.yml` — builds `deploy/` from this
+  commit's own source and drives the pipeline end to end in CI
 
 ## Known gaps (audited 2026-07-22)
 
@@ -81,6 +85,23 @@ of quad-bullets.
    the Worker? a lightweight exec probe that shells out to `by-admin`? some
    third option?) before it's implemented, not a quick fix.
 
+## CI validation
+
+`deploy/Dockerfile`, `deploy/entrypoint.sh`, and `deploy/docker-compose.yml`
+were never actually run before this doc's 2026-07-22 audit — a "reference"
+example nobody executes tends to bit-rot silently. `.github/workflows/
+deploy-smoke-test.yml` now builds the Worker image from **this commit's own
+source** (`deploy/Dockerfile`'s `BY_FRAMEWORK_SOURCE=local` build arg —
+installs an editable checkout instead of pulling the last PyPI release, so a
+breaking change is caught before it's ever published) and drives the full
+pipeline: `examples/send_and_verify.py` sends a message to
+`examples/echo_worker.py` via the real Redis control stream and asserts the
+echoed reply arrives on the real Redis data stream, retrying the send until
+the Worker container finishes registering (`FAIL_FAST` route policy raises
+if none is online yet — expected during container startup, not an error).
+Runs on every PR touching `deploy/**`, `examples/**`, or
+`src/by_framework/**`.
+
 ## Rule: keep the deployment story from drifting again
 
 Any change touching README's 部署 section, `__main__.py`'s CLI surface,
@@ -105,6 +126,11 @@ accumulate silently:
   Kubernetes `Deployment`) alongside any bare shell `&` example — `&` alone
   should not be the only scaling story in a doc claiming production
   readiness.
+- **A change to the client/worker message protocol (command/event shape,
+  route policy behavior) that breaks `examples/echo_worker.py` or
+  `examples/send_and_verify.py` must update them in the same change**, not
+  leave `deploy-smoke-test.yml` red — a smoke test nobody keeps green stops
+  being a smoke test.
 
 No dedicated guard yet (signal handling and CLI/API parity are judgement
 calls, not greppable in one line) — if the same class of drift reappears

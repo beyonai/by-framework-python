@@ -221,6 +221,11 @@ async def main():
 asyncio.run(main())
 ```
 
+可运行的完整版本见 [`examples/echo_worker.py`](examples/echo_worker.py)（Worker）和
+[`examples/send_and_verify.py`](examples/send_and_verify.py)（客户端，会一直等到收到回显再退出）——
+`deploy/` 下的 CI 冒烟测试用的就是这一对，见
+[`docs/architecture/production-deployment.md`](docs/architecture/production-deployment.md)。
+
 ---
 
 ## 核心概念

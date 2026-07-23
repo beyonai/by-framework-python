@@ -221,6 +221,13 @@ async def main():
 asyncio.run(main())
 ```
 
+A runnable version of this pair lives at
+[`examples/echo_worker.py`](examples/echo_worker.py) (Worker) and
+[`examples/send_and_verify.py`](examples/send_and_verify.py) (client — blocks
+until it sees the echoed reply) — the same pair `deploy/`'s CI smoke test
+drives end to end, see
+[`docs/architecture/production-deployment.md`](docs/architecture/production-deployment.md).
+
 ---
 
 ## Core Concepts
