@@ -1,4 +1,5 @@
 import asyncio
+import http.client
 import json
 import unittest
 from typing import Any
@@ -16,10 +17,41 @@ from by_framework.core.protocol.agent_state import AgentState
 from by_framework.core.protocol.commands import (
     AskAgentCommand,
     CancelTaskCommand,
+    EvictWorkerCommand,
     ReloadPluginsCommand,
     ResumeCommand,
+    SuspendWorkerCommand,
 )
 from by_framework.core.protocol.message_header import MessageHeader
+
+
+def _request_readyz(port: int):
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+    try:
+        connection.request("GET", "/readyz")
+        response = connection.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+        return response.status, body
+    finally:
+        connection.close()
+
+
+async def _wait_until(predicate, timeout=2.0, interval=0.02):
+    """Poll predicate (which may itself raise, e.g. ConnectionRefusedError
+    while a server is still binding) until it returns truthy or timeout."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    last_exc = None
+    while loop.time() < deadline:
+        try:
+            if predicate():
+                return
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            last_exc = exc
+        await asyncio.sleep(interval)
+    if last_exc is not None:
+        raise last_exc
+    raise AssertionError("condition not met within timeout")
 
 
 class MockRedisRunner:
@@ -894,6 +926,177 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(handled)
         runner._handle_control_message.assert_not_called()
         self.assertTrue(redis_mock.acked)
+
+    async def test_runner_health_endpoint_is_wired_into_startup_and_shutdown(self):
+        """Supplying health_port starts a real /readyz server during real
+        startup, tied to the real consume loop's liveness signal via
+        _mark_consumer_tick(), and tears it down on shutdown."""
+        worker = DummyWorker()
+        worker.start_heartbeat = AsyncMock()
+        worker.stop_heartbeat = AsyncMock()
+        redis_mock = MockRedisRunner(message_to_return=[])
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            health_port=0,
+        )
+        runner._control_loop = AsyncMock()
+
+        run_task = asyncio.ensure_future(runner.start())
+        try:
+            await _wait_until(lambda: runner._health_server.is_running)
+            port = runner._health_server.port
+            await _wait_until(lambda: _request_readyz(port)[0] in (200, 503))
+
+            status, body = _request_readyz(port)
+            self.assertEqual(status, 200)
+            self.assertTrue(body["ready"])
+            self.assertEqual(body["reason"], "serving")
+        finally:
+            run_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await run_task
+
+        with self.assertRaises(ConnectionRefusedError):
+            _request_readyz(port)
+
+    async def test_runner_shutdown_reports_draining_before_health_server_stops(self):
+        """_shutdown() must flip to draining as its first step - before the
+        rest of the drain runs, not after - and the readiness server must
+        stay reachable (still reporting draining) throughout the drain,
+        not disappear before it. Hooks into stop_heartbeat, which
+        _shutdown() calls partway through, to observe /readyz mid-drain."""
+        worker = DummyWorker()
+        redis_mock = MockRedisRunner(message_to_return=[])
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            health_port=0,
+        )
+        runner._health_server.start()
+        runner._mark_consumer_tick()  # simulate "already past starting"
+        observed = {}
+
+        async def observe_mid_shutdown():
+            port = runner._health_server.port
+            observed["status"], observed["body"] = _request_readyz(port)
+
+        worker.stop_heartbeat = observe_mid_shutdown
+
+        await runner._shutdown()
+
+        self.assertEqual(observed["status"], 503)
+        self.assertEqual(observed["body"]["reason"], "draining")
+        # And the server itself is torn down only once the drain is done.
+        self.assertFalse(runner._health_server.is_running)
+
+    async def test_runner_without_health_port_starts_no_server(self):
+        """Omitting health_port must leave _health_server unset - the
+        default (opted-out) case must have zero new behavior."""
+        worker = DummyWorker()
+        redis_mock = MockRedisRunner(message_to_return=[])
+        runner = WorkerRunner(
+            redis_client=redis_mock, worker=worker, group_name="test_group"
+        )
+
+        self.assertIsNone(runner._health_server)
+
+    async def test_runner_health_endpoint_reflects_admin_suspend_and_evict_live(self):
+        """Real SuspendWorkerCommand/EvictWorkerCommand messages, dispatched
+        through the Worker's actual control-message pipeline
+        (_run_control_once -> parse_control_command ->
+        handle_suspend_worker/handle_evict_worker - not just the
+        _set_admin_lifecycle callback directly), must be reflected in
+        /readyz immediately, without a process restart."""
+        worker = DummyWorker()
+        redis_mock = MockRedisRunner(message_to_return=[])
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            health_port=0,
+        )
+        runner._health_server.start()
+        runner._mark_consumer_tick()
+        # Fake a live _consumer_task so _is_consumer_healthy() reflects
+        # staleness, not "no task at all" - not what this test is about.
+        runner._consumer_task = asyncio.ensure_future(asyncio.sleep(10))
+        try:
+            _, body = _request_readyz(runner._health_server.port)
+            self.assertEqual(body["reason"], "serving")
+
+            suspend_cmd = SuspendWorkerCommand(
+                header=MessageHeader(session_id="s1", trace_id="t1", message_id="m1"),
+                reason="maintenance",
+            )
+            redis_mock.msg = [
+                [
+                    RedisKeys.worker_ctrl_stream("worker-1").encode(),
+                    [(b"1-0", {b"data": json.dumps(suspend_cmd.to_dict()).encode()})],
+                ]
+            ]
+            await runner._run_control_once(block=1)
+            _, body = _request_readyz(runner._health_server.port)
+            self.assertEqual(body["reason"], "suspended")
+
+            evict_cmd = EvictWorkerCommand(
+                header=MessageHeader(session_id="s1", trace_id="t1", message_id="m2"),
+                force=False,
+            )
+            redis_mock.msg = [
+                [
+                    RedisKeys.worker_ctrl_stream("worker-1").encode(),
+                    [(b"2-0", {b"data": json.dumps(evict_cmd.to_dict()).encode()})],
+                ]
+            ]
+            await runner._run_control_once(block=1)
+            _, body = _request_readyz(runner._health_server.port)
+            self.assertEqual(body["reason"], "evicted")
+        finally:
+            runner._health_server.stop()
+            runner._consumer_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await runner._consumer_task
+
+    async def test_runner_health_endpoint_reflects_consumer_staleness_live(self):
+        """Transition from serving -> consumer_stalled -> serving must be
+        observable through /readyz without a restart, driven by the same
+        staleness signal (_consumer_last_tick_monotonic vs
+        _consumer_health_timeout_seconds) _is_consumer_healthy() already
+        uses internally."""
+        worker = DummyWorker()
+        redis_mock = MockRedisRunner(message_to_return=[])
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            health_port=0,
+        )
+        runner._health_server.start()
+        runner._mark_consumer_tick()
+        # Fake a _consumer_task so _is_consumer_healthy() doesn't
+        # short-circuit on "no task" - only staleness is under test here.
+        runner._consumer_task = asyncio.ensure_future(asyncio.sleep(10))
+        try:
+            _, body = _request_readyz(runner._health_server.port)
+            self.assertEqual(body["reason"], "serving")
+
+            runner._consumer_last_tick_monotonic -= (
+                runner._consumer_health_timeout_seconds + 1
+            )
+            _, body = _request_readyz(runner._health_server.port)
+            self.assertEqual(body["reason"], "consumer_stalled")
+
+            runner._mark_consumer_tick()
+            _, body = _request_readyz(runner._health_server.port)
+            self.assertEqual(body["reason"], "serving")
+        finally:
+            runner._health_server.stop()
+            runner._consumer_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await runner._consumer_task
 
 
 if __name__ == "__main__":

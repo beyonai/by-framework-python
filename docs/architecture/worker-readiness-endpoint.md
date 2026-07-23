@@ -1,11 +1,11 @@
 # Worker readiness endpoint
 
-**Status: designed, not yet implemented.** This doc is the design record
-from the 2026-07-23 `/grilling` + `/domain-modeling` session that closed gap
-5 in `docs/architecture/production-deployment.md` ("Worker process exposes
-no health-check surface"). Build against this doc; update it in place if
-implementation reveals the design needs to change — don't let code and doc
-drift apart.
+**Status: implemented**, per GitHub issues #84-#88 against #83. This doc is
+the design record from the 2026-07-23 `/grilling` + `/domain-modeling`
+session that closed gap 5 in `docs/architecture/production-deployment.md`
+("Worker process exposes no health-check surface"). Keep it in sync with
+the code; update it in place if a future change touches this behavior —
+don't let code and doc drift apart.
 
 ## What it is
 
@@ -50,7 +50,7 @@ liveness (see Decision 1).
   Worker mid-shutdown should not be counted, independent of whether it's
   still functioning correctly in its final seconds.
 
-## Covers (once implemented)
+## Covers
 
 - `src/by_framework/worker/health_server.py` — new module, `WorkerHealthServer`
 - `src/by_framework/worker/runner.py` — `WorkerRunner` holds an optional
@@ -63,6 +63,9 @@ liveness (see Decision 1).
   `depends_on: condition: service_healthy` for anything that should wait on it
 - `deploy/kubernetes/worker-deployment.yaml` — `readinessProbe` (only —
   see Decision 1)
+- `.github/workflows/deploy-smoke-test.yml` — `docker compose up --wait`
+  fails the CI job if the readiness endpoint never reports healthy in a
+  real container, not just in the Python contract tests
 
 ## Decisions
 

@@ -172,6 +172,37 @@ async def test_run_worker_async_flow():
 
 
 @pytest.mark.asyncio
+async def test_run_worker_async_passes_health_port_through_to_runner():
+    """health_port must reach WorkerRunner so the opt-in readiness endpoint
+    (see docs/architecture/worker-readiness-endpoint.md) actually starts."""
+    with (
+        patch("by_framework.worker.app.init_redis") as mock_init_redis,
+        patch("by_framework.worker.app.close_redis", new_callable=AsyncMock),
+        patch("by_framework.worker.app.WorkerRegistry"),
+        patch("by_framework.worker.app.WorkspaceManager"),
+        patch("by_framework.worker.app.WorkerRunner") as mock_runner,
+    ):
+        mock_init_redis.return_value = MagicMock()
+        mock_runner.return_value.start = AsyncMock()
+
+        await _run_worker_async(
+            worker_class=MyTestWorker,
+            worker_id="test-w1",
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=0,
+            redis_password=None,
+            redis_username=None,
+            workspace_dir="/tmp/test-ws",
+            consumer_group="test-group",
+            health_port=9000,
+        )
+
+        _, runner_kwargs = mock_runner.call_args
+        assert runner_kwargs["health_port"] == 9000
+
+
+@pytest.mark.asyncio
 async def test_run_worker_async_standalone_falls_back_to_env_when_arg_not_passed():
     """Standalone mode must respect REDIS_HOST/REDIS_PASSWORD env vars when
     the caller doesn't pass the corresponding explicit arg — today it
@@ -725,3 +756,75 @@ def test_run_worker_sync_entry():
         # Verify the SIGTERM/SIGINT-handling wrapper actually wraps the
         # _run_worker_async coroutine, not something else.
         mock_graceful_shutdown.assert_called_once_with(mock_run_async.return_value)
+
+
+def test_run_worker_sync_entry_passes_health_port_through():
+    """health_port must reach _run_worker_async from the sync entry point too."""
+    with (
+        patch("by_framework.worker.app.asyncio.run"),
+        patch(
+            "by_framework.worker.app._run_worker_async", new_callable=MagicMock
+        ) as mock_run_async,
+        patch(
+            "by_framework.worker.app._run_with_graceful_shutdown",
+            new_callable=MagicMock,
+        ),
+    ):
+        run_worker(worker_class=MyTestWorker, worker_id="sync-w1", health_port=9000)
+
+        _, kwargs = mock_run_async.call_args
+        assert kwargs["health_port"] == 9000
+
+
+def test_run_worker_sync_entry_health_port_defaults_to_none():
+    """Omitting health_port must default to None (off) - opt-in only."""
+    with (
+        patch("by_framework.worker.app.asyncio.run"),
+        patch(
+            "by_framework.worker.app._run_worker_async", new_callable=MagicMock
+        ) as mock_run_async,
+        patch(
+            "by_framework.worker.app._run_with_graceful_shutdown",
+            new_callable=MagicMock,
+        ),
+    ):
+        run_worker(worker_class=MyTestWorker, worker_id="sync-w1")
+
+        _, kwargs = mock_run_async.call_args
+        assert kwargs["health_port"] is None
+
+
+def test_run_worker_sync_entry_health_port_falls_back_to_env_var():
+    with (
+        patch.dict("os.environ", {"BYAI_WORKER_HEALTH_PORT": "9001"}, clear=False),
+        patch("by_framework.worker.app.asyncio.run"),
+        patch(
+            "by_framework.worker.app._run_worker_async", new_callable=MagicMock
+        ) as mock_run_async,
+        patch(
+            "by_framework.worker.app._run_with_graceful_shutdown",
+            new_callable=MagicMock,
+        ),
+    ):
+        run_worker(worker_class=MyTestWorker, worker_id="sync-w1")
+
+        _, kwargs = mock_run_async.call_args
+        assert kwargs["health_port"] == 9001
+
+
+def test_run_worker_sync_entry_health_port_explicit_arg_overrides_env_var():
+    with (
+        patch.dict("os.environ", {"BYAI_WORKER_HEALTH_PORT": "9001"}, clear=False),
+        patch("by_framework.worker.app.asyncio.run"),
+        patch(
+            "by_framework.worker.app._run_worker_async", new_callable=MagicMock
+        ) as mock_run_async,
+        patch(
+            "by_framework.worker.app._run_with_graceful_shutdown",
+            new_callable=MagicMock,
+        ),
+    ):
+        run_worker(worker_class=MyTestWorker, worker_id="sync-w1", health_port=9002)
+
+        _, kwargs = mock_run_async.call_args
+        assert kwargs["health_port"] == 9002

@@ -2,14 +2,15 @@
 # README's shell-`&` "水平扩展" example with a real, supervised, restart-on-
 # failure orchestration form. Adjust image/replicas/resources for your setup.
 #
-# No liveness/readiness probe is set here on purpose: the Worker process
-# exposes no HTTP/exec health surface today (tracked as a known gap in
-# docs/architecture/production-deployment.md, gap 5) - the only liveness
-# signal is the Redis-backed heartbeat TTL key, readable via
-# `by-admin worker list`/`worker info`, not a local probe target. Wiring a
-# probe to something that doesn't actually reflect health (e.g. bare
-# `pgrep`) would be worse than no probe - don't add one until a real
-# endpoint exists.
+# readinessProbe ONLY below - see docs/architecture/worker-readiness-endpoint.md.
+# Do NOT add a livenessProbe pointed at /readyz (or at anything else,
+# absent a separate deliberate design for one): a Worker's health depends
+# on Redis being reachable, and wiring this to liveness would mean a
+# transient Redis outage kills and restarts every Worker replica
+# simultaneously - a self-inflicted restart storm strictly worse than the
+# outage itself. A failing readinessProbe never kills anything; it only
+# stops this replica from being counted, which is exactly what "not
+# ready" should do.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -41,6 +42,18 @@ spec:
             # REDIS_MODE/REDIS_CLUSTER_HOST: see docs/architecture/redis-cluster-mode.md.
             - name: BYAI_WORKER_CONCURRENCY
               value: "50"
+            - name: BYAI_WORKER_HEALTH_PORT
+              value: "8080"
+          ports:
+            - name: readiness
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: readiness
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
           resources:
             requests:
               cpu: "250m"

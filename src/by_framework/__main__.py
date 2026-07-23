@@ -101,6 +101,17 @@ def parse_args():
     parser.add_argument(
         "--redis-max-connections", type=int, help="Max Redis connections allowed"
     )
+    parser.add_argument(
+        "--health-port",
+        type=int,
+        default=None,
+        help=(
+            "Port for the local /readyz readiness endpoint (Docker/Kubernetes "
+            "health checks). Opt-in only - omit to leave it disabled, no "
+            "default port is provided. Also settable via BYAI_WORKER_HEALTH_PORT. "
+            "See docs/architecture/worker-readiness-endpoint.md."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -146,6 +157,7 @@ def main():
         max_concurrency=args.max_concurrency,
         fetch_count=args.fetch_count,
         redis_max_connections=args.redis_max_connections,
+        health_port=args.health_port,
     )
 
 

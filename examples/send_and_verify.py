@@ -28,7 +28,16 @@ async def _send_with_retry(client: GatewayClient, **kwargs):
     which is easy to miss since nothing looks like a failure at the call
     site. The Worker container may still be starting/registering when this
     script first runs, so callers MUST check .success, not just "did this
-    not raise"."""
+    not raise".
+
+    Kept even though deploy-smoke-test.yml's `docker compose up --wait`
+    already waits for /readyz to report "serving": readyz flips to serving
+    the instant WorkerRunner's consume loop ticks once, which happens
+    slightly *before* the Worker registers itself online in Redis
+    (heartbeat/registration starts after that same tick, not before) - see
+    docs/architecture/worker-readiness-endpoint.md. So "--wait succeeded"
+    narrows the race but doesn't fully close it; this retry loop is the
+    layer that actually does."""
     while True:
         resp = await client.send_message(**kwargs)
         if resp.success:

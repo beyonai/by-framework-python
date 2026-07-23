@@ -41,6 +41,7 @@ from by_framework.trace.trace_schema import TraceRecord
 from by_framework.trace.trace_writer import TraceWriteClient
 from by_framework.util.generate_message_id import generate_message_id
 from by_framework.worker.context import current_worker_id_var
+from by_framework.worker.health_server import WorkerHealthServer
 from by_framework.worker.worker import GatewayWorker
 
 from ._control_handling import (
@@ -69,6 +70,7 @@ class WorkerRunner:
         max_concurrency: int = 50,
         fetch_count: int = 10,
         span_recorder: Optional[SpanRecorder] = None,
+        health_port: Optional[int] = None,
     ):
         if (
             worker is None
@@ -117,6 +119,22 @@ class WorkerRunner:
             float(self.worker.heartbeat_lease_ttl_seconds) * 2.0,
             stream_block_seconds * 3.0,
         )
+        # Set as the first step of _shutdown() - see
+        # docs/architecture/worker-readiness-endpoint.md Decision 6.
+        self._draining: bool = False
+        # Opt-in only - see docs/architecture/worker-readiness-endpoint.md.
+        # None (the default) means no port opens and nothing here changes
+        # behavior for existing deployments.
+        self._health_server: Optional[WorkerHealthServer] = None
+        if health_port is not None:
+            self._health_server = WorkerHealthServer(
+                worker_id=self.worker.worker_id,
+                port=health_port,
+                has_started=lambda: self._consumer_last_tick_monotonic > 0,
+                is_draining=lambda: self._draining,
+                admin_lifecycle=lambda: self._admin_lifecycle,
+                consumer_healthy=self._is_consumer_healthy,
+            )
 
     @property
     def _terminal_execution_states(self) -> frozenset[str]:
@@ -916,6 +934,12 @@ class WorkerRunner:
         """Start the worker runner main loop."""
         self._running_tasks = set()
         try:
+            # As early as possible, so a probe hitting the port during
+            # startup gets an honest "starting" 503 instead of connection-
+            # refused - see docs/architecture/worker-readiness-endpoint.md.
+            if self._health_server is not None:
+                self._health_server.start()
+
             if hasattr(self.worker.registry, "claim_worker_id"):
                 self._lock_token = await self._claim_worker_id_with_retry()
 
@@ -984,6 +1008,10 @@ class WorkerRunner:
 
     async def _shutdown(self):
         """Graceful shutdown sequence."""
+        # First step, deliberately - readiness must flip the instant
+        # shutdown begins, not once the drain below finishes. See
+        # docs/architecture/worker-readiness-endpoint.md Decision 6.
+        self._draining = True
         if self._metrics_collector_task:
             self._metrics_collector_task.cancel()
             await asyncio.gather(self._metrics_collector_task, return_exceptions=True)
@@ -1029,3 +1057,8 @@ class WorkerRunner:
             if getattr(plugin_registry, "log_hook_stats_on_shutdown", True):
                 plugin_registry.log_hook_stats()
             await plugin_registry.on_worker_shutdown(self.worker)
+
+        # Stopped last, deliberately - the readiness endpoint should keep
+        # responding for the entire drain, not disappear before it.
+        if self._health_server is not None:
+            self._health_server.stop()
