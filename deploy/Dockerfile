@@ -41,5 +41,21 @@ RUN uv venv /opt/venv \
 
 COPY deploy/entrypoint.sh /entrypoint.sh
 
+# Opt-in readiness endpoint (see
+# docs/architecture/worker-readiness-endpoint.md) - BYAI_WORKER_HEALTH_PORT
+# is run_worker()'s own env-var fallback for --health-port, so this alone
+# is enough to turn it on; no CMD change needed even if you override
+# --worker-class below.
+ENV BYAI_WORKER_HEALTH_PORT=8080
+EXPOSE 8080
+
+# Readiness only - see the hard rule in
+# docs/architecture/worker-readiness-endpoint.md: never turn this into a
+# liveness/restart-on-unhealthy check. urlopen() raises (non-zero exit) on
+# the endpoint's real 503, so this actually fails on "not ready" - unlike
+# a healthcheck that only checks "did the server respond at all".
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3)"
+
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["--worker-class", "my_agent.MyAgent"]

@@ -72,18 +72,14 @@ of quad-bullets.
    default — no downward-API wiring needed). README's shell-`&` example is
    kept as a quick-local-check note, no longer the only scaling story.
 
-5. **Still open: Worker process exposes no health-check surface.** Unlike
-   the dashboard (`/api/health`), the Worker has no HTTP/exec endpoint for a
-   Kubernetes liveness/readiness probe; the only liveness signal is the
-   Redis-backed heartbeat TTL key
-   (`byai_gateway:registry:worker:online:{worker_id}`), readable only via
-   `by-admin worker list`/`worker info` or something else that queries Redis
-   directly. `deploy/kubernetes/worker-deployment.yaml` deliberately omits a
-   probe rather than wiring one to a proxy signal (e.g. bare `pgrep`) that
-   doesn't actually reflect health — a probe that always reports "healthy"
-   is worse than no probe. Needs a real design decision (new HTTP port on
-   the Worker? a lightweight exec probe that shells out to `by-admin`? some
-   third option?) before it's implemented, not a quick fix.
+5. ~~**Worker process exposes no health-check surface.**~~ **Fixed.** The
+   Worker now has an opt-in `/readyz` HTTP endpoint (`--health-port`/
+   `BYAI_WORKER_HEALTH_PORT`), readiness-only by design — never wired to a
+   liveness probe. `deploy/`'s reference Dockerfile/Compose/Kubernetes
+   artifacts all wire it up, and `deploy-smoke-test.yml` verifies it
+   reports healthy in a real container via `docker compose up --wait`.
+   Full design record, including why readiness-only and the hard rule
+   against ever adding liveness: `docs/architecture/worker-readiness-endpoint.md`.
 
 ## CI validation
 

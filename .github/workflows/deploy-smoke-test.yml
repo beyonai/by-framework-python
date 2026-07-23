@@ -44,8 +44,15 @@ jobs:
       - name: Install by-framework (for the verify client script below)
         run: uv sync
 
+      # --wait blocks until every service with a healthcheck (redis, and now
+      # worker's own /readyz-backed HEALTHCHECK - see
+      # docs/architecture/worker-readiness-endpoint.md) reports healthy, and
+      # fails the step if that doesn't happen in time. This is the actual
+      # verification that the readiness endpoint works end to end in a real
+      # container - not just that the Python contract tests pass.
       - name: Build and start Redis + Worker via deploy/docker-compose.yml
-        run: docker compose -f deploy/docker-compose.yml up --build -d
+        run: |
+          docker compose -f deploy/docker-compose.yml up --build -d --wait --wait-timeout 60
 
       - name: Send a message and verify the Worker echoes it back
         run: uv run python examples/send_and_verify.py

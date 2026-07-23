@@ -109,6 +109,7 @@ async def _run_worker_async(
     layout_builder: Optional[DataLayoutBuilder] = None,
     redis_mode: Optional[Literal["standalone", "cluster"]] = None,
     redis_cluster_nodes: Optional[List[Tuple[str, int]]] = None,
+    health_port: Optional[int] = None,
     **worker_kwargs,
 ):
     """Async worker runner initialization."""
@@ -244,6 +245,7 @@ async def _run_worker_async(
         group_name=consumer_group,
         max_concurrency=max_concurrency,
         fetch_count=fetch_count,
+        health_port=health_port,
     )
 
     try:
@@ -309,6 +311,7 @@ def run_worker(
     layout_builder: Optional[DataLayoutBuilder] = None,
     redis_mode: Optional[Literal["standalone", "cluster"]] = None,
     redis_cluster_nodes: Optional[List[Tuple[str, int]]] = None,
+    health_port: Optional[int] = None,
     **worker_kwargs,
 ):
     """
@@ -354,6 +357,13 @@ def run_worker(
         max_concurrency = int(os.environ.get("BYAI_WORKER_CONCURRENCY", 50))
     if fetch_count is None:
         fetch_count = int(os.environ.get("BYAI_WORKER_FETCH_COUNT", 10))
+    if health_port is None:
+        # Opt-in only, unlike the two above - no default port number, stays
+        # None (disabled) unless explicitly set. See
+        # docs/architecture/worker-readiness-endpoint.md Decision 4.
+        env_health_port = os.environ.get("BYAI_WORKER_HEALTH_PORT")
+        if env_health_port:
+            health_port = int(env_health_port)
 
     try:
         asyncio.run(
@@ -381,6 +391,7 @@ def run_worker(
                     layout_builder=layout_builder,
                     redis_mode=redis_mode,
                     redis_cluster_nodes=redis_cluster_nodes,
+                    health_port=health_port,
                     **worker_kwargs,
                 )
             )

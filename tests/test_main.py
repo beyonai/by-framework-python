@@ -111,3 +111,70 @@ def test_main_leaves_cluster_nodes_none_when_flag_not_passed():
 
     _, kwargs = mock_run_worker.call_args
     assert kwargs["redis_cluster_nodes"] is None
+
+
+def test_parse_args_health_port_defaults_to_none():
+    """Opt-in only - see docs/architecture/worker-readiness-endpoint.md
+    Decision 4. Omitting --health-port must mean the endpoint never
+    starts."""
+    with patch("sys.argv", ["by_framework", "--worker-class", "my_agent.MyAgent"]):
+        args = parse_args()
+
+    assert args.health_port is None
+
+
+def test_parse_args_accepts_health_port():
+    with patch(
+        "sys.argv",
+        [
+            "by_framework",
+            "--worker-class",
+            "my_agent.MyAgent",
+            "--health-port",
+            "9000",
+        ],
+    ):
+        args = parse_args()
+
+    assert args.health_port == 9000
+
+
+def test_main_passes_health_port_through_to_run_worker():
+    with (
+        patch(
+            "sys.argv",
+            [
+                "by_framework",
+                "--worker-class",
+                "my_agent.MyAgent",
+                "--health-port",
+                "9000",
+            ],
+        ),
+        patch("by_framework.__main__.get_class_from_string") as mock_get_class,
+        patch("by_framework.__main__.run_worker") as mock_run_worker,
+    ):
+        mock_worker_class = MagicMock()
+        mock_worker_class.__name__ = "MyAgent"
+        mock_get_class.return_value = mock_worker_class
+
+        main()
+
+    _, kwargs = mock_run_worker.call_args
+    assert kwargs["health_port"] == 9000
+
+
+def test_main_leaves_health_port_none_when_flag_not_passed():
+    with (
+        patch("sys.argv", ["by_framework", "--worker-class", "my_agent.MyAgent"]),
+        patch("by_framework.__main__.get_class_from_string") as mock_get_class,
+        patch("by_framework.__main__.run_worker") as mock_run_worker,
+    ):
+        mock_worker_class = MagicMock()
+        mock_worker_class.__name__ = "MyAgent"
+        mock_get_class.return_value = mock_worker_class
+
+        main()
+
+    _, kwargs = mock_run_worker.call_args
+    assert kwargs["health_port"] is None
