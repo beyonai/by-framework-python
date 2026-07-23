@@ -695,6 +695,16 @@ def test_run_worker_sync_entry():
         patch(
             "by_framework.worker.app._run_worker_async", new_callable=MagicMock
         ) as mock_run_async,
+        # asyncio.run is mocked out below, so _run_with_graceful_shutdown's
+        # real coroutine (it isn't itself mocked here) would otherwise be
+        # constructed and never awaited/closed - a dangling coroutine object
+        # that Python flags with "coroutine was never awaited" whenever it's
+        # later garbage-collected, often misattributed to an unrelated test.
+        # Mocking it too, like _run_worker_async above, avoids that.
+        patch(
+            "by_framework.worker.app._run_with_graceful_shutdown",
+            new_callable=MagicMock,
+        ) as mock_graceful_shutdown,
     ):
 
         run_worker(worker_class=MyTestWorker, worker_id="sync-w1")
@@ -711,3 +721,7 @@ def test_run_worker_sync_entry():
         # falls back to REDIS_HOST env var / RedisConfig's own default
         # inside _run_worker_async, not here.
         assert args[2] is None
+
+        # Verify the SIGTERM/SIGINT-handling wrapper actually wraps the
+        # _run_worker_async coroutine, not something else.
+        mock_graceful_shutdown.assert_called_once_with(mock_run_async.return_value)
