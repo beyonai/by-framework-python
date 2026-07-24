@@ -23,6 +23,7 @@ from typing_extensions import deprecated
 from by_framework.common.constants import (
     EXECUTION_ID_PREFIX,
     MESSAGE_ID_PREFIX,
+    TASK_GROUP_FIELD_ABORTED,
     TASK_GROUP_FIELD_COMPLETED,
     TASK_GROUP_FIELD_SOURCE_AGENT,
     TASK_GROUP_FIELD_TOTAL,
@@ -542,6 +543,42 @@ class AgentContext:
         Args:
             route_policy: Controls online checks and unavailable-agent behavior.
         """
+        return await self._dispatch_single_task(
+            target_agent_type=target_agent_type,
+            content=content,
+            extra_payload=extra_payload,
+            wait_for_reply=wait_for_reply,
+            metadata=metadata,
+            message_id=message_id,
+            parent_message_id=parent_message_id,
+            route_policy=route_policy,
+            availability_timeout_ms=availability_timeout_ms,
+            region=region,
+            priority=priority,
+        )
+
+    async def _dispatch_single_task(
+        self,
+        *,
+        target_agent_type: str,
+        content: object,
+        extra_payload: Optional[Dict[str, Any]] = None,
+        wait_for_reply: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+        message_id: Optional[str] = None,
+        parent_message_id: Optional[str] = None,
+        task_group_id: str = "",
+        route_policy: str = RoutePolicy.FAIL_FAST,
+        availability_timeout_ms: int = 30000,
+        region: Optional[str] = None,
+        priority: int = 0,
+    ) -> dict:
+        """Build, availability-check, and dispatch one AskAgentCommand.
+
+        Shared by call_agent (a single task) and call_agents/dispatch_group
+        (a batch, one call per task). Returns a call_agent-shaped result dict:
+        {status, message_id, parent_message_id, target_agent_type, [error, error_code]}.
+        """
         message_id = message_id or self.generate_message_id()
         parent_message_id = parent_message_id if parent_message_id else self.message_id
         merged_extra_payload = dict(extra_payload or {})
@@ -573,6 +610,7 @@ class AgentContext:
                 source_agent_type=self.current_agent_id if wait_for_reply else "",
                 target_agent_type=target_agent_type,
                 parent_message_id=parent_message_id,
+                task_group_id=task_group_id,
                 user_code=self.agent_runtime_state.session_manager.user_code,
                 user_name=self.agent_runtime_state.session_manager.user_name,
                 metadata=metadata,
@@ -667,6 +705,11 @@ class AgentContext:
         delivery_stream = availability.stream_name or RedisKeys.ctrl_stream(
             target_agent_type
         )
+        target_worker_id = availability.target_worker_id
+        effective_route_status = availability.status
+        selected_agent_type = availability.selected_agent_type
+        availability_error_code = availability.error_code
+        availability_error = availability.error
 
         from by_framework.core.registry import WorkerRegistry
 
@@ -687,10 +730,10 @@ class AgentContext:
                         "stream_name": delivery_stream,
                         "status": "QUEUED",
                         "route_policy": route_policy,
-                        "route_status": availability.status,
-                        "selected_agent_type": availability.selected_agent_type,
-                        "availability_error_code": availability.error_code,
-                        "availability_error": availability.error,
+                        "route_status": effective_route_status,
+                        "selected_agent_type": selected_agent_type,
+                        "availability_error_code": availability_error_code,
+                        "availability_error": availability_error,
                     }
                 )
             except Exception:  # pylint: disable=broad-exception-caught
@@ -705,9 +748,9 @@ class AgentContext:
                 parent_message_id=parent_message_id,
                 source_agent_type=self.current_agent_id if wait_for_reply else "",
                 target_agent_type=target_agent_type,
-                target_worker_id=availability.target_worker_id,
+                target_worker_id=target_worker_id,
                 route_policy=route_policy,
-                route_status=availability.status,
+                route_status=effective_route_status,
                 start_ts=dispatch_started_at,
                 end_ts=int(time.time() * 1000),
             )
@@ -777,7 +820,7 @@ class AgentContext:
         except Exception as err:  # pylint: disable=broad-exception-caught
             logger.debug("Failed to record agent dispatch span: %s", err)
 
-    async def dispatch_group(
+    async def call_agents(
         self,
         tasks: list[dict[str, Any]],
         wait_for_reply: bool = True,
@@ -785,8 +828,9 @@ class AgentContext:
         parent_message_id: Optional[str] = None,
     ) -> dict:
         """
-        Dispatch multiple tasks concurrently as a group.
-        The caller agent will be resumed ONLY when ALL tasks in the group are completed.
+        Dispatch multiple tasks concurrently as a Task Group — call_agent's
+        plural. The caller agent will be resumed with every task's result,
+        aggregated, ONLY when ALL tasks in the group are complete.
 
         Args:
             tasks: A list of dicts, each containing:
@@ -799,7 +843,7 @@ class AgentContext:
             wait_for_reply: bool. If True, sets up Redis counters to wait for all.
         """
         if not tasks:
-            return {"status": "EMPTY", "task_group_id": ""}
+            raise ValueError("dispatch_group/call_agents requires at least one task")
 
         task_group_id = f"{TASK_GROUP_ID_PREFIX}{uuid.uuid4().hex[:8]}"
         total_tasks = len(tasks)
@@ -827,114 +871,63 @@ class AgentContext:
             content = task.get("content", "")
             extra_payload = task.get("extra_payload", {})
             metadata = dict(task.get("metadata", {}) or {})
-            serialized_content = self._serialize_outbound_content(content)
 
             current_message_id = message_id or self.generate_message_id()
-            parent_message_id = (
-                parent_message_id if parent_message_id else self.message_id
-            )
-            call_parent_span_id = f"{current_message_id}:client.dispatch"
-            trace_parent_span_id = self._resolve_call_trace_parent_span_id(
-                call_parent_span_id
-            )
-            metadata.setdefault("trace_parent_span_id", trace_parent_span_id)
-            metadata.setdefault("framework_parent_span_id", call_parent_span_id)
-            langfuse_parent_observation_id = (
-                str(metadata.get("langfuse_parent_observation_id", "") or "")
-                or self._resolve_call_langfuse_parent_id()
-            )
-            merged_extra_payload = dict(extra_payload)
-            if wait_for_reply:
-                merged_extra_payload["wait_for_reply"] = True
-
-            command = AskAgentCommand(
-                header=MessageHeader(
-                    message_id=current_message_id,
-                    session_id=self.session_id,
-                    trace_id=self.trace_id,
-                    source_agent_type=self.current_agent_id if wait_for_reply else "",
+            try:
+                task_result = await self._dispatch_single_task(
                     target_agent_type=target_agent_type,
+                    content=content,
+                    extra_payload=extra_payload,
+                    metadata=metadata,
+                    wait_for_reply=wait_for_reply,
+                    message_id=current_message_id,
                     parent_message_id=parent_message_id,
                     task_group_id=task_group_id,
-                    user_code=self.agent_runtime_state.session_manager.user_code,
-                    user_name=self.agent_runtime_state.session_manager.user_name,
-                    metadata=metadata,
-                    trace_parent_span_id=trace_parent_span_id,
-                    langfuse_parent_observation_id=langfuse_parent_observation_id,
-                ),
-                content=serialized_content,
-                wait_for_reply=wait_for_reply,
-                extra_payload={
-                    k: v
-                    for k, v in merged_extra_payload.items()
-                    if k != "wait_for_reply"
-                },
-            )
-
-            if self.plugin_registry:
-                await self.plugin_registry.on_call_agent_start(self, command)
-
-            execution_id = f"{EXECUTION_ID_PREFIX}{uuid.uuid4().hex[:8]}"
-            from by_framework.core.registry import WorkerRegistry
-
-            registry = WorkerRegistry(self.redis)
-            if hasattr(registry, "initialize_execution"):
-                try:
-                    await registry.initialize_execution(
-                        {
-                            "execution_id": execution_id,
-                            "message_id": current_message_id,
-                            "session_id": self.session_id,
-                            "trace_id": self.trace_id,
-                            "parent_message_id": parent_message_id or "",
-                            "source_agent_type": self.current_agent_id
-                            if wait_for_reply
-                            else "",
-                            "target_agent_type": target_agent_type,
-                            "stream_name": RedisKeys.ctrl_stream(target_agent_type),
-                            "status": "QUEUED",
-                        }
+                )
+            except Exception:
+                # A genuine dispatch-time failure (not an availability-check
+                # rejection, which _dispatch_single_task already turns into a
+                # FAILED result instead of raising). Stop fanning out and mark
+                # the group aborted so already-sent siblings' replies don't
+                # later resume this (now-failed) caller execution.
+                if wait_for_reply:
+                    await self.redis.hset(  # type: ignore
+                        RedisKeys.task_group(task_group_id),
+                        TASK_GROUP_FIELD_ABORTED,
+                        "1",
                     )
-                except Exception:  # pylint: disable=broad-exception-caught
-                    pass  # Fallback if registry fails
-
-            dispatch_started_at = int(time.time() * 1000)
-            try:
-                await self.redis.xadd(
-                    RedisKeys.ctrl_stream(target_agent_type), command.to_redis_payload()
-                )
-                await self._record_agent_dispatch_span(
-                    message_id=current_message_id,
-                    parent_message_id=parent_message_id,
-                    source_agent_type=self.current_agent_id if wait_for_reply else "",
-                    target_agent_type=target_agent_type,
-                    target_worker_id="",
-                    route_policy=RoutePolicy.SEND_ANYWAY,
-                    route_status="GROUP_DISPATCH",
-                    start_ts=dispatch_started_at,
-                    end_ts=int(time.time() * 1000),
-                )
-            except Exception as error:
-                if self.plugin_registry:
-                    await self.plugin_registry.on_call_agent_error(self, command, error)
                 raise
 
-            if self.plugin_registry:
-                await self.plugin_registry.on_call_agent_complete(
-                    self,
-                    command,
-                    {
-                        "status": AgentState.QUEUED.value,
-                        "message_id": current_message_id,
-                        "parent_message_id": parent_message_id,
-                        "target_agent_type": target_agent_type,
-                    },
+            if task_result["status"] == AgentState.FAILED.value and wait_for_reply:
+                # Target agent type unavailable: record the failure as this
+                # task's result immediately, without blocking the rest of
+                # the batch or waiting for a reply that will never arrive.
+                result_data = {
+                    "status": task_result["status"],
+                    "reply_data": None,
+                    "content": "",
+                    "target_agent_type": target_agent_type,
+                    "metadata": {},
+                    "extra_payload": {},
+                    "error": task_result.get("error"),
+                    "error_code": task_result.get("error_code"),
+                }
+                results_key = RedisKeys.task_group_results(task_group_id)
+                await self.redis.hset(  # type: ignore
+                    results_key, current_message_id, json.dumps(result_data)
+                )
+                await self.redis.expire(results_key, TASK_GROUP_TTL_SECONDS)
+                await self.redis.hincrby(  # type: ignore
+                    RedisKeys.task_group(task_group_id), TASK_GROUP_FIELD_COMPLETED, 1
                 )
 
             dispatched.append(
                 {
                     "message_id": current_message_id,
-                    "target_agent_type": target_agent_type,
+                    # task_result["target_agent_type"] reflects any fallback
+                    # reroute _dispatch_single_task performed, so this stays
+                    # consistent with what Group Join later reports.
+                    "target_agent_type": task_result["target_agent_type"],
                 }
             )
 
@@ -970,10 +963,29 @@ class AgentContext:
             logger.debug("Failed to record dispatch_group span: %s", err)
 
         return {
-            "status": "GROUP_QUEUED",
+            "status": AgentState.QUEUED.value,
             "task_group_id": task_group_id,
             "dispatched_tasks": dispatched,
         }
+
+    async def dispatch_group(
+        self,
+        tasks: list[dict[str, Any]],
+        wait_for_reply: bool = True,
+        message_id: Optional[str] = None,
+        parent_message_id: Optional[str] = None,
+    ) -> dict:
+        """Alias for call_agents, kept permanently for source compatibility.
+
+        Not deprecated: shares call_agents' implementation and behavior
+        exactly, so existing callers upgrade automatically without a rename.
+        """
+        return await self.call_agents(
+            tasks,
+            wait_for_reply=wait_for_reply,
+            message_id=message_id,
+            parent_message_id=parent_message_id,
+        )
 
     def _serialize_outbound_content(self, content: object) -> WireContent:
         if self.content_codec is not None:

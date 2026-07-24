@@ -529,6 +529,10 @@ MSG_MAP_PREFIX = "msg_map:"
 TASK_GROUP_FIELD_TOTAL = "total"
 TASK_GROUP_FIELD_COMPLETED = "completed"
 TASK_GROUP_FIELD_SOURCE_AGENT = "source_agent_type"
+# Set once dispatch fails partway through a batch; any reply that arrives
+# for an aborted group is discarded instead of resuming the (already
+# terminated) caller execution.
+TASK_GROUP_FIELD_ABORTED = "aborted"
 
 
 # --- Timing and Sleep Constants ---
