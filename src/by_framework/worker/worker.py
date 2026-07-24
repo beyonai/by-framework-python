@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 from by_framework.common.config import WorkerConfig
 from by_framework.common.constants import (
     MESSAGE_ID_PREFIX,
+    TASK_GROUP_FIELD_ABORTED,
     TASK_GROUP_FIELD_COMPLETED,
     TASK_GROUP_FIELD_TOTAL,
     TASK_GROUP_TTL_SECONDS,
@@ -654,12 +655,33 @@ class GatewayWorker(ABC):
                         group_key, TASK_GROUP_FIELD_TOTAL
                     )
                     if total_str is not None:
+                        aborted = await self.redis.hget(  # type: ignore
+                            group_key, TASK_GROUP_FIELD_ABORTED
+                        )
+                        if aborted:
+                            logger.warning(
+                                "[%s] TaskGroup %s is aborted, discarding late "
+                                "reply from message_id=%s",
+                                self.worker_id,
+                                header.task_group_id,
+                                header.message_id,
+                            )
+                            return AgentTaskResult(
+                                status=f"{AgentState.CANCELLED.value}: group_aborted"
+                            )
+
                         # Store result in Redis Hash for distributed access
                         if isinstance(raw_command, ResumeCommand):
                             result_data = {
                                 "status": raw_command.status,
                                 "reply_data": raw_command.reply_data,
                                 "content": raw_command.content,
+                                # This ResumeCommand flows FROM the sub-agent
+                                # back TO the caller, so its header's
+                                # source_agent_type is the sub-agent that
+                                # produced this result — i.e. the original
+                                # dispatch's target_agent_type.
+                                "target_agent_type": header.source_agent_type,
                                 "metadata": raw_command.header.metadata,
                                 "extra_payload": raw_command.extra_payload,
                             }
@@ -690,6 +712,15 @@ class GatewayWorker(ABC):
                             header.task_group_id,
                             total_str,
                         )
+                        raw_results = await self.redis.hgetall(  # type: ignore
+                            results_key
+                        )
+                        aggregated_results = [
+                            {"message_id": msg_id, **json.loads(data)}
+                            for msg_id, data in raw_results.items()
+                        ]
+                        if isinstance(command, ResumeCommand):
+                            command.reply_data = aggregated_results
 
                 # await context.emit_state(
                 #     StateChangeEvent(state=AgentState.RESUMED.value)
