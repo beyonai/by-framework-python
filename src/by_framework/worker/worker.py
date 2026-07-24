@@ -661,10 +661,10 @@ class GatewayWorker(ABC):
                         if aborted:
                             logger.warning(
                                 "[%s] TaskGroup %s is aborted, discarding late "
-                                "reply from message_id=%s",
+                                "reply from sub-task message_id=%s",
                                 self.worker_id,
                                 header.task_group_id,
-                                header.message_id,
+                                header.parent_message_id,
                             )
                             return AgentTaskResult(
                                 status=f"{AgentState.CANCELLED.value}: group_aborted"
@@ -685,9 +685,18 @@ class GatewayWorker(ABC):
                                 "metadata": raw_command.header.metadata,
                                 "extra_payload": raw_command.extra_payload,
                             }
+                            # _enqueue_agent_return sets a reply's header.
+                            # message_id to the ORIGINAL dispatch's
+                            # parent_message_id (the caller's own message
+                            # id) — identical across every sibling in this
+                            # Task Group. Keying results by that would let
+                            # siblings overwrite each other; header.
+                            # parent_message_id on the reply is the
+                            # sub-task's own dispatch-time message_id
+                            # instead, which is unique per task.
                             await self.redis.hset(  # type: ignore
                                 results_key,
-                                header.message_id,
+                                header.parent_message_id,
                                 json.dumps(result_data),
                             )
                             await self.redis.expire(results_key, TASK_GROUP_TTL_SECONDS)

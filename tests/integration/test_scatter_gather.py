@@ -190,14 +190,21 @@ async def test_group_join_delivers_aggregated_results_on_resume(tmp_path):
     task_group_id = dispatch_result["task_group_id"]
     msg_b, msg_c = (t["message_id"] for t in dispatch_result["dispatched_tasks"])
 
+    # _enqueue_agent_return sets a reply's header.message_id to the caller's
+    # own message_id (shared by every sibling reply in this Task Group) and
+    # header.parent_message_id to the sub-task's own dispatch-time message_id
+    # (msg_b/msg_c here, distinct per task) — mirror that real relationship,
+    # not a hand-picked distinct message_id per reply, or this test can't
+    # catch a Group Join bug that only shows up when siblings' replies
+    # collide on the shared header.message_id.
     reply_b = ResumeCommand(
         header=MessageHeader(
-            message_id=msg_b,
+            message_id="parent-msg",
             session_id="s1",
             trace_id="t1",
             source_agent_type="agent-b",
             target_agent_type="caller_agent",
-            parent_message_id="parent-msg",
+            parent_message_id=msg_b,
             task_group_id=task_group_id,
         ),
         status="COMPLETED",
@@ -209,12 +216,12 @@ async def test_group_join_delivers_aggregated_results_on_resume(tmp_path):
 
     reply_c = ResumeCommand(
         header=MessageHeader(
-            message_id=msg_c,
+            message_id="parent-msg",
             session_id="s1",
             trace_id="t1",
             source_agent_type="agent-c",
             target_agent_type="caller_agent",
-            parent_message_id="parent-msg",
+            parent_message_id=msg_c,
             task_group_id=task_group_id,
         ),
         status="COMPLETED",
@@ -274,12 +281,12 @@ async def test_group_join_delivers_aggregate_even_with_partial_failure(tmp_path)
     await worker._handle_message(
         ResumeCommand(
             header=MessageHeader(
-                message_id=msg_b,
+                message_id="parent-msg",
                 session_id="s1",
                 trace_id="t1",
                 source_agent_type="agent-b",
                 target_agent_type="caller_agent",
-                parent_message_id="parent-msg",
+                parent_message_id=msg_b,
                 task_group_id=task_group_id,
             ),
             status="FAILED",
@@ -289,12 +296,12 @@ async def test_group_join_delivers_aggregate_even_with_partial_failure(tmp_path)
     await worker._handle_message(
         ResumeCommand(
             header=MessageHeader(
-                message_id=msg_c,
+                message_id="parent-msg",
                 session_id="s1",
                 trace_id="t1",
                 source_agent_type="agent-c",
                 target_agent_type="caller_agent",
-                parent_message_id="parent-msg",
+                parent_message_id=msg_c,
                 task_group_id=task_group_id,
             ),
             status="COMPLETED",
@@ -341,12 +348,12 @@ async def test_collect_group_results_still_works_outside_process_command(tmp_pat
     await worker._handle_message(
         ResumeCommand(
             header=MessageHeader(
-                message_id=msg_b,
+                message_id="parent-msg",
                 session_id="s1",
                 trace_id="t1",
                 source_agent_type="agent-b",
                 target_agent_type="caller_agent",
-                parent_message_id="parent-msg",
+                parent_message_id=msg_b,
                 task_group_id=task_group_id,
             ),
             status="COMPLETED",
@@ -396,12 +403,12 @@ async def test_collect_group_results_times_out_with_partial_results(tmp_path):
     await worker._handle_message(
         ResumeCommand(
             header=MessageHeader(
-                message_id=msg_b,
+                message_id="parent-msg",
                 session_id="s1",
                 trace_id="t1",
                 source_agent_type="agent-b",
                 target_agent_type="caller_agent",
-                parent_message_id="parent-msg",
+                parent_message_id=msg_b,
                 task_group_id=task_group_id,
             ),
             status="COMPLETED",
@@ -451,12 +458,12 @@ async def test_group_join_discards_reply_for_aborted_task_group(tmp_path):
     await worker._handle_message(
         ResumeCommand(
             header=MessageHeader(
-                message_id=msg_b,
+                message_id="parent-msg",
                 session_id="s1",
                 trace_id="t1",
                 source_agent_type="agent-b",
                 target_agent_type="caller_agent",
-                parent_message_id="parent-msg",
+                parent_message_id=msg_b,
                 task_group_id=task_group_id,
             ),
             status="COMPLETED",
