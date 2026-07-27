@@ -699,6 +699,7 @@ class WorkerRunner:
                 chunk_count=chunk_count,
                 parent_span_id=framework_parent_span_id,
                 tokens=token_usage,
+                cost={"total": token_usage["cost"]} if "cost" in token_usage else {},
             )
 
             # Finalize trace root when the root execution completes so the
@@ -810,6 +811,7 @@ class WorkerRunner:
         parent_span_id: str = "",
         chunk_count: int = 0,
         tokens: Optional[dict] = None,
+        cost: Optional[dict] = None,
     ) -> None:
         try:
             await self.span_recorder.record_span(
@@ -837,6 +839,7 @@ class WorkerRunner:
                     route_status=route_status,
                     chunk_count=chunk_count,
                     tokens=tokens or {},
+                    cost=cost or {},
                 )
             )
         except Exception as err:  # pylint: disable=broad-exception-caught

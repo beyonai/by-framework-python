@@ -498,12 +498,14 @@ class AgentContext:
         prompt_tokens: int = 0,
         completion_tokens: int = 0,
         model: str = "",
+        cost: float | None = None,
     ) -> None:
-        """Accumulate token usage from a single LLM call.
+        """Accumulate token usage (and optionally cost) from a single LLM call.
 
         Intended for agent implementations and framework adapters.  Each call
         adds to the running totals for the current execution so that the final
         worker.execute span and the Langfuse observation reflect the aggregate.
+        ``cost`` is additive across calls, mirroring the token counters.
         """
         self._token_usage["prompt_tokens"] = self._token_usage.get(
             "prompt_tokens", 0
@@ -516,6 +518,10 @@ class AgentContext:
         )
         if model:
             self._token_usage["model"] = model
+        if cost is not None:
+            self._token_usage["cost"] = self._token_usage.get("cost", 0.0) + max(
+                0.0, cost
+            )
 
     def get_token_usage(self) -> dict[str, Any]:
         """Return accumulated token usage for this execution."""
