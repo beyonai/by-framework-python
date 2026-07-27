@@ -200,7 +200,9 @@ async def test_mixed_local_tool_and_sub_agent_call_in_one_turn(
     # The local tool's result was persisted into the suspended state
     # alongside the pending sub-agent call, not dropped.
     assert ("tool", "call_local") in roles_and_ids
-    assert state["pending_tool_call_id"] == "call_sub"
+    assert state["pending"] == [
+        {"tool_call_id": "call_sub", "tool_name": "sub_assistant"}
+    ]
 
 
 @pytest.mark.asyncio

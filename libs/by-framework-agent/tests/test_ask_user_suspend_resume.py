@@ -79,8 +79,7 @@ async def test_ask_user_tool_suspends_and_persists_loop_state(
     raw_state = await mock_redis.get(RedisKeys.harness_state("exec-1"))
     assert raw_state is not None
     state = json.loads(raw_state)
-    assert state["pending_tool_call_id"] == "call_ask"
-    assert state["pending_tool_name"] == "ask_user"
+    assert state["pending"] == [{"tool_call_id": "call_ask", "tool_name": "ask_user"}]
     assert state["messages"][-1]["tool_calls"][0]["function"]["name"] == "ask_user"
 
     pipe = mock_redis.pipeline.return_value

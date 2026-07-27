@@ -118,27 +118,35 @@ class HarnessLoop:
                         status=AgentState.COMPLETED.value, content=turn.content
                     )
 
-                sub_agent_call = next(
-                    (tc for tc in turn.tool_calls if tc.name in sub_agent_ids), None
-                )
-                local_calls = (
-                    [tc for tc in turn.tool_calls if tc is not sub_agent_call]
-                    if sub_agent_call is not None
-                    else turn.tool_calls
-                )
+                sub_agent_calls = [
+                    tc for tc in turn.tool_calls if tc.name in sub_agent_ids
+                ]
+                local_calls = [
+                    tc for tc in turn.tool_calls if tc not in sub_agent_calls
+                ]
                 tool_results = (
                     await self._execute_tool_calls(context, local_calls, tool_specs)
                     if local_calls
                     else []
                 )
 
-                if sub_agent_call is not None:
-                    dispatch_error = await self._dispatch_sub_agent_call(
-                        context, messages, turn, sub_agent_call, tool_results
+                if len(sub_agent_calls) == 1:
+                    dispatch_errors = await self._dispatch_sub_agent_call(
+                        context, messages, turn, sub_agent_calls[0], tool_results
                     )
-                    if dispatch_error is None:
+                    if dispatch_errors is None:
                         return AgentTaskResult(status=AgentState.QUEUED.value)
-                    tool_results.append(dispatch_error)
+                    tool_results.extend(dispatch_errors)
+                elif len(sub_agent_calls) > 1:
+                    # Per ADR-0001's call_agent/call_agents unification: a turn
+                    # with multiple sub-agent calls fans out as one Task Group
+                    # dispatch rather than sequential call_agent hops.
+                    dispatch_errors = await self._dispatch_sub_agent_task_group(
+                        context, messages, turn, sub_agent_calls, tool_results
+                    )
+                    if dispatch_errors is None:
+                        return AgentTaskResult(status=AgentState.QUEUED.value)
+                    tool_results.extend(dispatch_errors)
 
                 messages.append(
                     self._assistant_tool_call_message(turn.content, turn.tool_calls)
@@ -159,11 +167,7 @@ class HarnessLoop:
         messages: list[dict[str, Any]],
         ask_user_call: _ResolvedToolCall,
     ) -> None:
-        if not context.execution_id:
-            raise RuntimeError(
-                "NativeAgentWorker requires a tracked execution_id to suspend a "
-                "loop on ask_user — ensure the worker is run via WorkerRunner"
-            )
+        self._require_execution_id(context, "ask_user")
 
         await self._persist_assistant_tool_call_turn(context, "", [ask_user_call])
         suspended_messages = messages + [
@@ -172,8 +176,9 @@ class HarnessLoop:
         await self._save_harness_state(
             context,
             messages=suspended_messages,
-            pending_tool_call_id=ask_user_call.id,
-            pending_tool_name=ask_user_call.name,
+            pending=[
+                {"tool_call_id": ask_user_call.id, "tool_name": ask_user_call.name}
+            ],
         )
 
         prompt = ""
@@ -200,25 +205,18 @@ class HarnessLoop:
         turn: _ModelTurn,
         sub_agent_call: _ResolvedToolCall,
         sibling_results: list[dict[str, Any]],
-    ) -> dict[str, Any] | None:
-        """Delegate to a sub-agent via call_agent.
+    ) -> list[dict[str, Any]] | None:
+        """Delegate to a single sub-agent via call_agent.
 
         On success, persists the suspended loop state and returns None — the
         caller returns QUEUED without falling through. On dispatch failure
-        (e.g. the sub-agent type has no online worker), returns a tool-error
-        result for the caller to fold into the normal turn continuation
+        (e.g. the sub-agent type has no online worker), returns tool-error
+        result(s) for the caller to fold into the normal turn continuation
         instead of suspending.
         """
-        if not context.execution_id:
-            raise RuntimeError(
-                "NativeAgentWorker requires a tracked execution_id to suspend "
-                "a loop on an agent-as-tool call — ensure the worker is run "
-                "via WorkerRunner"
-            )
+        self._require_execution_id(context, "an agent-as-tool call")
 
-        content = ""
-        if isinstance(sub_agent_call.arguments, dict):
-            content = str(sub_agent_call.arguments.get("content", ""))
+        content = _tool_call_content_argument(sub_agent_call)
 
         dispatch_result = await context.call_agent(
             target_agent_type=sub_agent_call.name,
@@ -227,29 +225,97 @@ class HarnessLoop:
         )
         if dispatch_result.get("status") != AgentState.QUEUED.value:
             dispatch_error = dispatch_result.get("error") or "unavailable"
-            return _tool_error_message(
-                sub_agent_call,
-                f"Failed to dispatch to sub-agent {sub_agent_call.name!r}: "
-                f"{dispatch_error}",
-            )
+            return [
+                _tool_error_message(
+                    sub_agent_call,
+                    f"Failed to dispatch to sub-agent {sub_agent_call.name!r}: "
+                    f"{dispatch_error}",
+                )
+            ]
 
+        await self._persist_suspended_turn(context, turn, sibling_results)
+        await self._save_harness_state(
+            context,
+            messages=messages
+            + [self._assistant_tool_call_message(turn.content, turn.tool_calls)]
+            + sibling_results,
+            pending=[
+                {"tool_call_id": sub_agent_call.id, "tool_name": sub_agent_call.name}
+            ],
+        )
+        return None
+
+    async def _dispatch_sub_agent_task_group(
+        self,
+        context: AgentContext,
+        messages: list[dict[str, Any]],
+        turn: _ModelTurn,
+        sub_agent_calls: list[_ResolvedToolCall],
+        sibling_results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]] | None:
+        """Delegate to multiple sub-agents at once as a single Task Group.
+
+        On success, persists the suspended loop state (with one pending
+        entry per sub-agent call) and returns None. Group Join — already
+        handled by GatewayWorker — resumes this loop exactly once, with
+        every sub-agent's result available together. On a genuine
+        dispatch-time failure (call_agents raises — an aborted fan-out, not
+        an individual unavailable target, which call_agents already turns
+        into a FAILED per-task result instead of raising), returns
+        tool-error results for every sub-agent call so the loop continues.
+        """
+        self._require_execution_id(context, "a multi-target agent-as-tool call")
+
+        tasks = [
+            {
+                "target_agent_type": call.name,
+                "content": _tool_call_content_argument(call),
+            }
+            for call in sub_agent_calls
+        ]
+
+        try:
+            await context.call_agents(tasks, wait_for_reply=True)
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            return [
+                _tool_error_message(
+                    call, f"Failed to dispatch Task Group to sub-agents: {exc}"
+                )
+                for call in sub_agent_calls
+            ]
+
+        await self._persist_suspended_turn(context, turn, sibling_results)
+        await self._save_harness_state(
+            context,
+            messages=messages
+            + [self._assistant_tool_call_message(turn.content, turn.tool_calls)]
+            + sibling_results,
+            pending=[
+                {"tool_call_id": call.id, "tool_name": call.name}
+                for call in sub_agent_calls
+            ],
+        )
+        return None
+
+    async def _persist_suspended_turn(
+        self,
+        context: AgentContext,
+        turn: _ModelTurn,
+        sibling_results: list[dict[str, Any]],
+    ) -> None:
         await self._persist_assistant_tool_call_turn(
             context, turn.content, turn.tool_calls
         )
         if sibling_results:
             await self._persist_tool_result_turns(context, sibling_results)
-        suspended_messages = (
-            messages
-            + [self._assistant_tool_call_message(turn.content, turn.tool_calls)]
-            + sibling_results
-        )
-        await self._save_harness_state(
-            context,
-            messages=suspended_messages,
-            pending_tool_call_id=sub_agent_call.id,
-            pending_tool_name=sub_agent_call.name,
-        )
-        return None
+
+    @staticmethod
+    def _require_execution_id(context: AgentContext, action: str) -> None:
+        if not context.execution_id:
+            raise RuntimeError(
+                f"NativeAgentWorker requires a tracked execution_id to suspend "
+                f"a loop on {action} — ensure the worker is run via WorkerRunner"
+            )
 
     async def _rehydrate_messages(self, context: AgentContext) -> list[dict[str, Any]]:
         if not context.execution_id:
@@ -268,14 +334,27 @@ class HarnessLoop:
         await self._clear_harness_state(context)
 
         messages = state["messages"]
-        tool_result = {
-            "role": "tool",
-            "tool_call_id": state["pending_tool_call_id"],
-            "name": state["pending_tool_name"],
-            "content": self._extract_resume_reply(context.current_command),
-        }
-        messages.append(tool_result)
-        await self._persist_tool_result_turns(context, [tool_result])
+        pending = state["pending"]
+
+        if len(pending) == 1:
+            tool_results = [
+                {
+                    "role": "tool",
+                    "tool_call_id": pending[0]["tool_call_id"],
+                    "name": pending[0]["tool_name"],
+                    "content": self._extract_resume_reply(context.current_command),
+                }
+            ]
+        else:
+            # Only a Task Group dispatch ever saves >1 pending entries, and
+            # GatewayWorker's Group Join only calls process_command once
+            # every sibling has replied, with the aggregate on reply_data.
+            tool_results = _map_group_results_to_tool_calls(
+                context.current_command, pending
+            )
+
+        messages.extend(tool_results)
+        await self._persist_tool_result_turns(context, tool_results)
         return messages
 
     @staticmethod
@@ -301,16 +380,11 @@ class HarnessLoop:
         context: AgentContext,
         *,
         messages: list[dict[str, Any]],
-        pending_tool_call_id: str,
-        pending_tool_name: str,
+        pending: list[dict[str, str]],
     ) -> None:
         key = RedisKeys.harness_state(context.execution_id)
         payload = json.dumps(
-            {
-                "messages": messages,
-                "pending_tool_call_id": pending_tool_call_id,
-                "pending_tool_name": pending_tool_name,
-            },
+            {"messages": messages, "pending": pending},
             ensure_ascii=False,
         )
         await context.redis.set(key, payload, ex=HARNESS_STATE_TTL_SECONDS)
@@ -619,3 +693,83 @@ def _sub_agent_tool_schema(sub_agent_id: str, description: str) -> dict[str, Any
             },
         },
     }
+
+
+def _tool_call_content_argument(call: _ResolvedToolCall) -> str:
+    if isinstance(call.arguments, dict):
+        return str(call.arguments.get("content", ""))
+    return ""
+
+
+def _map_group_results_to_tool_calls(
+    command: Any, pending: list[dict[str, str]]
+) -> list[dict[str, Any]]:
+    """Map a Task Group's aggregated reply_data back to each pending tool_call_id.
+
+    Each aggregate entry carries ``target_agent_type`` — the sub-agent that
+    produced it — which correlates 1:1 with the ``tool_name`` recorded for
+    each pending call at suspend time (a turn dispatches at most one call
+    per distinct sub-agent type).
+    """
+    aggregated = getattr(command, "reply_data", None) or []
+    tool_call_id_by_agent_type = {
+        entry["tool_name"]: entry["tool_call_id"] for entry in pending
+    }
+
+    results: list[dict[str, Any]] = []
+    seen_agent_types: set[str] = set()
+    for result in aggregated:
+        agent_type = result.get("target_agent_type", "")
+        tool_call_id = tool_call_id_by_agent_type.get(agent_type)
+        if tool_call_id is None:
+            continue
+        seen_agent_types.add(agent_type)
+        results.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "name": agent_type,
+                "content": _extract_group_member_reply(result),
+            }
+        )
+
+    # Every pending call should appear in the aggregate once Group Join
+    # fires (it only fires once `completed == total`) — but fail loudly
+    # with a visible error message instead of silently dropping the
+    # tool_call_id from the conversation if one is somehow missing.
+    for entry in pending:
+        if entry["tool_name"] not in seen_agent_types:
+            results.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": entry["tool_call_id"],
+                    "name": entry["tool_name"],
+                    "content": json.dumps(
+                        {"error": "no result received for this sub-agent call"},
+                        ensure_ascii=False,
+                    ),
+                }
+            )
+    return results
+
+
+def _extract_group_member_reply(result: dict[str, Any]) -> str:
+    if result.get("status") == "FAILED":
+        error = result.get("error") or "sub-agent call failed"
+        return json.dumps({"error": error}, ensure_ascii=False)
+
+    content = result.get("content") or ""
+    if content:
+        return (
+            content
+            if isinstance(content, str)
+            else json.dumps(content, ensure_ascii=False)
+        )
+    reply_data = result.get("reply_data")
+    if reply_data is not None:
+        return (
+            reply_data
+            if isinstance(reply_data, str)
+            else json.dumps(reply_data, ensure_ascii=False)
+        )
+    return ""

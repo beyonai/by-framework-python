@@ -37,8 +37,11 @@ class FakeRedisStore:
     async def smembers(self, key):
         return set(self.sets.get(key, set()))
 
-    async def hset(self, key, mapping=None, **kwargs):
-        self.hashes.setdefault(key, {}).update(mapping or kwargs)
+    async def hset(self, key, field=None, value=None, mapping=None, **kwargs):
+        bucket = self.hashes.setdefault(key, {})
+        if field is not None:
+            bucket[field] = value
+        bucket.update(mapping or kwargs)
 
     async def hget(self, key, field):
         return self.hashes.get(key, {}).get(field)
@@ -73,6 +76,7 @@ def mock_redis():
     mock.hgetall = store.hgetall
     mock.hincrby = store.hincrby
     mock.expire = store.expire
+    mock.store = store
     return mock
 
 
