@@ -18,6 +18,7 @@ class FakeRedisStore:
     def __init__(self):
         self.strings: dict[str, str] = {}
         self.hashes: dict[str, dict[str, str]] = {}
+        self.sets: dict[str, set] = {}
 
     async def set(self, key, value, ex=None):  # pylint: disable=unused-argument
         self.strings[key] = value
@@ -28,6 +29,13 @@ class FakeRedisStore:
     async def delete(self, key):
         self.strings.pop(key, None)
         self.hashes.pop(key, None)
+        self.sets.pop(key, None)
+
+    async def sadd(self, key, *values):
+        self.sets.setdefault(key, set()).update(values)
+
+    async def smembers(self, key):
+        return set(self.sets.get(key, set()))
 
     async def hset(self, key, mapping=None, **kwargs):
         self.hashes.setdefault(key, {}).update(mapping or kwargs)
@@ -58,12 +66,25 @@ def mock_redis():
     mock.set = store.set
     mock.get = store.get
     mock.delete = store.delete
+    mock.sadd = store.sadd
+    mock.smembers = store.smembers
     mock.hset = store.hset
     mock.hget = store.hget
     mock.hgetall = store.hgetall
     mock.hincrby = store.hincrby
     mock.expire = store.expire
     return mock
+
+
+async def mark_agent_type_online(
+    mock_redis, agent_type: str, worker_id: str = "worker-online"
+) -> None:
+    """Seed the availability-check keys AvailabilityRouter reads so
+    ``context.call_agent(...)`` treats ``agent_type`` as deliverable."""
+    from by_framework.common.constants import RedisKeys
+
+    await mock_redis.sadd(RedisKeys.agent_type_members(agent_type), worker_id)
+    await mock_redis.set(RedisKeys.worker_online_lease(worker_id), "1")
 
 
 @pytest.fixture

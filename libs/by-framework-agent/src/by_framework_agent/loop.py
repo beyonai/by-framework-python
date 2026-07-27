@@ -77,8 +77,10 @@ class HarnessLoop:
 
     async def run(self, context: AgentContext) -> AgentTaskResult:
         tool_specs = self._resolve_tools()
+        sub_agent_ids = set(self._agent_config.sub_agents)
         tool_schemas = [spec.to_openai_schema() for spec in tool_specs.values()]
         tool_schemas.append(_ASK_USER_TOOL_SCHEMA)
+        tool_schemas.extend(self._sub_agent_tool_schemas(context))
         model = self._resolve_model()
 
         is_resume = isinstance(context.current_command, ResumeCommand)
@@ -116,15 +118,33 @@ class HarnessLoop:
                         status=AgentState.COMPLETED.value, content=turn.content
                     )
 
+                sub_agent_call = next(
+                    (tc for tc in turn.tool_calls if tc.name in sub_agent_ids), None
+                )
+                local_calls = (
+                    [tc for tc in turn.tool_calls if tc is not sub_agent_call]
+                    if sub_agent_call is not None
+                    else turn.tool_calls
+                )
+                tool_results = (
+                    await self._execute_tool_calls(context, local_calls, tool_specs)
+                    if local_calls
+                    else []
+                )
+
+                if sub_agent_call is not None:
+                    dispatch_error = await self._dispatch_sub_agent_call(
+                        context, messages, turn, sub_agent_call, tool_results
+                    )
+                    if dispatch_error is None:
+                        return AgentTaskResult(status=AgentState.QUEUED.value)
+                    tool_results.append(dispatch_error)
+
                 messages.append(
                     self._assistant_tool_call_message(turn.content, turn.tool_calls)
                 )
                 await self._persist_assistant_tool_call_turn(
                     context, turn.content, turn.tool_calls
-                )
-
-                tool_results = await self._execute_tool_calls(
-                    context, turn.tool_calls, tool_specs
                 )
                 messages.extend(tool_results)
                 await self._persist_tool_result_turns(context, tool_results)
@@ -160,6 +180,76 @@ class HarnessLoop:
         if isinstance(ask_user_call.arguments, dict):
             prompt = str(ask_user_call.arguments.get("prompt", ""))
         await context.ask_user(prompt)
+
+    def _sub_agent_tool_schemas(self, context: AgentContext) -> list[dict[str, Any]]:
+        schemas = []
+        for sub_agent_id in self._agent_config.sub_agents:
+            sub_config = context.agent_runtime_state.config_manager.get_config(
+                sub_agent_id
+            )
+            description = (sub_config.description if sub_config else "") or (
+                f"Delegate to sub-agent {sub_agent_id!r}."
+            )
+            schemas.append(_sub_agent_tool_schema(sub_agent_id, description))
+        return schemas
+
+    async def _dispatch_sub_agent_call(
+        self,
+        context: AgentContext,
+        messages: list[dict[str, Any]],
+        turn: _ModelTurn,
+        sub_agent_call: _ResolvedToolCall,
+        sibling_results: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Delegate to a sub-agent via call_agent.
+
+        On success, persists the suspended loop state and returns None — the
+        caller returns QUEUED without falling through. On dispatch failure
+        (e.g. the sub-agent type has no online worker), returns a tool-error
+        result for the caller to fold into the normal turn continuation
+        instead of suspending.
+        """
+        if not context.execution_id:
+            raise RuntimeError(
+                "NativeAgentWorker requires a tracked execution_id to suspend "
+                "a loop on an agent-as-tool call — ensure the worker is run "
+                "via WorkerRunner"
+            )
+
+        content = ""
+        if isinstance(sub_agent_call.arguments, dict):
+            content = str(sub_agent_call.arguments.get("content", ""))
+
+        dispatch_result = await context.call_agent(
+            target_agent_type=sub_agent_call.name,
+            content=content,
+            wait_for_reply=True,
+        )
+        if dispatch_result.get("status") != AgentState.QUEUED.value:
+            dispatch_error = dispatch_result.get("error") or "unavailable"
+            return _tool_error_message(
+                sub_agent_call,
+                f"Failed to dispatch to sub-agent {sub_agent_call.name!r}: "
+                f"{dispatch_error}",
+            )
+
+        await self._persist_assistant_tool_call_turn(
+            context, turn.content, turn.tool_calls
+        )
+        if sibling_results:
+            await self._persist_tool_result_turns(context, sibling_results)
+        suspended_messages = (
+            messages
+            + [self._assistant_tool_call_message(turn.content, turn.tool_calls)]
+            + sibling_results
+        )
+        await self._save_harness_state(
+            context,
+            messages=suspended_messages,
+            pending_tool_call_id=sub_agent_call.id,
+            pending_tool_name=sub_agent_call.name,
+        )
+        return None
 
     async def _rehydrate_messages(self, context: AgentContext) -> list[dict[str, Any]]:
         if not context.execution_id:
@@ -507,4 +597,25 @@ def _tool_error_message(call: _ResolvedToolCall, error: str) -> dict[str, Any]:
         "tool_call_id": call.id,
         "name": call.name,
         "content": json.dumps({"error": error}, ensure_ascii=False),
+    }
+
+
+def _sub_agent_tool_schema(sub_agent_id: str, description: str) -> dict[str, Any]:
+    """Auto-generated tool schema for delegating to ``sub_agent_id`` via call_agent."""
+    return {
+        "type": "function",
+        "function": {
+            "name": sub_agent_id,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The message/task to send to the sub-agent.",
+                    }
+                },
+                "required": ["content"],
+            },
+        },
     }
