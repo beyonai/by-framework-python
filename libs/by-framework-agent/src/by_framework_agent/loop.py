@@ -16,8 +16,10 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+from by_framework.common.constants import HARNESS_STATE_TTL_SECONDS, RedisKeys
 from by_framework.core.extensions.agent_config import AgentConfig, CallbackType
 from by_framework.core.protocol.agent_state import AgentState
+from by_framework.core.protocol.commands import ResumeCommand
 from by_framework.core.protocol.events import StreamChunkEvent
 from by_framework.core.protocol.results import AgentTaskResult
 from by_framework.worker.context import AgentContext
@@ -27,6 +29,25 @@ from .tool_spec import ToolSpec
 
 _HISTORY_LIMIT = 50
 _MESSAGE_ROLES = {"user", "assistant", "system"}
+
+_ASK_USER_TOOL_NAME = "ask_user"
+_ASK_USER_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": _ASK_USER_TOOL_NAME,
+        "description": "Ask the human user a question and wait for their reply.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "The question to ask the user.",
+                }
+            },
+            "required": ["prompt"],
+        },
+    },
+}
 
 
 @dataclass
@@ -56,38 +77,164 @@ class HarnessLoop:
 
     async def run(self, context: AgentContext) -> AgentTaskResult:
         tool_specs = self._resolve_tools()
-        tool_schemas = [spec.to_openai_schema() for spec in tool_specs.values()] or None
-        messages = await self._build_messages(context)
+        tool_schemas = [spec.to_openai_schema() for spec in tool_specs.values()]
+        tool_schemas.append(_ASK_USER_TOOL_SCHEMA)
         model = self._resolve_model()
 
-        while True:
-            turn = await self._run_model_turn(context, messages, model, tool_schemas)
+        is_resume = isinstance(context.current_command, ResumeCommand)
+        if is_resume:
+            messages = await self._rehydrate_messages(context)
+        else:
+            messages = await self._build_messages(context)
 
-            if turn.usage or turn.cost:
-                context.record_token_usage(
-                    prompt_tokens=(turn.usage or {}).get("prompt_tokens", 0),
-                    completion_tokens=(turn.usage or {}).get("completion_tokens", 0),
-                    model=turn.model,
-                    cost=turn.cost or None,
+        try:
+            while True:
+                turn = await self._run_model_turn(
+                    context, messages, model, tool_schemas
                 )
 
-            if not turn.tool_calls:
-                return AgentTaskResult(
-                    status=AgentState.COMPLETED.value, content=turn.content
+                if turn.usage or turn.cost:
+                    context.record_token_usage(
+                        prompt_tokens=(turn.usage or {}).get("prompt_tokens", 0),
+                        completion_tokens=(turn.usage or {}).get(
+                            "completion_tokens", 0
+                        ),
+                        model=turn.model,
+                        cost=turn.cost or None,
+                    )
+
+                ask_user_call = next(
+                    (tc for tc in turn.tool_calls if tc.name == _ASK_USER_TOOL_NAME),
+                    None,
+                )
+                if ask_user_call is not None:
+                    await self._suspend_for_ask_user(context, messages, ask_user_call)
+                    return AgentTaskResult(status=AgentState.WAITING_USER.value)
+
+                if not turn.tool_calls:
+                    return AgentTaskResult(
+                        status=AgentState.COMPLETED.value, content=turn.content
+                    )
+
+                messages.append(
+                    self._assistant_tool_call_message(turn.content, turn.tool_calls)
+                )
+                await self._persist_assistant_tool_call_turn(
+                    context, turn.content, turn.tool_calls
                 )
 
-            messages.append(
-                self._assistant_tool_call_message(turn.content, turn.tool_calls)
-            )
-            await self._persist_assistant_tool_call_turn(
-                context, turn.content, turn.tool_calls
+                tool_results = await self._execute_tool_calls(
+                    context, turn.tool_calls, tool_specs
+                )
+                messages.extend(tool_results)
+                await self._persist_tool_result_turns(context, tool_results)
+        except Exception:
+            if context.execution_id:
+                await self._clear_harness_state(context)
+            raise
+
+    async def _suspend_for_ask_user(
+        self,
+        context: AgentContext,
+        messages: list[dict[str, Any]],
+        ask_user_call: _ResolvedToolCall,
+    ) -> None:
+        if not context.execution_id:
+            raise RuntimeError(
+                "NativeAgentWorker requires a tracked execution_id to suspend a "
+                "loop on ask_user — ensure the worker is run via WorkerRunner"
             )
 
-            tool_results = await self._execute_tool_calls(
-                context, turn.tool_calls, tool_specs
+        await self._persist_assistant_tool_call_turn(context, "", [ask_user_call])
+        suspended_messages = messages + [
+            self._assistant_tool_call_message("", [ask_user_call])
+        ]
+        await self._save_harness_state(
+            context,
+            messages=suspended_messages,
+            pending_tool_call_id=ask_user_call.id,
+            pending_tool_name=ask_user_call.name,
+        )
+
+        prompt = ""
+        if isinstance(ask_user_call.arguments, dict):
+            prompt = str(ask_user_call.arguments.get("prompt", ""))
+        await context.ask_user(prompt)
+
+    async def _rehydrate_messages(self, context: AgentContext) -> list[dict[str, Any]]:
+        if not context.execution_id:
+            raise RuntimeError(
+                "NativeAgentWorker requires a tracked execution_id to resume a "
+                "suspended loop — ensure the worker is run via WorkerRunner"
             )
-            messages.extend(tool_results)
-            await self._persist_tool_result_turns(context, tool_results)
+
+        state = await self._load_harness_state(context)
+        if state is None:
+            raise RuntimeError(
+                "Received a resume for execution_id="
+                f"{context.execution_id!r} but no harness loop state was found "
+                "(stray or expired resume)"
+            )
+        await self._clear_harness_state(context)
+
+        messages = state["messages"]
+        tool_result = {
+            "role": "tool",
+            "tool_call_id": state["pending_tool_call_id"],
+            "name": state["pending_tool_name"],
+            "content": self._extract_resume_reply(context.current_command),
+        }
+        messages.append(tool_result)
+        await self._persist_tool_result_turns(context, [tool_result])
+        return messages
+
+    @staticmethod
+    def _extract_resume_reply(command: Any) -> str:
+        content = getattr(command, "content", "") or ""
+        if content:
+            return (
+                content
+                if isinstance(content, str)
+                else json.dumps(content, ensure_ascii=False)
+            )
+        reply_data = getattr(command, "reply_data", None)
+        if reply_data is not None:
+            return (
+                reply_data
+                if isinstance(reply_data, str)
+                else json.dumps(reply_data, ensure_ascii=False)
+            )
+        return ""
+
+    async def _save_harness_state(
+        self,
+        context: AgentContext,
+        *,
+        messages: list[dict[str, Any]],
+        pending_tool_call_id: str,
+        pending_tool_name: str,
+    ) -> None:
+        key = RedisKeys.harness_state(context.execution_id)
+        payload = json.dumps(
+            {
+                "messages": messages,
+                "pending_tool_call_id": pending_tool_call_id,
+                "pending_tool_name": pending_tool_name,
+            },
+            ensure_ascii=False,
+        )
+        await context.redis.set(key, payload, ex=HARNESS_STATE_TTL_SECONDS)
+
+    async def _load_harness_state(self, context: AgentContext) -> dict[str, Any] | None:
+        key = RedisKeys.harness_state(context.execution_id)
+        raw = await context.redis.get(key)
+        if raw is None:
+            return None
+        return json.loads(raw)
+
+    async def _clear_harness_state(self, context: AgentContext) -> None:
+        key = RedisKeys.harness_state(context.execution_id)
+        await context.redis.delete(key)
 
     async def _run_model_turn(
         self,

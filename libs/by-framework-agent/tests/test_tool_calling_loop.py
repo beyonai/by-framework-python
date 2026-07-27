@@ -84,7 +84,8 @@ async def test_tool_call_then_final_answer(mock_redis, workspace_manager):
 
     # Two model calls: the tool_call turn, then the follow-up with the result.
     assert len(model_client.calls) == 2
-    assert model_client.calls[0]["tools"] == [tool.to_openai_schema()]
+    # The built-in ask_user tool is always offered alongside declared tools.
+    assert tool.to_openai_schema() in model_client.calls[0]["tools"]
     second_call_messages = model_client.calls[1]["messages"]
     assert second_call_messages[-2]["tool_calls"][0]["function"]["name"] == (
         "get_weather"
