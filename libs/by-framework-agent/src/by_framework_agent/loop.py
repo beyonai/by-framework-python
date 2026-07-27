@@ -177,7 +177,11 @@ class HarnessLoop:
             context,
             messages=suspended_messages,
             pending=[
-                {"tool_call_id": ask_user_call.id, "tool_name": ask_user_call.name}
+                {
+                    "tool_call_id": ask_user_call.id,
+                    "tool_name": ask_user_call.name,
+                    "message_id": "",
+                }
             ],
         )
 
@@ -233,14 +237,17 @@ class HarnessLoop:
                 )
             ]
 
-        await self._persist_suspended_turn(context, turn, sibling_results)
-        await self._save_harness_state(
+        await self._suspend_turn(
             context,
-            messages=messages
-            + [self._assistant_tool_call_message(turn.content, turn.tool_calls)]
-            + sibling_results,
+            messages,
+            turn,
+            sibling_results,
             pending=[
-                {"tool_call_id": sub_agent_call.id, "tool_name": sub_agent_call.name}
+                {
+                    "tool_call_id": sub_agent_call.id,
+                    "tool_name": sub_agent_call.name,
+                    "message_id": dispatch_result.get("message_id", ""),
+                }
             ],
         )
         return None
@@ -275,7 +282,7 @@ class HarnessLoop:
         ]
 
         try:
-            await context.call_agents(tasks, wait_for_reply=True)
+            dispatch_result = await context.call_agents(tasks, wait_for_reply=True)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             return [
                 _tool_error_message(
@@ -284,30 +291,54 @@ class HarnessLoop:
                 for call in sub_agent_calls
             ]
 
-        await self._persist_suspended_turn(context, turn, sibling_results)
-        await self._save_harness_state(
+        # dispatched_tasks is ordered identically to `tasks` above, and each
+        # entry's message_id is what Group Join later keys aggregated
+        # results by (see worker.py) — target_agent_type alone would collide
+        # if a turn ever dispatches the same sub-agent type twice.
+        dispatched_tasks = dispatch_result.get("dispatched_tasks", [])
+        await self._suspend_turn(
             context,
-            messages=messages
-            + [self._assistant_tool_call_message(turn.content, turn.tool_calls)]
-            + sibling_results,
+            messages,
+            turn,
+            sibling_results,
             pending=[
-                {"tool_call_id": call.id, "tool_name": call.name}
-                for call in sub_agent_calls
+                {
+                    "tool_call_id": call.id,
+                    "tool_name": call.name,
+                    "message_id": dispatched.get("message_id", ""),
+                }
+                for call, dispatched in zip(sub_agent_calls, dispatched_tasks)
             ],
         )
         return None
 
-    async def _persist_suspended_turn(
+    async def _suspend_turn(
         self,
         context: AgentContext,
+        messages: list[dict[str, Any]],
         turn: _ModelTurn,
         sibling_results: list[dict[str, Any]],
+        *,
+        pending: list[dict[str, str]],
     ) -> None:
+        """Persist a turn's assistant/tool history and harness_state together.
+
+        Shared tail for both single-target and Task Group dispatch: once the
+        dispatch itself has succeeded, both suspend the same way — only
+        ``pending``'s cardinality differs.
+        """
         await self._persist_assistant_tool_call_turn(
             context, turn.content, turn.tool_calls
         )
         if sibling_results:
             await self._persist_tool_result_turns(context, sibling_results)
+        await self._save_harness_state(
+            context,
+            messages=messages
+            + [self._assistant_tool_call_message(turn.content, turn.tool_calls)]
+            + sibling_results,
+            pending=pending,
+        )
 
     @staticmethod
     def _require_execution_id(context: AgentContext, action: str) -> None:
@@ -359,21 +390,10 @@ class HarnessLoop:
 
     @staticmethod
     def _extract_resume_reply(command: Any) -> str:
-        content = getattr(command, "content", "") or ""
-        if content:
-            return (
-                content
-                if isinstance(content, str)
-                else json.dumps(content, ensure_ascii=False)
-            )
-        reply_data = getattr(command, "reply_data", None)
-        if reply_data is not None:
-            return (
-                reply_data
-                if isinstance(reply_data, str)
-                else json.dumps(reply_data, ensure_ascii=False)
-            )
-        return ""
+        return _stringify_reply(
+            getattr(command, "content", "") or "",
+            getattr(command, "reply_data", None),
+        )
 
     async def _save_harness_state(
         self,
@@ -706,29 +726,28 @@ def _map_group_results_to_tool_calls(
 ) -> list[dict[str, Any]]:
     """Map a Task Group's aggregated reply_data back to each pending tool_call_id.
 
-    Each aggregate entry carries ``target_agent_type`` — the sub-agent that
-    produced it — which correlates 1:1 with the ``tool_name`` recorded for
-    each pending call at suspend time (a turn dispatches at most one call
-    per distinct sub-agent type).
+    Correlates by the dispatch-time ``message_id`` recorded on each pending
+    entry — the same unique-per-task key Group Join itself uses to key the
+    results hash (see worker.py) — NOT by ``target_agent_type``, which
+    collides if a single turn ever dispatches the same sub-agent type more
+    than once.
     """
     aggregated = getattr(command, "reply_data", None) or []
-    tool_call_id_by_agent_type = {
-        entry["tool_name"]: entry["tool_call_id"] for entry in pending
-    }
+    pending_by_message_id = {entry["message_id"]: entry for entry in pending}
 
     results: list[dict[str, Any]] = []
-    seen_agent_types: set[str] = set()
+    seen_message_ids: set[str] = set()
     for result in aggregated:
-        agent_type = result.get("target_agent_type", "")
-        tool_call_id = tool_call_id_by_agent_type.get(agent_type)
-        if tool_call_id is None:
+        message_id = result.get("message_id", "")
+        entry = pending_by_message_id.get(message_id)
+        if entry is None:
             continue
-        seen_agent_types.add(agent_type)
+        seen_message_ids.add(message_id)
         results.append(
             {
                 "role": "tool",
-                "tool_call_id": tool_call_id,
-                "name": agent_type,
+                "tool_call_id": entry["tool_call_id"],
+                "name": entry["tool_name"],
                 "content": _extract_group_member_reply(result),
             }
         )
@@ -738,7 +757,7 @@ def _map_group_results_to_tool_calls(
     # with a visible error message instead of silently dropping the
     # tool_call_id from the conversation if one is somehow missing.
     for entry in pending:
-        if entry["tool_name"] not in seen_agent_types:
+        if entry["message_id"] not in seen_message_ids:
             results.append(
                 {
                     "role": "tool",
@@ -758,14 +777,20 @@ def _extract_group_member_reply(result: dict[str, Any]) -> str:
         error = result.get("error") or "sub-agent call failed"
         return json.dumps({"error": error}, ensure_ascii=False)
 
-    content = result.get("content") or ""
+    return _stringify_reply(result.get("content") or "", result.get("reply_data"))
+
+
+def _stringify_reply(content: str, reply_data: Any) -> str:
+    """Prefer ``content``, fall back to ``reply_data``, both JSON-encoded if
+    not already a string. Shared by single-reply and Task Group correlation
+    — both need the same "what did the other side actually say" extraction.
+    """
     if content:
         return (
             content
             if isinstance(content, str)
             else json.dumps(content, ensure_ascii=False)
         )
-    reply_data = result.get("reply_data")
     if reply_data is not None:
         return (
             reply_data
