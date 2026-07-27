@@ -131,6 +131,20 @@ class GatewayWorker(ABC):
         """
         pass
 
+    async def on_cancelled_resume(
+        self, command: GatewayCommand, context: AgentContext, reason: str
+    ) -> None:
+        """Called when a resume arrives for an execution already marked
+        cancelled — the execution has no live task to cancel (it fully
+        suspended, e.g. awaiting ask_user or a sub-agent reply), so this is
+        the only hook that fires before ``_handle_message`` bails out
+        without calling ``process_command``.
+
+        Override this to clean up any out-of-band state (e.g. Redis) a
+        suspended execution left behind. No-op by default.
+        """
+        pass
+
     async def process_command(
         self, command: GatewayCommand, context: AgentContext
     ) -> ProcessCommandResult:
@@ -640,6 +654,7 @@ class GatewayWorker(ABC):
             # 3. Process
             logger.info("[%s] Starting task processing", self.worker_id)
             if cancel_event and cancel_event.is_set():
+                await self.on_cancelled_resume(command, context, cancel_reason)
                 raise asyncio.CancelledError(
                     f"Task cancelled before processing (reason: {cancel_reason})"
                 )
