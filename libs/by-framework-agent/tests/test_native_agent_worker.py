@@ -238,3 +238,77 @@ async def test_non_dict_model_params_fails_loudly(mock_redis, workspace_manager)
     result = await worker._handle_message(_command())  # pylint: disable=protected-access
 
     assert result.status == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_different_agents_use_independent_model_provider_and_credentials(
+    mock_redis, workspace_manager
+):
+    """extra["model"]/extra["model_params"] live on AgentConfig, not the
+    worker — two agents (e.g. an orchestrator and a self-hosted sub-agent)
+    can each point at a completely different provider, model, and
+    credentials, and never see each other's."""
+    openai_client = StubModelClient(
+        turns=[[ModelChunk(content="from openai", is_final=True, finish_reason="stop")]]
+    )
+    openai_worker = _ChatWorker(
+        worker_id="openai-worker",
+        redis_client=mock_redis,
+        registry=MagicMock(),
+        workspace_manager=workspace_manager,
+        plugin_registry=_registry(
+            [
+                _agent_config(
+                    extra={
+                        "model": "gpt-4o-mini",
+                        "model_params": {"api_key": "sk-openai-key"},
+                    }
+                )
+            ]
+        ),
+        model_client=openai_client,
+    )
+
+    self_hosted_client = StubModelClient(
+        turns=[
+            [
+                ModelChunk(
+                    content="from self-hosted", is_final=True, finish_reason="stop"
+                )
+            ]
+        ]
+    )
+    self_hosted_worker = _ChatWorker(
+        worker_id="self-hosted-worker",
+        redis_client=mock_redis,
+        registry=MagicMock(),
+        workspace_manager=workspace_manager,
+        plugin_registry=_registry(
+            [
+                _agent_config(
+                    extra={
+                        "model": "openai/local-llama",
+                        "model_params": {
+                            "api_key": "sk-local-anything",
+                            "api_base": "http://localhost:8000/v1",
+                        },
+                    }
+                )
+            ]
+        ),
+        model_client=self_hosted_client,
+    )
+
+    await openai_worker._handle_message(_command())  # pylint: disable=protected-access
+    await self_hosted_worker._handle_message(  # pylint: disable=protected-access
+        _command()
+    )
+
+    assert openai_client.calls[0]["model"] == "gpt-4o-mini"
+    assert openai_client.calls[0]["params"] == {"api_key": "sk-openai-key"}
+
+    assert self_hosted_client.calls[0]["model"] == "openai/local-llama"
+    assert self_hosted_client.calls[0]["params"] == {
+        "api_key": "sk-local-anything",
+        "api_base": "http://localhost:8000/v1",
+    }

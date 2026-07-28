@@ -79,8 +79,34 @@ AgentConfig(
   (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, ...). litellm
   reads it automatically; nothing to pass explicitly.
 - **`extra["model_params"]`** (optional) — a dict forwarded as-is to every
-  `ModelClient.complete()` call: `temperature`, `max_tokens`, `api_base`
-  (for self-hosted/proxy endpoints), etc.
+  `ModelClient.complete()` call, i.e. straight into `litellm.acompletion(...)`.
+  Anything litellm's `completion`/`acompletion` accepts as a kwarg works:
+  `temperature`, `max_tokens`, `api_key` (overrides the env var for just
+  this agent), `api_base` (point at a self-hosted/proxy/OpenAI-compatible
+  endpoint, e.g. vLLM or a local gateway), `api_version`, etc.
+
+`extra` lives on `AgentConfig`, not the worker — so **different agents can
+each use a completely different provider, model, and credentials** in the
+same process. An orchestrator calling OpenAI and a `sub_agents` delegate
+pointed at a self-hosted model behind a different key both "just work":
+
+```python
+AgentConfig(
+    agent_id="orchestrator",
+    sub_agents=["local_specialist"],
+    extra={"model": "gpt-4o-mini", "model_params": {"api_key": "sk-..."}},
+)
+AgentConfig(
+    agent_id="local_specialist",
+    extra={
+        "model": "openai/local-llama",  # litellm's OpenAI-compatible provider
+        "model_params": {
+            "api_key": "sk-local-anything",
+            "api_base": "http://localhost:8000/v1",
+        },
+    },
+)
+```
 
 See [`examples/05_real_model_react.py`](examples/05_real_model_react.py) for
 a complete runnable version of the snippet above, with a `calculate` tool to
