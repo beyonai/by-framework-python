@@ -100,6 +100,26 @@ def _model_params_from_env() -> dict[str, Any]:
     return params
 
 
+_SECRET_PARAM_NAME_MARKERS = ("key", "token", "secret", "password", "authorization")
+
+
+def _redact_secrets(params: dict[str, Any]) -> dict[str, Any]:
+    """Mask any secret-looking param value before it's ever printed/logged —
+    api_key (or anything else from MODEL_PARAMS_JSON with a similarly
+    sensitive name) must never land in plain text in terminal output,
+    shell history, or copy-pasted logs."""
+    redacted: dict[str, Any] = {}
+    for name, value in params.items():
+        looks_secret = any(
+            marker in name.lower() for marker in _SECRET_PARAM_NAME_MARKERS
+        )
+        if looks_secret and isinstance(value, str) and value:
+            redacted[name] = f"{value[:4]}***" if len(value) > 4 else "***"
+        else:
+            redacted[name] = value
+    return redacted
+
+
 class ReactTelemetry:
     """Makes it possible to tell "the model computed this itself" apart from
     "the calculate tool computed this" — the two look identical in the final
@@ -209,7 +229,7 @@ async def main() -> None:
 
     model = os.environ.get("MODEL", "gpt-4o-mini")
     model_params = _model_params_from_env()
-    params_label = model_params or "(none set)"
+    params_label = _redact_secrets(model_params) or "(none set)"
     print(f"model:    {model}")
     print(f"params:   {params_label}")
 
