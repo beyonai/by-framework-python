@@ -19,6 +19,30 @@ var — litellm reads it automatically:
     MODEL=gemini/gemini-2.0-flash                GEMINI_API_KEY=...
     MODEL=azure/<deployment-name>                AZURE_API_KEY=..., AZURE_API_BASE=...
 
+Every AgentConfig.extra["model_params"] key litellm accepts is configurable
+via its own env var, so you don't have to edit this file to try one:
+
+    MODEL_TEMPERATURE=0.2   # float, forwarded as model_params["temperature"]
+    MODEL_MAX_TOKENS=500    # int,   forwarded as model_params["max_tokens"]
+    MODEL_API_BASE=...      # str,   for a self-hosted/proxy/OpenAI-compatible
+                             #        endpoint (e.g. vLLM) instead of the
+                             #        provider's default
+    MODEL_API_KEY=...       # str,   overrides the provider's usual env var
+                             #        just for this agent (e.g. a self-hosted
+                             #        model's own key)
+    MODEL_API_VERSION=...   # str,   e.g. for Azure OpenAI deployments
+    MODEL_PARAMS_JSON='{"seed": 7, "top_p": 0.9}'
+                             # any other litellm kwarg not covered above —
+                             # merged in last, so it wins on overlapping keys
+
+Example — point at a local vLLM/OpenAI-compatible server instead of a real
+provider:
+
+    MODEL=openai/local-llama \
+    MODEL_API_BASE=http://localhost:8000/v1 \
+    MODEL_API_KEY=sk-local-anything \
+    uv run python examples/05_real_model_react.py "What is 9 * 6?"
+
 Redis is still faked (InMemoryRedis, see _infra.py) — only the model call is
 real. A production deployment additionally runs this behind WorkerRunner
 against a real Redis Streams cluster instead of Dispatcher.
@@ -27,8 +51,10 @@ against a real Redis Streams cluster instead of Dispatcher.
 # pylint: disable=invalid-name  # numbered filename for tutorial ordering
 
 import asyncio
+import json
 import os
 import sys
+from typing import Any
 
 from _infra import Dispatcher, InMemoryRedis
 from by_framework.core.extensions.agent_config import AgentConfig
@@ -42,6 +68,36 @@ from by_framework_agent import NativeAgentWorker, ToolSpec
 # Restricted to a handful of safe operators — a real calculator tool would
 # use a proper expression parser instead of eval().
 _ALLOWED_CALC_CHARS = set("0123456789+-*/(). ")
+
+
+def _model_params_from_env() -> dict[str, Any]:
+    """Build AgentConfig.extra["model_params"] from env vars — see the
+    module docstring for the full list. Every value here is forwarded
+    as-is to litellm.acompletion(), so names match litellm's own kwargs
+    (temperature, max_tokens, api_base, api_key, api_version, ...)."""
+    params: dict[str, Any] = {}
+
+    if "MODEL_TEMPERATURE" in os.environ:
+        params["temperature"] = float(os.environ["MODEL_TEMPERATURE"])
+    if "MODEL_MAX_TOKENS" in os.environ:
+        params["max_tokens"] = int(os.environ["MODEL_MAX_TOKENS"])
+    if "MODEL_API_BASE" in os.environ:
+        params["api_base"] = os.environ["MODEL_API_BASE"]
+    if "MODEL_API_KEY" in os.environ:
+        params["api_key"] = os.environ["MODEL_API_KEY"]
+    if "MODEL_API_VERSION" in os.environ:
+        params["api_version"] = os.environ["MODEL_API_VERSION"]
+
+    raw_extra = os.environ.get("MODEL_PARAMS_JSON")
+    if raw_extra:
+        extra = json.loads(raw_extra)
+        if not isinstance(extra, dict):
+            raise ValueError(
+                f"MODEL_PARAMS_JSON must decode to a JSON object, got {extra!r}"
+            )
+        params.update(extra)  # wins on any key also set via a named var above
+
+    return params
 
 
 async def calculate(context, arguments) -> str:
@@ -95,9 +151,12 @@ def build_registry() -> PluginRegistry:
                 # - extra["model"]: any litellm model string
                 # - extra["model_params"]: forwarded to every ModelClient.
                 #   complete() call (temperature, max_tokens, api_base, ...)
+                # Both are sourced from env vars here — see the module
+                # docstring for the full list — so trying a different
+                # model/provider/endpoint never requires editing this file.
                 extra={
                     "model": os.environ.get("MODEL", "gpt-4o-mini"),
-                    "model_params": {"temperature": 0.2},
+                    "model_params": _model_params_from_env(),
                 },
             )
         ]
@@ -116,6 +175,12 @@ class AssistantWorker(NativeAgentWorker):
 
 async def main() -> None:
     question = " ".join(sys.argv[1:]) or "What is 12 * (7 + 5)?"
+
+    model = os.environ.get("MODEL", "gpt-4o-mini")
+    model_params = _model_params_from_env()
+    params_label = model_params or "(none set)"
+    print(f"model:    {model}")
+    print(f"params:   {params_label}")
 
     redis = InMemoryRedis()
     dispatcher = Dispatcher(redis=redis)
