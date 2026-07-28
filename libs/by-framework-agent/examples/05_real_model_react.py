@@ -57,7 +57,7 @@ import sys
 from typing import Any
 
 from _infra import Dispatcher, InMemoryRedis
-from by_framework.core.extensions.agent_config import AgentConfig
+from by_framework.core.extensions.agent_config import AgentConfig, CallbackType
 from by_framework.core.extensions.registry import PluginRegistry
 from by_framework.core.protocol.commands import AskAgentCommand
 from by_framework.core.protocol.message_header import MessageHeader
@@ -100,23 +100,50 @@ def _model_params_from_env() -> dict[str, Any]:
     return params
 
 
-async def calculate(context, arguments) -> str:
-    del context
-    expression = str(arguments.get("expression", ""))
-    if not expression or not set(expression) <= _ALLOWED_CALC_CHARS:
-        return "error: expression must be a simple arithmetic expression"
-    try:
-        # Safe here specifically because _ALLOWED_CALC_CHARS above already
-        # rejected anything but digits/operators/parens/spaces — no
-        # identifier characters means no attribute-chain sandbox escape.
-        return str(
-            eval(expression, {"__builtins__": {}}, {})  # pylint: disable=eval-used
-        )
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-        return f"error: {exc}"
+class ReactTelemetry:
+    """Makes it possible to tell "the model computed this itself" apart from
+    "the calculate tool computed this" — the two look identical in the final
+    answer text alone. Wired in as both the tool handler (so a tool
+    invocation is directly observable) and before/after_model_callback (so
+    a second model turn — only reachable after a tool result — is too).
+    """
+
+    def __init__(self) -> None:
+        self.model_turn = 0
+        self.tool_call_count = 0
+
+    async def before_model(self, context, payload) -> None:
+        del context
+        self.model_turn += 1
+        num_messages = len(payload["messages"])
+        print(f"[MODEL TURN {self.model_turn}] sending {num_messages} messages")
+
+    async def after_model(self, context, payload) -> None:
+        del context
+        preview = payload["content"] or "(no text — likely requesting a tool call)"
+        print(f"[MODEL TURN {self.model_turn}] replied: {preview!r}")
+
+    async def calculate(self, context, arguments) -> str:
+        del context
+        expression = str(arguments.get("expression", ""))
+        if not expression or not set(expression) <= _ALLOWED_CALC_CHARS:
+            return "error: expression must be a simple arithmetic expression"
+        try:
+            # Safe here specifically because _ALLOWED_CALC_CHARS above
+            # already rejected anything but digits/operators/parens/spaces —
+            # no identifier characters means no attribute-chain sandbox
+            # escape.
+            result = str(
+                eval(expression, {"__builtins__": {}}, {})  # pylint: disable=eval-used
+            )
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            return f"error: {exc}"
+        self.tool_call_count += 1
+        print(f"[TOOL CALLED] calculate({expression!r}) -> {result}")
+        return result
 
 
-def build_registry() -> PluginRegistry:
+def build_registry(telemetry: ReactTelemetry) -> PluginRegistry:
     registry = PluginRegistry()
     registry._set_agent_configs(  # pylint: disable=protected-access
         [
@@ -133,7 +160,7 @@ def build_registry() -> PluginRegistry:
                 tools={
                     "calculate": ToolSpec(
                         name="calculate",
-                        handler=calculate,
+                        handler=telemetry.calculate,
                         description="Evaluate a simple arithmetic expression.",
                         parameters={
                             "type": "object",
@@ -146,6 +173,10 @@ def build_registry() -> PluginRegistry:
                             "required": ["expression"],
                         },
                     )
+                },
+                callbacks={
+                    CallbackType.before_model_callback: [telemetry.before_model],
+                    CallbackType.after_model_callback: [telemetry.after_model],
                 },
                 # This is the whole configuration surface for a real model:
                 # - extra["model"]: any litellm model string
@@ -182,6 +213,7 @@ async def main() -> None:
     print(f"model:    {model}")
     print(f"params:   {params_label}")
 
+    telemetry = ReactTelemetry()
     redis = InMemoryRedis()
     dispatcher = Dispatcher(redis=redis)
     dispatcher.register(
@@ -190,7 +222,7 @@ async def main() -> None:
             worker_id="assistant-worker",
             redis_client=redis,
             workspace_manager=WorkspaceManager(),
-            plugin_registry=build_registry(),
+            plugin_registry=build_registry(telemetry),
         ),
     )
 
@@ -210,6 +242,22 @@ async def main() -> None:
     result = await dispatcher.dispatch_root(command)
     print(f"status:   {result.status}")
     print(f"answer:   {result.content}")
+    print()
+    print(f"model turns taken:    {telemetry.model_turn}")
+    print(f"calculate tool calls: {telemetry.tool_call_count}")
+    if telemetry.tool_call_count:
+        print(
+            "-> confirmed: the numeric result above came from the calculate "
+            "tool (see the [TOOL CALLED] line above), not the model's own "
+            "arithmetic."
+        )
+    else:
+        print(
+            "-> the calculate tool was never invoked — the model answered "
+            "directly. If the answer is numeric, it computed it itself "
+            "(and may be wrong); try a stricter system prompt or a model "
+            "with better tool-use adherence."
+        )
 
 
 if __name__ == "__main__":
