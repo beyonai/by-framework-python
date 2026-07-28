@@ -196,3 +196,45 @@ async def test_token_usage_and_cost_recorded(mock_redis, workspace_manager):
         "model": "gpt-4o-mini",
         "cost": 0.001,
     }
+
+
+@pytest.mark.asyncio
+async def test_model_params_forwarded_to_model_client(mock_redis, workspace_manager):
+    model_client = StubModelClient(
+        turns=[[ModelChunk(content="ok", is_final=True, finish_reason="stop")]]
+    )
+    config = _agent_config(
+        extra={
+            "model": "gpt-4o-mini",
+            "model_params": {"temperature": 0.2, "max_tokens": 500},
+        }
+    )
+    worker = _ChatWorker(
+        worker_id="agent-1",
+        redis_client=mock_redis,
+        registry=MagicMock(),
+        workspace_manager=workspace_manager,
+        plugin_registry=_registry([config]),
+        model_client=model_client,
+    )
+
+    await worker._handle_message(_command())  # pylint: disable=protected-access
+
+    assert model_client.calls[0]["params"] == {"temperature": 0.2, "max_tokens": 500}
+
+
+@pytest.mark.asyncio
+async def test_non_dict_model_params_fails_loudly(mock_redis, workspace_manager):
+    config = _agent_config(extra={"model": "gpt-4o-mini", "model_params": "oops"})
+    worker = _ChatWorker(
+        worker_id="agent-1",
+        redis_client=mock_redis,
+        registry=MagicMock(),
+        workspace_manager=workspace_manager,
+        plugin_registry=_registry([config]),
+        model_client=StubModelClient(turns=[]),
+    )
+
+    result = await worker._handle_message(_command())  # pylint: disable=protected-access
+
+    assert result.status == "FAILED"

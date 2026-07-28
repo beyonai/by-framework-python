@@ -82,6 +82,7 @@ class HarnessLoop:
         tool_schemas.append(_ASK_USER_TOOL_SCHEMA)
         tool_schemas.extend(self._sub_agent_tool_schemas(context))
         model = self._resolve_model()
+        model_params = self._resolve_model_params()
 
         is_resume = isinstance(context.current_command, ResumeCommand)
         if is_resume:
@@ -92,7 +93,7 @@ class HarnessLoop:
         try:
             while True:
                 turn = await self._run_model_turn(
-                    context, messages, model, tool_schemas
+                    context, messages, model, tool_schemas, model_params
                 )
 
                 if turn.usage or turn.cost:
@@ -426,6 +427,7 @@ class HarnessLoop:
         messages: list[dict[str, Any]],
         model: str,
         tool_schemas: list[dict[str, Any]] | None,
+        model_params: dict[str, Any],
     ) -> _ModelTurn:
         await self._fire_callbacks(
             CallbackType.before_model_callback, context, {"messages": messages}
@@ -438,7 +440,7 @@ class HarnessLoop:
         response_model = model
 
         async for chunk in self._model_client.complete(
-            messages, model=model, tools=tool_schemas
+            messages, model=model, tools=tool_schemas, **model_params
         ):
             if chunk.content:
                 content_parts.append(chunk.content)
@@ -609,6 +611,18 @@ class HarnessLoop:
                 "in extra['model']"
             )
         return str(model)
+
+    def _resolve_model_params(self) -> dict[str, Any]:
+        """Extra kwargs (temperature, max_tokens, api_base, ...) forwarded
+        to ModelClient.complete() on every call, from
+        AgentConfig.extra["model_params"]."""
+        params = self._agent_config.extra.get("model_params", {})
+        if not isinstance(params, dict):
+            raise TypeError(
+                f"AgentConfig '{self._agent_config.agent_id}' extra['model_params'] "
+                f"must be a dict, got {type(params).__name__}"
+            )
+        return dict(params)
 
     async def _fire_callbacks(
         self,
