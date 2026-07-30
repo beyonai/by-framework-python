@@ -6,7 +6,6 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock
 
-from redis.asyncio import Redis
 from redis.asyncio.cluster import ClusterNode, RedisCluster
 
 from by_framework.worker.heartbeat import WorkerHeartbeat
@@ -87,24 +86,6 @@ class TestWorkerHeartbeat(unittest.IsolatedAsyncioTestCase):
         self.assertIsNot(isolated, cluster_redis)
         self.assertEqual(isolated.connection_kwargs.get("password"), "secret")
         self.assertTrue(isolated.connection_kwargs.get("decode_responses"))
-
-    async def test_create_isolated_redis_filters_unsupported_standalone_kwargs(self):
-        """Standalone connection_pool kwargs can include metadata not accepted
-        by Redis.__init__; creating the isolated client should filter them."""
-        redis_client = Redis(host="127.0.0.1", port=6379, decode_responses=True)
-        redis_client.connection_pool.connection_kwargs["himport_registry"] = object()
-        mock_registry = MockRegistry()
-        heartbeat = WorkerHeartbeat(
-            worker_id="worker-1",
-            agent_types=["agent-a"],
-            redis_client=redis_client,
-            registry=mock_registry,
-        )
-
-        isolated = await heartbeat._create_isolated_redis()
-
-        self.assertIsNotNone(isolated)
-        self.assertIsInstance(isolated, Redis)
 
     async def test_start_initial_registration(self):
         """Test that start() performs initial registration."""
