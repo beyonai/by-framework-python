@@ -1,0 +1,16 @@
+name: verify
+on: [push, pull_request]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: resolve map base ref
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "MAP_BASE_REF=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_ENV"
+          elif git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
+            echo "MAP_BASE_REF=${{ github.event.before }}" >> "$GITHUB_ENV"
+          fi
+      - run: bash scripts/verify.sh

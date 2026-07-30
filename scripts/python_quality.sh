@@ -45,6 +45,7 @@ collect_targets_for_project() {
     local -a defaults=()
     [[ -d "$project/src" ]] && defaults+=("src")
     [[ -d "$project/tests" ]] && defaults+=("tests")
+    [[ -d "$project/examples" ]] && defaults+=("examples")
     if [[ "${#defaults[@]}" -gt 0 ]]; then
       printf '%s\n' "${defaults[@]}"
     fi
@@ -58,7 +59,7 @@ collect_targets_for_project() {
     [[ "$raw" != *.py ]] && continue
     normalized="$(normalize_path "$raw")"
     if [[ "$normalized_project" == "." ]]; then
-      if [[ "$normalized" == src/* || "$normalized" == tests/* ]]; then
+      if [[ "$normalized" == src/* || "$normalized" == tests/* || "$normalized" == examples/* ]]; then
         matches+=("$normalized")
       fi
     elif [[ "$normalized" == "$normalized_project/"* ]]; then
