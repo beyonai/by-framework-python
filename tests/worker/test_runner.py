@@ -1083,10 +1083,13 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
             _, body = _request_readyz(runner._health_server.port)
             self.assertEqual(body["reason"], "serving")
 
-            runner._consumer_last_tick_monotonic -= (
-                runner._consumer_health_timeout_seconds + 1
-            )
-            _, body = _request_readyz(runner._health_server.port)
+            with patch(
+                "by_framework.worker.runner.time.monotonic",
+                return_value=runner._consumer_last_tick_monotonic
+                + runner._consumer_health_timeout_seconds
+                + 1,
+            ):
+                _, body = _request_readyz(runner._health_server.port)
             self.assertEqual(body["reason"], "consumer_stalled")
 
             runner._mark_consumer_tick()
