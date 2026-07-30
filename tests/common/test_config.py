@@ -233,7 +233,7 @@ class TestRedisConfig(unittest.TestCase):
                 else:
                     os.environ.pop(k, None)
 
-    def test_from_env_empty_host_and_port_fall_back_to_defaults(self):
+    def test_from_env_empty_host_and_port_falls_back_to_defaults(self):
         """A blank REDIS_HOST/REDIS_PORT (present but empty) falls back to defaults."""
         env_vars = ["REDIS_HOST", "REDIS_PORT"]
         old_values = {k: os.environ.get(k) for k in env_vars}
