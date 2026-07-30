@@ -312,7 +312,13 @@ class WorkerHeartbeat:
                 conn_kwargs.pop(key, None)
 
             from redis.asyncio import Redis as AsyncRedis  # pylint: disable=import-outside-toplevel
+            import inspect  # pylint: disable=import-outside-toplevel
 
+            # Keep only constructor-supported kwargs because connection_pool
+            # may carry pool/client metadata that Redis.__init__ doesn't accept.
+            sig = inspect.signature(AsyncRedis.__init__)
+            valid_params = set(sig.parameters.keys())
+            conn_kwargs = {k: v for k, v in conn_kwargs.items() if k in valid_params}
             return AsyncRedis(**conn_kwargs)
         except Exception as exc:  # pylint: disable=broad-exception-caught
             logger.error(
