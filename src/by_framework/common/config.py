@@ -43,6 +43,8 @@ class RedisConfig:
         """
         password = os.environ.get("REDIS_PASSWORD", "")
         username = os.environ.get("REDIS_USERNAME") or None
+        host = os.environ.get("REDIS_HOST") or "localhost"
+        port_str = os.environ.get("REDIS_PORT")
         max_connections = os.environ.get("REDIS_MAX_CONNECTIONS")
         cluster_host_str = os.environ.get("REDIS_CLUSTER_HOST")
         cluster_nodes_str = cluster_host_str or os.environ.get("REDIS_CLUSTER_NODES")
@@ -61,8 +63,8 @@ class RedisConfig:
             if db_str is not None:
                 logger.warning("REDIS_DB is deprecated, use REDIS_DATABASE instead")
         return cls(
-            host=os.environ.get("REDIS_HOST", "localhost"),
-            port=int(os.environ.get("REDIS_PORT", "6379")),
+            host=host,
+            port=int(port_str) if port_str else 6379,
             db=int(db_str) if db_str is not None else 0,
             password=password,
             username=username,
