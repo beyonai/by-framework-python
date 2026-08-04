@@ -445,11 +445,36 @@ class LangGraphAdapter:
             )
             return {"status": AgentState.QUEUED.value}
 
+        if not full_response:
+            # on_chat_model_stream isn't guaranteed to fire for every LLM
+            # call a graph makes — e.g. the final answer after a tool round
+            # can go unstreamed depending on the graph/provider's exact
+            # streaming behavior — leaving full_response empty even though
+            # the graph produced a real answer. Mirror _process_result's
+            # non-streaming extraction as a fallback: read the last message
+            # straight from the checkpointed graph state instead of
+            # silently returning nothing.
+            full_response = self._extract_final_text_from_state()
+
         # Emit final answer if using custom output handler
         if self._output_handler and full_response:
             await self._output_handler(self._context, full_response)
 
         return full_response
+
+    def _extract_final_text_from_state(self) -> str:
+        """Read the last message's text straight from the checkpointed
+        graph state — see the fallback's call site for why this exists."""
+        try:
+            snapshot = self._graph.get_state(self._state_config)
+        except Exception:  # pylint: disable=broad-exception-caught
+            return ""
+        messages = (snapshot.values or {}).get("messages", [])
+        if not messages:
+            return ""
+        last_msg = messages[-1]
+        content = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+        return content if isinstance(content, str) else str(content)
 
     async def _process_result(self, result: dict) -> Any:
         """Analyze graph result and determine suspended vs completed."""
