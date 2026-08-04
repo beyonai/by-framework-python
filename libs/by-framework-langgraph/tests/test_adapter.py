@@ -584,14 +584,17 @@ async def _async_events(events):
 
 
 class TestStreamInvokeFallback:
-    """Tests for _stream_invoke's fallback when nothing was streamed.
+    """Tests for _stream_invoke preferring the checkpointed graph state.
 
-    Regression: on_chat_model_stream isn't guaranteed to fire for the final
-    answer after a tool round (depends on the graph/provider's exact
-    streaming behavior), so full_response can stay empty even though the
-    graph produced a real answer. _stream_invoke must fall back to reading
-    the last message from the checkpointed graph state instead of silently
-    returning "".
+    Regression: on_chat_model_stream isn't guaranteed to fire for every LLM
+    call a graph makes — a model that narrates before calling a tool can
+    populate full_response with just that preamble (a round that DID
+    stream), while the actual final answer's round, after the tool
+    executes, doesn't stream at all. full_response ends up non-empty but
+    wrong, so an empty-only fallback check can't catch it. The graph
+    state's messages[-1] — the canonical checkpointed state, not the
+    streamed text, which is only a best-effort UI side channel — must win
+    whenever it's available, not just when full_response is empty.
     """
 
     @pytest.mark.asyncio
@@ -614,7 +617,42 @@ class TestStreamInvokeFallback:
         assert result == "the final answer"
 
     @pytest.mark.asyncio
-    async def test_streamed_text_is_used_without_needing_the_fallback(self):
+    async def test_graph_state_overrides_a_non_empty_but_stale_preamble(self):
+        # Regression: the model narrates ("好的,我来帮你计算...") before
+        # calling a tool — that preamble streams fine via
+        # on_chat_model_stream, so full_response is non-empty — but the
+        # actual final answer's round (after the tool executes) never
+        # streams. The stale preamble must not win just because it's
+        # non-empty; graph state's last message is the real answer.
+        ctx = _make_mock_context()
+        graph = MagicMock()
+        graph.astream_events = MagicMock(
+            return_value=_async_events(
+                [
+                    {
+                        "event": "on_chat_model_stream",
+                        "data": {
+                            "chunk": SimpleNamespace(content="好的,我来帮你计算...")
+                        },
+                    },
+                ]
+            )
+        )
+        snapshot = MagicMock()
+        snapshot.next = ()
+        snapshot.values = {
+            "messages": [MagicMock(content="计算结果为:25 x (4 + 8) = 300")]
+        }
+        graph.get_state.return_value = snapshot
+
+        adapter = LangGraphAdapter(graph, ctx, stream=True)
+        cmd = AskAgentCommand(header=_make_header(), content="算一下 25 * (4 + 8)")
+        result = await adapter.run(cmd)
+
+        assert result == "计算结果为:25 x (4 + 8) = 300"
+
+    @pytest.mark.asyncio
+    async def test_streamed_text_is_used_when_graph_state_has_no_messages(self):
         ctx = _make_mock_context()
         graph = MagicMock()
         graph.astream_events = MagicMock(
@@ -633,6 +671,7 @@ class TestStreamInvokeFallback:
         )
         snapshot = MagicMock()
         snapshot.next = ()
+        snapshot.values = {}
         graph.get_state.return_value = snapshot
 
         adapter = LangGraphAdapter(graph, ctx, stream=True)
@@ -642,7 +681,9 @@ class TestStreamInvokeFallback:
         assert result == "hello world"
 
     @pytest.mark.asyncio
-    async def test_fallback_returns_empty_string_when_state_has_no_messages(self):
+    async def test_returns_empty_string_when_neither_streaming_nor_state_have_text(
+        self,
+    ):
         ctx = _make_mock_context()
         graph = MagicMock()
         graph.astream_events = MagicMock(return_value=_async_events([]))
@@ -658,14 +699,23 @@ class TestStreamInvokeFallback:
         assert result == ""
 
     @pytest.mark.asyncio
-    async def test_fallback_swallows_get_state_errors(self):
+    async def test_falls_back_to_streamed_text_when_get_state_errors(self):
         ctx = _make_mock_context()
         graph = MagicMock()
-        graph.astream_events = MagicMock(return_value=_async_events([]))
+        graph.astream_events = MagicMock(
+            return_value=_async_events(
+                [
+                    {
+                        "event": "on_chat_model_stream",
+                        "data": {"chunk": SimpleNamespace(content="hello")},
+                    },
+                ]
+            )
+        )
         graph.get_state.side_effect = RuntimeError("no checkpoint")
 
         adapter = LangGraphAdapter(graph, ctx, stream=True)
         cmd = AskAgentCommand(header=_make_header(), content="hi")
         result = await adapter.run(cmd)
 
-        assert result == ""
+        assert result == "hello"

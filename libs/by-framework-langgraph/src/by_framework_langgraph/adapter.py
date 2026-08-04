@@ -445,16 +445,22 @@ class LangGraphAdapter:
             )
             return {"status": AgentState.QUEUED.value}
 
-        if not full_response:
-            # on_chat_model_stream isn't guaranteed to fire for every LLM
-            # call a graph makes — e.g. the final answer after a tool round
-            # can go unstreamed depending on the graph/provider's exact
-            # streaming behavior — leaving full_response empty even though
-            # the graph produced a real answer. Mirror _process_result's
-            # non-streaming extraction as a fallback: read the last message
-            # straight from the checkpointed graph state instead of
-            # silently returning nothing.
-            full_response = self._extract_final_text_from_state()
+        # The checkpointed graph state's last message — not the streamed
+        # text — is the authoritative final answer, and takes priority
+        # whenever it's available (not just when full_response is empty).
+        # on_chat_model_stream isn't guaranteed to fire for every LLM call a
+        # graph makes: a model that narrates before calling a tool (e.g.
+        # "好的,我来帮你计算这个表达式!" + a tool_calls delta) can populate
+        # full_response with that preamble via a round that DID stream,
+        # while the actual final answer's round — after the tool
+        # executes — doesn't stream at all. full_response would then be
+        # non-empty but wrong (just the preamble), so an empty-only check
+        # can't catch it; graph state's messages[-1] is what the graph
+        # actually decided the final answer is, regardless of what
+        # streaming happened to capture.
+        state_text = self._extract_final_text_from_state()
+        if state_text:
+            full_response = state_text
 
         # Emit final answer if using custom output handler
         if self._output_handler and full_response:
