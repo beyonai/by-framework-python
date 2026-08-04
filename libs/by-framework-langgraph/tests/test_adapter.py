@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from by_framework.core.protocol.commands import AskAgentCommand, ResumeCommand
 from by_framework.core.protocol.message_header import MessageHeader
+from langchain_core.messages import AIMessage, ToolMessage
 
 from by_framework_langgraph.adapter import (
     LangGraphAdapter,
@@ -117,7 +118,7 @@ class TestAdapterRun:
         ctx = _make_mock_context()
         graph = MagicMock()
         graph.ainvoke = AsyncMock(
-            return_value={"messages": [MagicMock(content="done")]}
+            return_value={"messages": [AIMessage(content="done")]}
         )
         # Not suspended
         snapshot = MagicMock()
@@ -143,7 +144,7 @@ class TestAdapterRun:
         ctx = _make_mock_context()
         graph = MagicMock()
         graph.ainvoke = AsyncMock(
-            return_value={"messages": [MagicMock(content="hello")]}
+            return_value={"messages": [AIMessage(content="hello")]}
         )
         snapshot = MagicMock()
         snapshot.next = ()
@@ -166,7 +167,7 @@ class TestAdapterRun:
         ctx = _make_mock_context()
         graph = MagicMock()
         graph.ainvoke = AsyncMock(
-            return_value={"messages": [MagicMock(content="partial")]}
+            return_value={"messages": [AIMessage(content="partial")]}
         )
         snapshot = MagicMock()
         snapshot.next = ("tools",)
@@ -184,6 +185,36 @@ class TestAdapterRun:
         assert result["status"] == "QUEUED"
 
     @pytest.mark.asyncio
+    async def test_finds_the_last_ai_message_when_messages_end_on_a_tool_message(
+        self,
+    ):
+        # Regression: a misconfigured graph (e.g. a routing function that
+        # returns the string "end" instead of the END constant) can
+        # terminate right after a tool call instead of looping back to the
+        # agent node — leaving a ToolMessage as messages[-1]. Blindly
+        # returning messages[-1].content would surface the tool's raw
+        # result as the "final answer" instead of the model's actual reply.
+        ctx = _make_mock_context()
+        graph = MagicMock()
+        graph.ainvoke = AsyncMock(
+            return_value={
+                "messages": [
+                    AIMessage(content="计算结果为:300", tool_calls=[]),
+                    ToolMessage(content="300", tool_call_id="call_1"),
+                ]
+            }
+        )
+        snapshot = MagicMock()
+        snapshot.next = ()
+        graph.get_state.return_value = snapshot
+
+        adapter = LangGraphAdapter(graph, ctx, stream=False)
+        cmd = AskAgentCommand(header=_make_header(), content="算一下 25*(4+8)")
+        result = await adapter.run(cmd)
+
+        assert result == "计算结果为:300"
+
+    @pytest.mark.asyncio
     async def test_includes_langfuse_callbacks_and_parent_trace_context(
         self, monkeypatch
     ):
@@ -191,7 +222,7 @@ class TestAdapterRun:
         ctx = _make_mock_context()
         graph = MagicMock()
         graph.ainvoke = AsyncMock(
-            return_value={"messages": [MagicMock(content="hello")]}
+            return_value={"messages": [AIMessage(content="hello")]}
         )
         snapshot = MagicMock()
         snapshot.next = ()
@@ -277,7 +308,7 @@ class TestAdapterRun:
             del input_data
             assert config["metadata"]["worker_id"] == "worker-langgraph-1"
             assert propagation_active is True
-            return {"messages": [MagicMock(content="hello")]}
+            return {"messages": [AIMessage(content="hello")]}
 
         graph.ainvoke = fake_ainvoke
         monkeypatch.setitem(
@@ -334,7 +365,7 @@ class TestAdapterRun:
         ctx = ContextWithoutProvider()
         graph = MagicMock()
         graph.ainvoke = AsyncMock(
-            return_value={"messages": [MagicMock(content="hello")]}
+            return_value={"messages": [AIMessage(content="hello")]}
         )
         snapshot = MagicMock()
         snapshot.next = ()
@@ -358,7 +389,7 @@ class TestAdapterRun:
         ctx = _make_mock_context()
         graph = MagicMock()
         graph.ainvoke = AsyncMock(
-            return_value={"messages": [MagicMock(content="hello")]}
+            return_value={"messages": [AIMessage(content="hello")]}
         )
         snapshot = MagicMock()
         snapshot.next = ()
@@ -401,7 +432,7 @@ class TestAdapterRun:
         ctx = _make_mock_context()
         graph = MagicMock()
         graph.ainvoke = AsyncMock(
-            return_value={"messages": [MagicMock(content="hello")]}
+            return_value={"messages": [AIMessage(content="hello")]}
         )
         snapshot = MagicMock()
         snapshot.next = ()
@@ -607,7 +638,7 @@ class TestStreamInvokeFallback:
         graph.astream_events = MagicMock(return_value=_async_events([]))
         snapshot = MagicMock()
         snapshot.next = ()
-        snapshot.values = {"messages": [MagicMock(content="the final answer")]}
+        snapshot.values = {"messages": [AIMessage(content="the final answer")]}
         graph.get_state.return_value = snapshot
 
         adapter = LangGraphAdapter(graph, ctx, stream=True)
@@ -615,6 +646,29 @@ class TestStreamInvokeFallback:
         result = await adapter.run(cmd)
 
         assert result == "the final answer"
+
+    @pytest.mark.asyncio
+    async def test_finds_the_last_ai_message_when_state_ends_on_a_tool_message(self):
+        # Same regression as TestAdapterRun's equivalent, for the streaming
+        # path's graph-state extraction.
+        ctx = _make_mock_context()
+        graph = MagicMock()
+        graph.astream_events = MagicMock(return_value=_async_events([]))
+        snapshot = MagicMock()
+        snapshot.next = ()
+        snapshot.values = {
+            "messages": [
+                AIMessage(content="计算结果为:300", tool_calls=[]),
+                ToolMessage(content="300", tool_call_id="call_1"),
+            ]
+        }
+        graph.get_state.return_value = snapshot
+
+        adapter = LangGraphAdapter(graph, ctx, stream=True)
+        cmd = AskAgentCommand(header=_make_header(), content="算一下 25*(4+8)")
+        result = await adapter.run(cmd)
+
+        assert result == "计算结果为:300"
 
     @pytest.mark.asyncio
     async def test_graph_state_overrides_a_non_empty_but_stale_preamble(self):
@@ -641,7 +695,7 @@ class TestStreamInvokeFallback:
         snapshot = MagicMock()
         snapshot.next = ()
         snapshot.values = {
-            "messages": [MagicMock(content="计算结果为:25 x (4 + 8) = 300")]
+            "messages": [AIMessage(content="计算结果为:25 x (4 + 8) = 300")]
         }
         graph.get_state.return_value = snapshot
 

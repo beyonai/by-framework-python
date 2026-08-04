@@ -18,7 +18,7 @@ from by_framework.core.protocol.commands import ResumeCommand
 from by_framework.core.protocol.events import StreamChunkEvent
 from by_framework.trace.span_recorder import str_to_uint64, str_to_uint128
 from langchain_core.callbacks import BaseCallbackHandler
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.types import Command
 
 from ._utils import extract_content_text, extract_resume_data
@@ -30,6 +30,26 @@ if TYPE_CHECKING:
 
 
 LANGFUSE_OBSERVATION_ATTR = "_langfuse_observation"
+
+
+def _last_ai_message_text(messages: list[Any]) -> str:
+    """Find the last AIMessage's text content — not just messages[-1].
+
+    A correctly-terminating ReAct graph routes back to the agent node after
+    every tool call, so the state's last message should already be an
+    AIMessage. But a misconfigured graph (e.g. a routing function that
+    returns the string "end" instead of the END constant) can terminate
+    right after a tool call instead, leaving a ToolMessage as messages[-1].
+    Blindly using messages[-1].content would then surface a tool's raw
+    result as the "final answer" instead of the model's actual reply, so
+    this scans backwards for the last real AIMessage rather than trusting
+    positional order.
+    """
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            content = msg.content
+            return content if isinstance(content, str) else str(content)
+    return ""
 
 
 class _TokenAccumulatingCallbackHandler(BaseCallbackHandler):
@@ -469,18 +489,13 @@ class LangGraphAdapter:
         return full_response
 
     def _extract_final_text_from_state(self) -> str:
-        """Read the last message's text straight from the checkpointed
+        """Read the last AIMessage's text straight from the checkpointed
         graph state — see the fallback's call site for why this exists."""
         try:
             snapshot = self._graph.get_state(self._state_config)
         except Exception:  # pylint: disable=broad-exception-caught
             return ""
-        messages = (snapshot.values or {}).get("messages", [])
-        if not messages:
-            return ""
-        last_msg = messages[-1]
-        content = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
-        return content if isinstance(content, str) else str(content)
+        return _last_ai_message_text((snapshot.values or {}).get("messages", []))
 
     async def _process_result(self, result: dict) -> Any:
         """Analyze graph result and determine suspended vs completed."""
@@ -491,13 +506,12 @@ class LangGraphAdapter:
             )
             return {"status": AgentState.QUEUED.value}
 
-        # Extract final answer from last message
+        # Extract final answer from the last AIMessage
         messages = result.get("messages", [])
         if not messages:
             return result
 
-        last_msg = messages[-1]
-        answer = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+        answer = _last_ai_message_text(messages)
 
         # Emit output
         if self._output_handler:
