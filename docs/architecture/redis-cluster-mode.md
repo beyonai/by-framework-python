@@ -40,14 +40,23 @@ written down; keep every entry point's logic mirrored against it.
 ## Cross-file invariants
 
 - **Redis connection/cluster-mode precedence has no shared helper — every new
-  Redis-connecting entry point must manually replicate it.** Evidence: three
+  Redis-connecting entry point must manually replicate it.** Evidence: four
   separate fixes, each "this path forgot to honor the precedence the other
   paths already have" — 38e86c7 (`run_worker`'s programmatic path didn't
   infer cluster mode from `redis_cluster_nodes` alone), 35d45fe (the
   shared-default `get_redis()` singleton wasn't honoring env config at all),
-  62180fe (the admin CLI had no cluster-config path at all). Correct form:
-  when adding a new Redis-connecting call path, explicitly test it against
-  the precedence in "Flow" above — there's no single source of truth to
+  62180fe (the admin CLI had no cluster-config path at all), and a fourth
+  case caught 2026-07-22: `admin/cli.py`'s `_get_redis()` added the cluster
+  path in 62180fe but left the standalone branch calling
+  `init_redis_from_url("redis://localhost:6379/0")` unconditionally —
+  `REDIS_HOST`/`PORT`/`PASSWORD`/`USERNAME`/`DATABASE` were silently ignored
+  whenever `REDIS_MODE` wasn't `cluster` and no `--redis-url` was passed, so
+  the CLI could connect to a different Redis than the worker/gateway with no
+  error. Fixed by always resolving through `RedisConfig.from_env()` +
+  `init_redis(config=...)`, mirroring `run_worker()`'s unified path, for both
+  modes. Correct form: when adding a new Redis-connecting call path,
+  explicitly test it against the precedence in "Flow" above for *every*
+  mode branch, not just cluster — there's no single source of truth to
   inherit from, only this doc to check against.
 
 - **Never build a Redis SCAN/KEYS pattern, or extract an id from a scanned

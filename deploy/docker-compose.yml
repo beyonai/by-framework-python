@@ -1,0 +1,70 @@
+# Illustrates the README's "水平扩展"/"Horizontal Scaling" section as a real
+# orchestration form instead of backgrounded shell processes: N Worker
+# replicas, same agent type, distinct worker ids (see entrypoint.sh),
+# competing for the same Redis control stream via a consumer group.
+#
+# Usage (downstream project, default my_agent.MyAgent + published PyPI package):
+#   docker compose -f deploy/docker-compose.yml up --build --scale worker=3
+#
+# Usage (this repo's own CI smoke test - see
+# .github/workflows/deploy-smoke-test.yml - builds from local source and
+# runs examples/echo_worker.py instead):
+#   BY_FRAMEWORK_SOURCE=local WORKER_CLASS=examples.echo_worker.EchoWorker \
+#     docker compose -f deploy/docker-compose.yml up --build
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        BY_FRAMEWORK_SOURCE: ${BY_FRAMEWORK_SOURCE:-pypi}
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Mirrors deploy/Dockerfile's HEALTHCHECK - redeclared here (Compose
+    # would otherwise just inherit the image's own) so this file is a
+    # self-contained example of the readiness endpoint's wiring, and so any
+    # future service added here can depend on
+    # `worker: condition: service_healthy` without having to go trace
+    # through the Dockerfile to confirm one exists. Readiness only - never
+    # liveness, see docs/architecture/worker-readiness-endpoint.md.
+    #
+    # No host port published for 8080/readyz on purpose: this file's
+    # documented `--scale worker=N` usage above would collide trying to
+    # publish the same fixed host port for every replica. The healthcheck
+    # itself needs no host port - Compose evaluates it inside the
+    # container's own network. deploy-smoke-test.yml verifies it via
+    # `up --wait`.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=3)",
+        ]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # REDIS_PASSWORD, REDIS_USERNAME, REDIS_MODE, REDIS_CLUSTER_HOST, etc.
+      # all follow RedisConfig.from_env() - see docs/architecture/redis-cluster-mode.md.
+      BYAI_WORKER_CONCURRENCY: "50"
+    command: ["--worker-class", "${WORKER_CLASS:-my_agent.MyAgent}"]
+    # Give WorkerRunner._shutdown() room to drain in-flight tasks before
+    # Compose escalates to SIGKILL on `docker compose down`/stop.
+    stop_grace_period: 30s

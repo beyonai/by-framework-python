@@ -1,3 +1,6 @@
+import asyncio
+import os
+import signal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -7,6 +10,7 @@ from by_framework.core.extensions import (Plugin, PluginManifest, TraceProviderF
 from by_framework.worker.app import (
     _build_auto_trace_plugin,
     _load_trace_provider_factories_from_module,
+    _run_with_graceful_shutdown,
     _run_worker_async,
     run_worker,
 )
@@ -49,6 +53,64 @@ class FakeTraceProviderFactory(TraceProviderFactory):
 
     def build_plugin_from_env(self) -> Plugin | None:
         return self._plugin
+
+
+async def _noop_coro():
+    return None
+
+
+@pytest.mark.asyncio
+async def test_run_with_graceful_shutdown_cancels_task_on_sigterm():
+    """SIGTERM (what `docker stop`/Kubernetes pod termination actually send,
+    not SIGINT) must cancel the wrapped task so its own try/finally drain
+    sequence (WorkerRunner._shutdown) runs, instead of the process dying
+    immediately under Python's default SIGTERM disposition. Sends a real
+    SIGTERM to this test process - safe here because
+    _run_with_graceful_shutdown has already installed an asyncio handler
+    that overrides the default disposition before the signal is sent."""
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def long_running():
+        started.set()
+        try:
+            await asyncio.sleep(100)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    run_task = asyncio.ensure_future(_run_with_graceful_shutdown(long_running()))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.wait_for(run_task, timeout=2)
+    finally:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, ValueError):
+                pass
+
+    assert cancelled.is_set()
+    assert run_task.exception() is None
+
+
+@pytest.mark.asyncio
+async def test_run_with_graceful_shutdown_falls_back_when_signal_handler_unsupported():
+    """On platforms without add_signal_handler support (e.g. Windows'
+    default event loop), registration must log and continue rather than
+    raise - SIGINT still gets graceful handling there via run_worker()'s
+    outer `except KeyboardInterrupt`."""
+    loop = asyncio.get_running_loop()
+    original_add_signal_handler = loop.add_signal_handler
+    loop.add_signal_handler = MagicMock(side_effect=NotImplementedError)
+    try:
+        result = await _run_with_graceful_shutdown(_noop_coro())
+    finally:
+        loop.add_signal_handler = original_add_signal_handler
+
+    assert result is None
 
 
 @pytest.mark.asyncio
@@ -107,6 +169,37 @@ async def test_run_worker_async_flow():
 
         # 4. Verify resource cleanup
         mock_close_redis.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_worker_async_passes_health_port_through_to_runner():
+    """health_port must reach WorkerRunner so the opt-in readiness endpoint
+    (see docs/architecture/worker-readiness-endpoint.md) actually starts."""
+    with (
+        patch("by_framework.worker.app.init_redis") as mock_init_redis,
+        patch("by_framework.worker.app.close_redis", new_callable=AsyncMock),
+        patch("by_framework.worker.app.WorkerRegistry"),
+        patch("by_framework.worker.app.WorkspaceManager"),
+        patch("by_framework.worker.app.WorkerRunner") as mock_runner,
+    ):
+        mock_init_redis.return_value = MagicMock()
+        mock_runner.return_value.start = AsyncMock()
+
+        await _run_worker_async(
+            worker_class=MyTestWorker,
+            worker_id="test-w1",
+            redis_host="localhost",
+            redis_port=6379,
+            redis_db=0,
+            redis_password=None,
+            redis_username=None,
+            workspace_dir="/tmp/test-ws",
+            consumer_group="test-group",
+            health_port=9000,
+        )
+
+        _, runner_kwargs = mock_runner.call_args
+        assert runner_kwargs["health_port"] == 9000
 
 
 @pytest.mark.asyncio
@@ -633,6 +726,16 @@ def test_run_worker_sync_entry():
         patch(
             "by_framework.worker.app._run_worker_async", new_callable=MagicMock
         ) as mock_run_async,
+        # asyncio.run is mocked out below, so _run_with_graceful_shutdown's
+        # real coroutine (it isn't itself mocked here) would otherwise be
+        # constructed and never awaited/closed - a dangling coroutine object
+        # that Python flags with "coroutine was never awaited" whenever it's
+        # later garbage-collected, often misattributed to an unrelated test.
+        # Mocking it too, like _run_worker_async above, avoids that.
+        patch(
+            "by_framework.worker.app._run_with_graceful_shutdown",
+            new_callable=MagicMock,
+        ) as mock_graceful_shutdown,
     ):
 
         run_worker(worker_class=MyTestWorker, worker_id="sync-w1")
@@ -649,3 +752,79 @@ def test_run_worker_sync_entry():
         # falls back to REDIS_HOST env var / RedisConfig's own default
         # inside _run_worker_async, not here.
         assert args[2] is None
+
+        # Verify the SIGTERM/SIGINT-handling wrapper actually wraps the
+        # _run_worker_async coroutine, not something else.
+        mock_graceful_shutdown.assert_called_once_with(mock_run_async.return_value)
+
+
+def test_run_worker_sync_entry_passes_health_port_through():
+    """health_port must reach _run_worker_async from the sync entry point too."""
+    with (
+        patch("by_framework.worker.app.asyncio.run"),
+        patch(
+            "by_framework.worker.app._run_worker_async", new_callable=MagicMock
+        ) as mock_run_async,
+        patch(
+            "by_framework.worker.app._run_with_graceful_shutdown",
+            new_callable=MagicMock,
+        ),
+    ):
+        run_worker(worker_class=MyTestWorker, worker_id="sync-w1", health_port=9000)
+
+        _, kwargs = mock_run_async.call_args
+        assert kwargs["health_port"] == 9000
+
+
+def test_run_worker_sync_entry_health_port_defaults_to_none():
+    """Omitting health_port must default to None (off) - opt-in only."""
+    with (
+        patch("by_framework.worker.app.asyncio.run"),
+        patch(
+            "by_framework.worker.app._run_worker_async", new_callable=MagicMock
+        ) as mock_run_async,
+        patch(
+            "by_framework.worker.app._run_with_graceful_shutdown",
+            new_callable=MagicMock,
+        ),
+    ):
+        run_worker(worker_class=MyTestWorker, worker_id="sync-w1")
+
+        _, kwargs = mock_run_async.call_args
+        assert kwargs["health_port"] is None
+
+
+def test_run_worker_sync_entry_health_port_falls_back_to_env_var():
+    with (
+        patch.dict("os.environ", {"BYAI_WORKER_HEALTH_PORT": "9001"}, clear=False),
+        patch("by_framework.worker.app.asyncio.run"),
+        patch(
+            "by_framework.worker.app._run_worker_async", new_callable=MagicMock
+        ) as mock_run_async,
+        patch(
+            "by_framework.worker.app._run_with_graceful_shutdown",
+            new_callable=MagicMock,
+        ),
+    ):
+        run_worker(worker_class=MyTestWorker, worker_id="sync-w1")
+
+        _, kwargs = mock_run_async.call_args
+        assert kwargs["health_port"] == 9001
+
+
+def test_run_worker_sync_entry_health_port_explicit_arg_overrides_env_var():
+    with (
+        patch.dict("os.environ", {"BYAI_WORKER_HEALTH_PORT": "9001"}, clear=False),
+        patch("by_framework.worker.app.asyncio.run"),
+        patch(
+            "by_framework.worker.app._run_worker_async", new_callable=MagicMock
+        ) as mock_run_async,
+        patch(
+            "by_framework.worker.app._run_with_graceful_shutdown",
+            new_callable=MagicMock,
+        ),
+    ):
+        run_worker(worker_class=MyTestWorker, worker_id="sync-w1", health_port=9002)
+
+        _, kwargs = mock_run_async.call_args
+        assert kwargs["health_port"] == 9002

@@ -50,7 +50,6 @@ app.add_typer(metrics_app, name="metrics", help="Metrics and observability")
 
 console = Console()
 err_console = Console(stderr=True)
-_DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 _redis_url: Optional[str] = None
 
 
@@ -85,10 +84,12 @@ def _get_redis(redis_url: Optional[str] = None):
     configured_url = redis_url if redis_url is not None else _redis_url
     if configured_url:
         return init_redis_from_url(configured_url)
-    config = RedisConfig.from_env()
-    if config.mode == "cluster":
-        return init_redis(config=config)
-    return init_redis_from_url(_DEFAULT_REDIS_URL)
+    # Always resolve through RedisConfig.from_env() - for both standalone and
+    # cluster mode - so REDIS_HOST/PORT/PASSWORD/USERNAME/DATABASE are honored
+    # the same way run_worker()'s config resolution honors them. Previously
+    # only cluster mode read env_config; standalone mode silently ignored it
+    # and connected to a hardcoded localhost:6379/0.
+    return init_redis(config=RedisConfig.from_env())
 
 
 # --------------------------------------------------------------------------- #

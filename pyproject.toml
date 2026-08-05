@@ -1,11 +1,11 @@
 [project]
 name = "by-framework"
-version = "0.2.2.dev10"
+version = "0.2.2.dev12"
 description = "分布式 Agent 调度框架"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "redis>=7.0.0",
+    "redis==7.4.0",
     "httpx>=0.28.1",
     "typing-extensions>=4.0.0",
     "dill>=0.4.1",

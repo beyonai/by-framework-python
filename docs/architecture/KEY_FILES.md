@@ -52,7 +52,11 @@ Entry anatomy:
   if more than one `by_framework_trace_*` provider factory activates from
   env — silently picking one would hide a misconfiguration. `close_redis()`
   must stay in the `finally` block (including on `asyncio.CancelledError`)
-  so restarts don't leak the connection pool.
+  so restarts don't leak the connection pool. `health_port` (readiness
+  endpoint, see [[worker-readiness-endpoint]]) is opt-in only — unlike
+  `max_concurrency`/`fetch_count`, its `BYAI_WORKER_HEALTH_PORT` env-var
+  fallback must never resolve to a default port number; leave it `None`
+  when unset so no port opens for deployments that never asked for one.
 
 - `src/by_framework/common/config.py` — `RedisConfig`/`WorkerConfig`/`LoggingConfig`
   env-loaded dataclasses. `RedisConfig.from_env()`'s cluster-mode/key-schema
@@ -121,7 +125,29 @@ Entry anatomy:
   failure mode this log surfaces (fix 90764e1, #77). Terminal-state
   replay-skip logic is coupled to `ResumeCommand` handling: skip replaying an
   execution already in a terminal state *unless* the command is a
-  `ResumeCommand`.
+  `ResumeCommand`. `_health_server` (see [[worker-readiness-endpoint]]) must
+  start before any other step in `start()` (currently first line of the
+  `try:` block) so a probe hitting the port during startup gets an honest
+  `starting` 503 instead of connection-refused, and must `stop()` as the
+  *last* step of `_shutdown()` — after every other teardown step, not
+  before — so `/readyz` stays reachable (reporting `draining`) for the
+  entire drain. `self._draining = True` must stay the first line of
+  `_shutdown()`, ahead of every other teardown step, not just ahead of the
+  health-server stop.
+
+- `src/by_framework/worker/health_server.py` — `WorkerHealthServer`: the
+  `/readyz` readiness HTTP endpoint, on its own daemon thread (mirrors
+  `heartbeat.py`'s "don't share the main event loop" pattern — see that
+  file's own docstring). Full design record, including why this exists and
+  the hard rule against ever wiring it to a liveness check:
+  [[worker-readiness-endpoint]]. `_compute_reason()`'s check order is the
+  entire contract — `starting > draining > evicted > suspended >
+  consumer_stalled > serving`, first match wins; reordering these checks
+  silently changes what an operator is told during a real incident. All
+  Worker state is read via constructor-injected callables (`has_started`,
+  `is_draining`, `admin_lifecycle`, `consumer_healthy`) — this class must
+  never reach into `WorkerRunner` directly, which is what keeps it testable
+  standalone against fake state (see `tests/worker/test_health_server.py`).
 
 - `src/by_framework/core/registry.py` — `WorkerRegistry`: Redis-backed worker
   membership/heartbeat/execution-state, admin lifecycle, locking primitives.

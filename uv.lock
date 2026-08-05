@@ -315,7 +315,7 @@ wheels = [
 
 [[package]]
 name = "by-framework"
-version = "0.2.2.dev10"
+version = "0.2.2.dev12"
 source = { editable = "." }
 dependencies = [
     { name = "dill" },
@@ -359,7 +359,7 @@ requires-dist = [
     { name = "pylint", marker = "extra == 'dev'", specifier = ">=3.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.21.0" },
-    { name = "redis", specifier = ">=7.0.0" },
+    { name = "redis", specifier = "==7.4.0" },
     { name = "rich", marker = "extra == 'cli'", specifier = ">=13.0.0" },
     { name = "rich", marker = "extra == 'dev'", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.3.0" },
