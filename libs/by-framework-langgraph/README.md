@@ -44,3 +44,46 @@ class OrchestratorWorker(LangGraphWorker):
         llm = ChatOpenAI(model="gpt-4o").bind_tools([poet, ask])
         # ... build and return compiled graph
 ```
+
+## Common Pitfalls
+
+Both of these fail **silently** — no exception, just wrong or empty results — so they're easy to lose time to.
+
+### `add_messages` must be imported as a function, not written as a string
+
+```python
+from langgraph.graph.message import add_messages
+
+# Correct — the reducer actually runs; messages accumulate across nodes.
+messages: Annotated[list, add_messages]
+
+# Wrong — looks plausible (some older LangGraph docs used this form), but
+# the reducer silently does nothing: each node only sees its own output,
+# not the accumulated history. Your agent node ends up calling the model
+# with just the latest ToolMessage and no prior context, and typically
+# returns an empty or confused reply.
+messages: Annotated[list, "add_messages"]
+```
+
+### A routing function must return the `END` constant, not the string `"end"`
+
+```python
+from langgraph.graph import END
+
+# Correct — the graph terminates properly; the agent node's final
+# AIMessage is saved to state before the graph stops.
+def should_continue(state):
+    ...
+    return END
+
+# Wrong — "end" looks like it should work as a node name, but LangGraph
+# only recognizes the END constant (whose actual value is "__end__").
+# LangGraph logs "wrote to unknown channel branch:to:end, ignoring it."
+# and the graph doesn't route there — the agent's last turn is dropped,
+# and `state["messages"][-1]` after execution can end up being something
+# other than the model's real final answer (e.g. a stale ToolMessage from
+# an earlier step), not the reply you expected.
+def should_continue(state):
+    ...
+    return "end"
+```

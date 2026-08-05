@@ -44,6 +44,15 @@ class AdkAdapter:
         self._agent = agent
         self._context = context
         self._runner = runner
+        # Text streamed via non-final events during this run — the source of
+        # truth for the final answer. ADK's final-response event's own
+        # `content.parts[0].text` is not reliable once streaming has already
+        # happened (observed truncated to the first streamed fragment), so
+        # the final answer must be reconstructed from what was actually
+        # streamed rather than re-read from the final event. One adapter
+        # instance is constructed per run() call (see AdkWorker), so this is
+        # safe as instance state.
+        self._accumulated_text = ""
 
     @property
     def agent(self) -> LlmAgent:
@@ -101,14 +110,19 @@ class AdkAdapter:
 
         # Check for final response
         if not has_specific_part and event.is_final_response():
-            if event.content and event.content.parts and event.content.parts[0].text:
-                final_text = event.content.parts[0].text.strip()
+            # Prefer what was actually streamed; only fall back to the final
+            # event's own text when nothing was streamed beforehand (e.g. a
+            # single-shot, non-streaming-style final event) — see __init__'s
+            # docstring for why the final event's own text can't be trusted
+            # once streaming has already happened.
+            final_text = self._accumulated_text.strip() or _event_text(event)
+            if final_text:
                 await self._context.emit_chunk(
                     final_text,
                     content_type=SseMessageType.text.value,
                     event_type=EventType.FINAL_ANSWER.value,
                 )
-                return final_text
+            return final_text
         return None
 
     async def _process_part(self, part: Any, event: Any) -> bool:
@@ -161,7 +175,18 @@ class AdkAdapter:
             return True
         if getattr(part, "text", None) and not part.text.isspace():
             if not event.is_final_response():
+                self._accumulated_text += part.text
                 await self._context.emit_chunk(
                     part.text, content_type=SseMessageType.text.value
                 )
         return False
+
+
+def _event_text(event: Any) -> str:
+    """Join every text part of an event — used only as a fallback when
+    nothing was streamed via prior non-final events (see `_process_event`)."""
+    if not (event.content and event.content.parts):
+        return ""
+    return "".join(
+        part.text for part in event.content.parts if getattr(part, "text", None)
+    ).strip()
