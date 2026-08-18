@@ -270,8 +270,8 @@ async def process_command(self, command, context: AgentContext):
         wait_for_reply=True,
     )
 
-    # Scatter-gather fan-out
-    group = await context.dispatch_group([
+    # Scatter-gather fan-out — call_agent's plural
+    group = await context.call_agents([
         {"target_agent_type": "researcher", "content": "Find references"},
         {"target_agent_type": "writer",    "content": "Draft summary"},
     ])
@@ -381,20 +381,59 @@ The framework handles:
 
 ### Scatter-Gather Dispatch
 
-Fan out multiple sub-tasks in parallel and collect their results:
+`call_agents` is `call_agent`'s plural: each task behaves exactly like the equivalent single
+`call_agent` call, and the caller is resumed once — with every task's result — after all of
+them complete. `dispatch_group` is a permanent alias of it, not deprecated.
 
 ```python
-group = await context.dispatch_group([
+group = await context.call_agents([
     {"target_agent_type": "researcher", "content": "Find papers"},
     {"target_agent_type": "analyst",    "content": "Summarize findings"},
 ], wait_for_reply=True)
-
-results = await context.collect_group_results(group["task_group_id"])
-for r in results.values():
-    print(r["content"])
+# {"status": "QUEUED", "task_group_id": "tg-...", "dispatched_tasks": [...]}
 ```
 
-Group progress is tracked in Redis; `dispatch_group` returns immediately with a `task_group_id` that can be polled via `collect_group_results`.
+The Worker is resumed with a `ResumeCommand` whose `reply_data` is the ordered aggregate,
+one entry per task, in dispatch order:
+
+```python
+async def process_command(self, command, context):
+    if isinstance(command, ResumeCommand):
+        for item in command.reply_data:
+            print(item["target_agent_type"], item["status"], item["content"])
+        # command.content is "" on a group resume: reply_data is the single
+        # aggregation channel.
+        return {"status": "completed", "content": summarize(command.reply_data)}
+```
+
+`collect_group_results(task_group_id)` remains available for polling the same results from
+outside a resume.
+
+Per task, every option `call_agent` takes is accepted, with the same defaults:
+
+| Key | Default | Notes |
+|---|---|---|
+| `target_agent_type` | — | required |
+| `content` | `""` | |
+| `extra_payload`, `metadata` | `{}` | |
+| `message_id` | generated | pass one per task for exact IDs; a legacy batch-level value expands to `<id>:0`, `<id>:1`, ... |
+| `route_policy` | `FAIL_FAST` | `SEND_ANYWAY` queues for an agent type whose workers have not started yet |
+| `availability_timeout_ms` | `30000` | |
+| `region`, `priority` | `None`, `0` | |
+
+Behavior worth knowing:
+
+- An unavailable target fails **that task only** — it is recorded as a `FAILED` entry in the
+  aggregate with top-level `error`/`error_code` and the same values retained in
+  `reply_data`, and its siblings still dispatch.
+- `call_agents([])` raises `ValueError` rather than silently succeeding.
+- A dispatch-time infrastructure failure marks the group aborted; late sibling replies are
+  discarded instead of resuming a caller execution that already failed.
+
+**Upgrading:** the Task Group state contract is versioned
+(`docs/adr/0001-unify-call-agent-and-call-agents-behavior.md`). A new Worker joins an old
+group with the old semantics, but an old Worker cannot do the reverse — **drain in-flight
+task groups, or restart the whole agent-type pool at once, before upgrading a mixed pool.**
 
 ### User-in-the-Loop
 

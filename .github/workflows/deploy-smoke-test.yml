@@ -5,6 +5,11 @@ name: Deploy Smoke Test
 # -> Worker consumes -> Worker replies -> Redis data stream -> client reads
 # - using examples/echo_worker.py, built from THIS commit's source (not the
 # last PyPI release; see deploy/Dockerfile's BY_FRAMEWORK_SOURCE=local mode).
+# examples/send_and_verify.py also drives echo_worker.py's "fanout" agent
+# type, which fans out to two more "echo" calls via call_agents and resumes
+# on their aggregated Group Join result - the only place that path runs
+# against a real, separate-process Redis Streams deployment instead of the
+# in-memory fakes tests/ uses.
 # See docs/architecture/production-deployment.md.
 
 on:

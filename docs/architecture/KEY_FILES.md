@@ -94,7 +94,42 @@ Entry anatomy:
   (`admin_workers()`, `trace_index_session/worker/agent`) are deliberately
   left *untagged* relative to the per-entity keys they index — never share a
   Cluster hash tag with them (fix 8501407). `WORKER_DEFAULT_LEASE_TTL_SECONDS
-  = 30` must stay ~6x `WORKER_DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5`.
+  = 30` must stay ~6x `WORKER_DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5`. The
+  `TASK_GROUP_FIELD_*` block is a cross-runtime wire contract, not local
+  naming: Java and TS read the same hash. `TASK_GROUP_FIELD_PROTOCOL_VERSION`
+  absent means "written by a pre-v2 dispatcher" and *must* keep selecting the
+  legacy Group Join path — see `docs/adr/0001-unify-call-agent-and-call-agents-behavior.md`; renaming or defaulting it would
+  silently reinterpret in-flight groups during a rolling upgrade.
+
+- `src/by_framework/worker/context.py` — `AgentContext`: the runtime handed to
+  `process_command`. `call_agent` and `call_agents` (alias `dispatch_group`)
+  both dispatch through `_dispatch_single_task`, the one place that builds,
+  availability-checks, and sends an `AskAgentCommand`; per-task routing
+  options in a batch exist so a group member behaves exactly like the
+  equivalent single call. `call_agents` must **never** book-keep the Task
+  Group itself — storing results and incrementing `completed` belong to
+  `GatewayWorker`'s Group Join, and a second copy here is what could push
+  `completed` to `total` with no reply left to resume the caller. A target
+  that fails its availability check is queued onto `_pending_group_replies`
+  as the reply a sub-agent would have sent, and the worker flushes it after
+  `process_command` returns. See `docs/adr/0001-unify-call-agent-and-call-agents-behavior.md`.
+
+- `src/by_framework/worker/task_group.py` — `TaskGroupStore`, the single Task
+  Group persistence and accounting module. It resolves collision-free sibling
+  IDs, writes the complete group contract before dispatch, atomically records
+  each unique reply, leases/commits Group Join, and supplies the ordered result
+  view used by both automatic resume and `collect_group_results`. Do not add
+  direct Task Group result writes or completion increments outside this module.
+
+- `src/by_framework/worker/worker.py` — `GatewayWorker`. `_enqueue_agent_return`'s
+  header derivation is load-bearing in two directions: a reply's
+  `header.message_id` is the *caller's* id (what `WorkerRunner` reattaches the
+  suspended execution by) and its `header.parent_message_id` is the sub-task's
+  own id (the only per-sibling-unique key, so what Group Join keys the result
+  hash by under protocol v2). `_handle_message`'s Group Join branches on
+  `protocol_version` and delegates the v2 contract to `TaskGroupStore`; legacy
+  unstamped groups retain their original behavior. See
+  `docs/adr/0001-unify-call-agent-and-call-agents-behavior.md`.
 
 - `src/by_framework/client/client.py` — `GatewayClient.send_message()` and
   friends; publishes commands to Redis control streams and drives registry
@@ -113,7 +148,10 @@ Entry anatomy:
 
 - `src/by_framework/worker/runner.py` — `WorkerRunner`, the consume loop:
   `XREADGROUP` fetch, command dispatch, resume/suspend bookkeeping, denylist
-  enforcement. `_active_agent_type_streams()` must read only the in-memory
+  enforcement. It also reclaims lease-expired pending entries with per-stream
+  `XAUTOCLAIM`; a contended Task Group Join stays pending without becoming an
+  execution failure, while a committed Join replay is ACK-only and cannot
+  rewrite caller registry state. `_active_agent_type_streams()` must read only the in-memory
   `self._denied_agent_types` frozenset — no Redis `SISMEMBER` call inside the
   hot consume-loop path; refreshed only by the heartbeat thread's
   `denylist_refresh` callback (bounded staleness ~1 heartbeat interval) (fix

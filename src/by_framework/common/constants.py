@@ -529,6 +529,31 @@ MSG_MAP_PREFIX = "msg_map:"
 TASK_GROUP_FIELD_TOTAL = "total"
 TASK_GROUP_FIELD_COMPLETED = "completed"
 TASK_GROUP_FIELD_SOURCE_AGENT = "source_agent_type"
+# Set once dispatch fails partway through a batch; any reply that arrives
+# for an aborted group is discarded instead of resuming the (already
+# terminated) caller execution.
+TASK_GROUP_FIELD_ABORTED = "aborted"
+# Task Group protocol version, stamped by the dispatcher. A group whose hash
+# carries no version was created by a pre-2 dispatcher: Group Join must then
+# fall back to the legacy behavior (results keyed by the caller's own
+# message_id, no aggregation) so a rolling upgrade cannot reinterpret an
+# in-flight group under the wrong contract. Named "protocol_version" rather
+# than "schema"/"version" to avoid confusion with RedisKeys' key-schema
+# versioning (see docs/architecture/redis-cluster-mode.md).
+TASK_GROUP_FIELD_PROTOCOL_VERSION = "protocol_version"
+# JSON array of the group's sub-task dispatch message_ids, in dispatch order.
+# Group Join aggregates in this order, and uses it to name results that never
+# arrived instead of silently returning a short list.
+TASK_GROUP_FIELD_TASK_ORDER = "task_order"
+# Group Join claim state. The final unique reply claims the right to resume
+# the caller; Redis redelivery observes this state instead of resuming twice.
+TASK_GROUP_FIELD_JOIN_CLAIM = "join_claim"
+TASK_GROUP_FIELD_JOIN_CLAIM_EXPIRES_AT = "join_claim_expires_at"
+TASK_GROUP_FIELD_JOINED = "joined"
+# Version 2: per-sub-task result keys, ordered aggregation into the caller's
+# reply_data, and content cleared on group resume.
+TASK_GROUP_PROTOCOL_V2 = "2"
+TASK_GROUP_JOIN_CLAIM_TTL_MS = 60 * 60 * 1000
 
 
 # --- Timing and Sleep Constants ---

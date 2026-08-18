@@ -268,8 +268,8 @@ async def process_command(self, command, context: AgentContext):
         wait_for_reply=True,
     )
 
-    # Scatter-gather 扇出
-    group = await context.dispatch_group([
+    # Scatter-gather 扇出 —— call_agent 的复数形式
+    group = await context.call_agents([
         {"target_agent_type": "researcher", "content": "查找参考资料"},
         {"target_agent_type": "writer", "content": "起草摘要"},
     ])
@@ -379,20 +379,54 @@ Worker 可通过 `context.call_agent()` 委托另一个 Agent 执行。当 `wait
 
 ### Scatter-Gather 分发
 
-并行扇出多个子任务并收集结果：
+`call_agents` 是 `call_agent` 的复数形式：每个子任务的行为与等价的单次 `call_agent` 调用完全一致，
+区别只在于所有子任务完成后，调用方被**一次性**唤醒并拿到全部结果。`dispatch_group` 是它的永久别名，
+不是废弃 API。
 
 ```python
-group = await context.dispatch_group([
+group = await context.call_agents([
     {"target_agent_type": "researcher", "content": "查找论文"},
     {"target_agent_type": "analyst",    "content": "总结发现"},
 ], wait_for_reply=True)
-
-results = await context.collect_group_results(group["task_group_id"])
-for r in results.values():
-    print(r["content"])
+# {"status": "QUEUED", "task_group_id": "tg-...", "dispatched_tasks": [...]}
 ```
 
-组进度在 Redis 中追踪；`dispatch_group` 立即返回 `task_group_id`，可通过 `collect_group_results` 轮询结果。
+Worker 收到的 `ResumeCommand` 中，`reply_data` 是按派发顺序排列的聚合结果，每个子任务一条：
+
+```python
+async def process_command(self, command, context):
+    if isinstance(command, ResumeCommand):
+        for item in command.reply_data:
+            print(item["target_agent_type"], item["status"], item["content"])
+        # 组恢复时 command.content 为 ""：reply_data 是唯一的聚合通道
+        return {"status": "completed", "content": summarize(command.reply_data)}
+```
+
+`collect_group_results(task_group_id)` 仍可用于在 resume 之外轮询同一批结果。
+
+每个子任务都可以带上 `call_agent` 的全部参数，默认值也一致：
+
+| 键 | 默认值 | 说明 |
+|---|---|---|
+| `target_agent_type` | — | 必填 |
+| `content` | `""` | |
+| `extra_payload`、`metadata` | `{}` | |
+| `message_id` | 自动生成 | 精确 ID 可逐任务传入；旧的批级值会展开为 `<id>:0`、`<id>:1`…… |
+| `route_policy` | `FAIL_FAST` | `SEND_ANYWAY` 可把消息排入尚未启动的 agent type |
+| `availability_timeout_ms` | `30000` | |
+| `region`、`priority` | `None`、`0` | |
+
+几点行为需要知道：
+
+- 目标不可用**只让该任务失败** —— 它会作为一条 `FAILED` 记录进入聚合结果，顶层带
+  `error`/`error_code`，并在 `reply_data` 中保留相同值；其余任务照常派发。
+- `call_agents([])` 抛 `ValueError`，不再静默成功。
+- 派发过程中的基础设施故障会把该组标记为 aborted；迟到的兄弟回包被丢弃，不会去唤醒一个已经失败的
+  调用方执行。
+
+**升级注意**：Task Group 的状态契约带版本号（见
+`docs/adr/0001-unify-call-agent-and-call-agents-behavior.md`）。新 Worker 能按旧语义处理旧组，
+但旧 Worker 无法反向兼容 —— **升级混合部署的 worker 池前，必须排空进行中的 task group，或者整池一次性重启。**
 
 ### 人机交互流程
 

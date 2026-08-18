@@ -13,6 +13,7 @@ from by_framework import (
     WorkerRunner,
 )
 from by_framework.common.config import WorkerConfig
+from by_framework.common.constants import TASK_GROUP_FIELD_JOINED
 from by_framework.core.protocol.agent_state import AgentState
 from by_framework.core.protocol.commands import (
     AskAgentCommand,
@@ -23,6 +24,7 @@ from by_framework.core.protocol.commands import (
     SuspendWorkerCommand,
 )
 from by_framework.core.protocol.message_header import MessageHeader
+from by_framework.worker.task_group import TASK_GROUP_JOIN_PENDING_STATUS
 
 
 def _request_readyz(port: int):
@@ -62,6 +64,7 @@ class MockRedisRunner:
         self.acked = False
         self.ack_calls = []
         self.group_create_calls = []
+        self.hashes = {}
 
     async def xgroup_create(self, name, groupname, id="0", mkstream=False):
         self.group_create_calls.append((name, groupname, id, mkstream))
@@ -77,6 +80,9 @@ class MockRedisRunner:
     async def xack(self, name, groupname, *ids):
         self.acked = True
         self.ack_calls.append((name, groupname, ids))
+
+    async def hget(self, name, key):
+        return self.hashes.get(name, {}).get(key)
 
 
 class DummyWorker(GatewayWorker):
@@ -331,6 +337,72 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(worker.registry.save_execution.await_count == 1)
         worker.registry.mark_execution_finished.assert_awaited()
         self.assertTrue(redis_mock.acked)
+
+    async def test_runner_leaves_join_claim_contention_pending_without_failure(self):
+        redis_mock = MockRedisRunner(message_to_return=[])
+        worker = DummyWorker()
+        worker._handle_message = AsyncMock(
+            return_value=AgentTaskResult(status=TASK_GROUP_JOIN_PENDING_STATUS)
+        )
+        worker.registry = AsyncMock()
+        worker.registry.get_execution_by_message_id.return_value = {
+            "execution_id": "exec-join",
+            "message_id": "caller-msg",
+            "session_id": "sess-1",
+            "status": "RUNNING",
+        }
+        runner = WorkerRunner(
+            redis_client=redis_mock, worker=worker, group_name="test_group"
+        )
+        payload = ResumeCommand(
+            header=MessageHeader(
+                message_id="caller-msg",
+                session_id="sess-1",
+                trace_id="trace-1",
+                target_agent_type="dummy_agent",
+                parent_message_id="subtask-msg",
+                task_group_id="tg-pending",
+            ),
+            status="COMPLETED",
+        ).to_dict()
+
+        await runner._process_message_from_dict(
+            RedisKeys.ctrl_stream("dummy_agent"), "2-0", payload
+        )
+
+        self.assertFalse(redis_mock.acked)
+        worker.registry.mark_execution_finished.assert_not_awaited()
+
+    async def test_runner_acks_joined_replay_without_registry_mutation(self):
+        redis_mock = MockRedisRunner(message_to_return=[])
+        redis_mock.hashes[RedisKeys.task_group("tg-joined")] = {
+            TASK_GROUP_FIELD_JOINED: "1"
+        }
+        worker = DummyWorker()
+        worker.registry = AsyncMock()
+        runner = WorkerRunner(
+            redis_client=redis_mock, worker=worker, group_name="test_group"
+        )
+        payload = ResumeCommand(
+            header=MessageHeader(
+                message_id="caller-msg",
+                session_id="sess-1",
+                trace_id="trace-1",
+                target_agent_type="dummy_agent",
+                parent_message_id="subtask-msg",
+                task_group_id="tg-joined",
+            ),
+            status="COMPLETED",
+        ).to_dict()
+
+        await runner._process_message_from_dict(
+            RedisKeys.ctrl_stream("dummy_agent"), "3-0", payload
+        )
+
+        self.assertTrue(redis_mock.acked)
+        worker.registry.get_execution_by_message_id.assert_not_awaited()
+        worker.registry.update_execution_status.assert_not_awaited()
+        worker.registry.mark_execution_finished.assert_not_awaited()
 
     async def test_runner_records_worker_execute_span(self):
         """Processed worker commands write an execution span for trace drilldown."""
