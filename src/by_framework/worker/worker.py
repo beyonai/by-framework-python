@@ -25,7 +25,10 @@ from by_framework.common.constants import (
     MESSAGE_ID_PREFIX,
     TASK_GROUP_FIELD_ABORTED,
     TASK_GROUP_FIELD_COMPLETED,
+    TASK_GROUP_FIELD_PROTOCOL_VERSION,
+    TASK_GROUP_FIELD_TASK_ORDER,
     TASK_GROUP_FIELD_TOTAL,
+    TASK_GROUP_PROTOCOL_V2,
     TASK_GROUP_TTL_SECONDS,
     RedisKeys,
 )
@@ -300,6 +303,103 @@ class GatewayWorker(ABC):
             await self._heartbeat.stop()
             self._heartbeat = None
             logger.info("[%s] Heartbeat stopped", self.worker_id)
+
+    async def _aggregate_task_group(
+        self,
+        *,
+        group_key: str,
+        results_key: str,
+        task_group_id: str,
+        total: int,
+    ) -> list[dict[str, Any]]:
+        """Collect a completed Task Group's results in dispatch order.
+
+        Order comes from the group's `task_order` field rather than from
+        `hgetall`, whose order is unspecified — callers fanning out to N
+        agents need to know which result is which without matching by hand.
+
+        Results present in Redis but absent from `task_order` are appended
+        rather than dropped, and a short result set is logged loudly. Silently
+        returning fewer results than the caller dispatched is the failure mode
+        this repo's North Star rules out.
+        """
+        raw_results = await self.redis.hgetall(results_key)  # type: ignore
+        raw_order = await self.redis.hget(  # type: ignore
+            group_key, TASK_GROUP_FIELD_TASK_ORDER
+        )
+        try:
+            order = json.loads(raw_order) if raw_order else []
+        except (TypeError, ValueError):
+            logger.error(
+                "[%s] TaskGroup %s has an unreadable %s field (%r); falling "
+                "back to Redis hash order",
+                self.worker_id,
+                task_group_id,
+                TASK_GROUP_FIELD_TASK_ORDER,
+                raw_order,
+            )
+            order = []
+
+        aggregated: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for msg_id in order:
+            if msg_id in raw_results:
+                aggregated.append(
+                    {"message_id": msg_id, **json.loads(raw_results[msg_id])}
+                )
+                seen.add(msg_id)
+        for msg_id, data in raw_results.items():
+            if msg_id not in seen:
+                aggregated.append({"message_id": msg_id, **json.loads(data)})
+
+        if len(aggregated) != total:
+            missing = [msg_id for msg_id in order if msg_id not in raw_results]
+            logger.error(
+                "[%s] TaskGroup %s aggregated %d result(s) but expected %d; "
+                "missing sub-task message_ids=%s. Resuming the caller with an "
+                "incomplete result set.",
+                self.worker_id,
+                task_group_id,
+                len(aggregated),
+                total,
+                missing or "unknown",
+            )
+        return aggregated
+
+    async def _flush_pending_group_replies(self, context: AgentContext) -> None:
+        """Deliver replies for Task Group sub-tasks that never reached a worker.
+
+        AgentContext.call_agents queues these instead of sending them inline:
+        sending during the dispatch loop would put a reply on the caller's
+        control stream strictly before the caller's process_command returns,
+        turning the pre-existing "a very fast sub-agent replies before the
+        caller suspends" race from unlikely into certain. Flushing here keeps
+        that race no worse than it is for real sub-agents.
+
+        Failures are logged, never raised: a Task Group that cannot be told
+        about a dispatch failure will time out, whereas raising here would
+        also destroy the caller's own result.
+        """
+        pending = getattr(context, "_pending_group_replies", None)
+        if not pending:
+            return
+        replies = list(pending)
+        pending.clear()
+        for reply in replies:
+            try:
+                await self.redis.xadd(
+                    RedisKeys.ctrl_stream(reply.header.target_agent_type),
+                    reply.to_redis_payload(),
+                )
+            except Exception as error:  # pylint: disable=broad-exception-caught
+                logger.error(
+                    "[%s] Failed to deliver Task Group %s dispatch-failure "
+                    "reply for sub-task %s: %s",
+                    self.worker_id,
+                    reply.header.task_group_id,
+                    reply.header.parent_message_id,
+                    error,
+                )
 
     async def _enqueue_agent_return(
         self,
@@ -670,6 +770,18 @@ class GatewayWorker(ABC):
                                 status=f"{AgentState.CANCELLED.value}: group_aborted"
                             )
 
+                        # Which Task Group contract this group was dispatched
+                        # under. A group with no stamp was created by a
+                        # pre-v2 dispatcher, possibly by a worker still
+                        # running the old code during a rolling upgrade, so
+                        # it must keep being joined the old way — reading an
+                        # in-flight group under the wrong contract is exactly
+                        # the silent corruption this repo guards against.
+                        protocol_version = await self.redis.hget(  # type: ignore
+                            group_key, TASK_GROUP_FIELD_PROTOCOL_VERSION
+                        )
+                        is_v2 = protocol_version == TASK_GROUP_PROTOCOL_V2
+
                         # Store result in Redis Hash for distributed access
                         if isinstance(raw_command, ResumeCommand):
                             result_data = {
@@ -693,10 +805,15 @@ class GatewayWorker(ABC):
                             # siblings overwrite each other; header.
                             # parent_message_id on the reply is the
                             # sub-task's own dispatch-time message_id
-                            # instead, which is unique per task.
+                            # instead, which is unique per task. Pre-v2
+                            # groups keep the old (colliding) key so their
+                            # readers see what they were written to expect.
+                            result_field = (
+                                header.parent_message_id if is_v2 else header.message_id
+                            )
                             await self.redis.hset(  # type: ignore
                                 results_key,
-                                header.parent_message_id,
+                                result_field,
                                 json.dumps(result_data),
                             )
                             await self.redis.expire(results_key, TASK_GROUP_TTL_SECONDS)
@@ -721,20 +838,29 @@ class GatewayWorker(ABC):
                             header.task_group_id,
                             total_str,
                         )
-                        raw_results = await self.redis.hgetall(  # type: ignore
-                            results_key
-                        )
-                        aggregated_results = [
-                            {"message_id": msg_id, **json.loads(data)}
-                            for msg_id, data in raw_results.items()
-                        ]
-                        if isinstance(command, ResumeCommand):
+                        if is_v2 and isinstance(command, ResumeCommand):
+                            aggregated_results = await self._aggregate_task_group(
+                                group_key=group_key,
+                                results_key=results_key,
+                                task_group_id=header.task_group_id,
+                                total=int(total_str),
+                            )
                             command.reply_data = aggregated_results
+                            # reply_data is the single aggregation channel for
+                            # a Task Group resume. Leaving content as whichever
+                            # sibling happened to reply last would give the
+                            # caller two channels that disagree.
+                            command.content = ""
 
                 # await context.emit_state(
                 #     StateChangeEvent(state=AgentState.RESUMED.value)
                 # )
             process_result = await self.process_command(command, context)
+            # Only reached when process_command returned normally. If it
+            # raised, call_agents has already marked the Task Group aborted
+            # and these replies must NOT be sent — the caller execution they
+            # would resume is the one that just failed.
+            await self._flush_pending_group_replies(context)
             task_result = normalize_process_result(process_result)
 
             # Determine the execution status to return

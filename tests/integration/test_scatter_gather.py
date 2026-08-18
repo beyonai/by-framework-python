@@ -1,14 +1,16 @@
+import json
 from typing import List
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from by_framework.common.constants import (
     TASK_GROUP_FIELD_ABORTED,
     TASK_GROUP_FIELD_COMPLETED,
+    TASK_GROUP_FIELD_TOTAL,
     RedisKeys,
 )
-from by_framework.core.protocol.commands import ResumeCommand
+from by_framework.core.protocol.commands import (ResumeCommand, command_from_dict)
 from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.worker.context import AgentContext
 from by_framework.worker.worker import GatewayWorker
@@ -26,8 +28,12 @@ class DummyWorker(GatewayWorker):
 class MockRedis:
     """Minimal in-memory Redis hash store for scatter-gather join tests."""
 
-    def __init__(self):
+    def __init__(self, offline_agent_types=None):
         self.data = {}
+        # Agent types with no online worker, so dispatch-time availability
+        # checks reject them the way they would in a real deployment.
+        self.offline_agent_types = set(offline_agent_types or ())
+        self.streams = {}
 
     async def hset(self, name, key=None, value=None, mapping=None):
         bucket = self.data.setdefault(name, {})
@@ -52,11 +58,16 @@ class MockRedis:
         return 1
 
     async def xadd(self, name, fields):
+        self.streams.setdefault(name, []).append(fields)
         return "0-1"
 
     async def smembers(self, name):
-        # Every agent type is treated as having one online worker, so
-        # dispatch-time availability checks always pass in these tests.
+        # Every agent type is treated as having one online worker unless the
+        # test declared it offline, so dispatch-time availability checks pass
+        # by default and can be made to fail on demand.
+        for agent_type in self.offline_agent_types:
+            if name == RedisKeys.agent_type_members(agent_type):
+                return set()
         return {b"worker-1"}
 
     async def get(self, name):
@@ -474,3 +485,304 @@ async def test_group_join_discards_reply_for_aborted_task_group(tmp_path):
     assert worker.received_commands == []
     group_hash = redis.data[RedisKeys.task_group(task_group_id)]
     assert group_hash.get(TASK_GROUP_FIELD_COMPLETED, "0") == "0"
+
+
+def _make_join_worker(redis, tmp_path, worker_id):
+    workspace_manager = AsyncMock()
+    workspace_manager.setup_workspace.return_value = {
+        "private": str(tmp_path),
+        "public": str(tmp_path),
+    }
+    return RecordingProcessCommandWorker(
+        worker_id=worker_id,
+        redis_client=redis,
+        registry=AsyncMock(),
+        workspace_manager=workspace_manager,
+    )
+
+
+def _make_caller_context(redis):
+    return AgentContext(
+        session_id="s1",
+        trace_id="t1",
+        redis_client=redis,
+        current_agent_id="caller_agent",
+        message_id="parent-msg",
+    )
+
+
+def _reply(*, task_group_id, task_message_id, source_agent_type, **kwargs):
+    """A sub-agent's reply, shaped the way _enqueue_agent_return shapes it."""
+    return ResumeCommand(
+        header=MessageHeader(
+            message_id="parent-msg",
+            session_id="s1",
+            trace_id="t1",
+            source_agent_type=source_agent_type,
+            target_agent_type="caller_agent",
+            parent_message_id=task_message_id,
+            task_group_id=task_group_id,
+        ),
+        **kwargs,
+    )
+
+
+@pytest.mark.asyncio
+async def test_group_with_every_target_offline_still_resumes_caller(tmp_path):
+    """A group whose only target is offline must resume the caller, not hang.
+
+    Regression for the deadlock where the dispatcher itself counted the
+    failure: `completed` reached `total` inside call_agents, where nothing
+    knows how to resume anyone, so no reply was ever left to trigger Group
+    Join and the caller stayed suspended forever.
+    """
+    redis = MockRedis(offline_agent_types={"agent-b"})
+    worker = _make_join_worker(redis, tmp_path, "test-all-offline")
+    caller_context = _make_caller_context(redis)
+
+    dispatch_result = await caller_context.call_agents(
+        tasks=[{"target_agent_type": "agent-b", "content": "one"}],
+    )
+    task_group_id = dispatch_result["task_group_id"]
+    msg_b = dispatch_result["dispatched_tasks"][0]["message_id"]
+
+    # Nothing was dispatched and the group is untouched until the worker
+    # flushes the synthetic reply.
+    assert dispatch_result["dispatched_tasks"][0]["status"] == "FAILED"
+    group_hash = redis.data[RedisKeys.task_group(task_group_id)]
+    assert group_hash.get(TASK_GROUP_FIELD_COMPLETED) == "0"
+
+    await worker._flush_pending_group_replies(caller_context)
+
+    # The flushed reply lands on the caller's own control stream, exactly
+    # where a real sub-agent's return would have gone.
+    caller_stream = redis.streams[RedisKeys.ctrl_stream("caller_agent")]
+    assert len(caller_stream) == 1
+    flushed = command_from_dict(json.loads(caller_stream[0]["data"]))
+    await worker._handle_message(flushed)
+
+    assert len(worker.received_commands) == 1
+    aggregate = worker.received_commands[0].reply_data
+    assert len(aggregate) == 1
+    assert aggregate[0]["message_id"] == msg_b
+    assert aggregate[0]["status"] == "FAILED"
+    assert aggregate[0]["target_agent_type"] == "agent-b"
+    assert aggregate[0]["reply_data"]["error_code"] == "AGENT_TYPE_UNAVAILABLE"
+
+
+@pytest.mark.asyncio
+async def test_group_resumes_once_when_fast_reply_precedes_offline_sibling(tmp_path):
+    """The second deadlock shape: a sibling replies before a later sibling
+    fails its availability check, so the dispatcher's own counting would have
+    been the one to complete the group."""
+    redis = MockRedis(offline_agent_types={"agent-c"})
+    worker = _make_join_worker(redis, tmp_path, "test-fast-then-offline")
+    caller_context = _make_caller_context(redis)
+
+    dispatch_result = await caller_context.call_agents(
+        tasks=[
+            {"target_agent_type": "agent-b", "content": "one"},
+            {"target_agent_type": "agent-c", "content": "two"},
+        ],
+    )
+    task_group_id = dispatch_result["task_group_id"]
+    msg_b, msg_c = (t["message_id"] for t in dispatch_result["dispatched_tasks"])
+
+    # agent-b's reply arrives first: 1/2, caller not resumed yet.
+    await worker._handle_message(
+        _reply(
+            task_group_id=task_group_id,
+            task_message_id=msg_b,
+            source_agent_type="agent-b",
+            status="COMPLETED",
+            content="B result",
+            reply_data={"value": "b"},
+        )
+    )
+    assert worker.received_commands == []
+
+    # Then the offline sibling's synthetic reply completes the group.
+    await worker._flush_pending_group_replies(caller_context)
+    flushed = command_from_dict(
+        json.loads(redis.streams[RedisKeys.ctrl_stream("caller_agent")][0]["data"])
+    )
+    await worker._handle_message(flushed)
+
+    assert len(worker.received_commands) == 1
+    aggregate = worker.received_commands[0].reply_data
+    assert [item["message_id"] for item in aggregate] == [msg_b, msg_c]
+    assert aggregate[0]["status"] == "COMPLETED"
+    assert aggregate[1]["status"] == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_group_aggregate_follows_dispatch_order_not_completion_order(tmp_path):
+    """Aggregation order is the tasks' dispatch order, so callers can index
+    results positionally instead of matching by hand."""
+    redis = MockRedis()
+    worker = _make_join_worker(redis, tmp_path, "test-order")
+    caller_context = _make_caller_context(redis)
+
+    dispatch_result = await caller_context.call_agents(
+        tasks=[
+            {"target_agent_type": "agent-b", "content": "one"},
+            {"target_agent_type": "agent-c", "content": "two"},
+            {"target_agent_type": "agent-d", "content": "three"},
+        ],
+    )
+    task_group_id = dispatch_result["task_group_id"]
+    msg_b, msg_c, msg_d = (t["message_id"] for t in dispatch_result["dispatched_tasks"])
+
+    # Complete in reverse order.
+    for msg_id, agent_type in (
+        (msg_d, "agent-d"),
+        (msg_c, "agent-c"),
+        (msg_b, "agent-b"),
+    ):
+        await worker._handle_message(
+            _reply(
+                task_group_id=task_group_id,
+                task_message_id=msg_id,
+                source_agent_type=agent_type,
+                status="COMPLETED",
+                content=f"{agent_type} result",
+            )
+        )
+
+    assert len(worker.received_commands) == 1
+    resumed = worker.received_commands[0]
+    assert [item["message_id"] for item in resumed.reply_data] == [msg_b, msg_c, msg_d]
+    assert [item["target_agent_type"] for item in resumed.reply_data] == [
+        "agent-b",
+        "agent-c",
+        "agent-d",
+    ]
+    # reply_data is the single aggregation channel; content must not also
+    # carry whichever sibling replied last.
+    assert resumed.content == ""
+
+
+@pytest.mark.asyncio
+async def test_group_without_protocol_stamp_keeps_legacy_join(tmp_path):
+    """A group created by a pre-v2 dispatcher — an old worker still running
+    during a rolling upgrade — must be joined the old way: results keyed by
+    the caller's own message_id, no aggregation, content left alone."""
+    redis = MockRedis()
+    worker = _make_join_worker(redis, tmp_path, "test-legacy")
+
+    task_group_id = "tg-legacy01"
+    group_key = RedisKeys.task_group(task_group_id)
+    # Exactly what a pre-v2 dispatcher wrote: no protocol_version, no
+    # task_order.
+    await redis.hset(
+        group_key,
+        mapping={
+            TASK_GROUP_FIELD_TOTAL: "1",
+            TASK_GROUP_FIELD_COMPLETED: "0",
+        },
+    )
+
+    await worker._handle_message(
+        _reply(
+            task_group_id=task_group_id,
+            task_message_id="msg-b",
+            source_agent_type="agent-b",
+            status="COMPLETED",
+            content="B result",
+            reply_data={"value": "b"},
+        )
+    )
+
+    assert len(worker.received_commands) == 1
+    resumed = worker.received_commands[0]
+    # Legacy behavior: the caller sees the single reply as-is.
+    assert resumed.reply_data == {"value": "b"}
+    assert resumed.content == "B result"
+    # And the result was stored under the legacy (caller message_id) key.
+    results = redis.data[RedisKeys.task_group_results(task_group_id)]
+    assert set(results) == {"parent-msg"}
+
+
+@pytest.mark.asyncio
+async def test_group_join_logs_loudly_when_a_result_never_arrived(tmp_path):
+    """A short result set resumes the caller but must never do so silently."""
+    redis = MockRedis()
+    worker = _make_join_worker(redis, tmp_path, "test-incomplete")
+    caller_context = _make_caller_context(redis)
+
+    dispatch_result = await caller_context.call_agents(
+        tasks=[
+            {"target_agent_type": "agent-b", "content": "one"},
+            {"target_agent_type": "agent-c", "content": "two"},
+        ],
+    )
+    task_group_id = dispatch_result["task_group_id"]
+    msg_b, msg_c = (t["message_id"] for t in dispatch_result["dispatched_tasks"])
+
+    # agent-c's result is lost (expired hash field, failed write, ...) but the
+    # completion counter still reaches total.
+    await worker._handle_message(
+        _reply(
+            task_group_id=task_group_id,
+            task_message_id=msg_b,
+            source_agent_type="agent-b",
+            status="COMPLETED",
+            content="B result",
+        )
+    )
+    await redis.hincrby(RedisKeys.task_group(task_group_id), TASK_GROUP_FIELD_COMPLETED)
+    # by-framework's logger sets propagate=False, so caplog's root handler
+    # never sees these records; assert on the module logger directly.
+    with patch("by_framework.worker.worker.logger.error") as mock_error:
+        aggregate = await worker._aggregate_task_group(
+            group_key=RedisKeys.task_group(task_group_id),
+            results_key=RedisKeys.task_group_results(task_group_id),
+            task_group_id=task_group_id,
+            total=2,
+        )
+
+    assert [item["message_id"] for item in aggregate] == [msg_b]
+    assert mock_error.call_count == 1
+    logged = mock_error.call_args.args
+    assert "expected %d" in logged[0]
+    assert msg_c in logged[-1]
+
+
+@pytest.mark.asyncio
+async def test_flush_is_skipped_when_process_command_raises(tmp_path):
+    """A dispatch-time infrastructure failure aborts the group; the synthetic
+    replies queued before it must never be delivered, or a late reply would
+    resume a caller execution that already failed."""
+    redis = MockRedis(offline_agent_types={"agent-b"})
+    caller_context = _make_caller_context(redis)
+
+    original_xadd = redis.xadd
+
+    async def failing_xadd(name, fields):
+        if name == RedisKeys.ctrl_stream("agent-c"):
+            raise RuntimeError("stream unavailable")
+        return await original_xadd(name, fields)
+
+    redis.xadd = failing_xadd
+
+    with pytest.raises(RuntimeError):
+        await caller_context.call_agents(
+            tasks=[
+                {"target_agent_type": "agent-b", "content": "one"},
+                {"target_agent_type": "agent-c", "content": "two"},
+            ],
+        )
+
+    # agent-b's synthetic failure reply was built but never handed to the
+    # context, so there is nothing for the worker to flush.
+    assert caller_context._pending_group_replies == []
+
+    # The group itself is marked aborted, so even the sibling that WAS sent
+    # cannot resume the caller when its reply lands.
+    group_hashes = [
+        bucket
+        for key, bucket in redis.data.items()
+        if TASK_GROUP_FIELD_TOTAL in bucket
+    ]
+    assert len(group_hashes) == 1
+    assert group_hashes[0][TASK_GROUP_FIELD_ABORTED] == "1"

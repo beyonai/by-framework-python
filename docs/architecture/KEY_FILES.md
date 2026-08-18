@@ -94,7 +94,35 @@ Entry anatomy:
   (`admin_workers()`, `trace_index_session/worker/agent`) are deliberately
   left *untagged* relative to the per-entity keys they index — never share a
   Cluster hash tag with them (fix 8501407). `WORKER_DEFAULT_LEASE_TTL_SECONDS
-  = 30` must stay ~6x `WORKER_DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5`.
+  = 30` must stay ~6x `WORKER_DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 5`. The
+  `TASK_GROUP_FIELD_*` block is a cross-runtime wire contract, not local
+  naming: Java and TS read the same hash. `TASK_GROUP_FIELD_PROTOCOL_VERSION`
+  absent means "written by a pre-v2 dispatcher" and *must* keep selecting the
+  legacy Group Join path — see `docs/adr/0001-unify-call-agent-and-call-agents-behavior.md`; renaming or defaulting it would
+  silently reinterpret in-flight groups during a rolling upgrade.
+
+- `src/by_framework/worker/context.py` — `AgentContext`: the runtime handed to
+  `process_command`. `call_agent` and `call_agents` (alias `dispatch_group`)
+  both dispatch through `_dispatch_single_task`, the one place that builds,
+  availability-checks, and sends an `AskAgentCommand`; per-task routing
+  options in a batch exist so a group member behaves exactly like the
+  equivalent single call. `call_agents` must **never** book-keep the Task
+  Group itself — storing results and incrementing `completed` belong to
+  `GatewayWorker`'s Group Join, and a second copy here is what could push
+  `completed` to `total` with no reply left to resume the caller. A target
+  that fails its availability check is queued onto `_pending_group_replies`
+  as the reply a sub-agent would have sent, and the worker flushes it after
+  `process_command` returns. See `docs/adr/0001-unify-call-agent-and-call-agents-behavior.md`.
+
+- `src/by_framework/worker/worker.py` — `GatewayWorker`. `_enqueue_agent_return`'s
+  header derivation is load-bearing in two directions: a reply's
+  `header.message_id` is the *caller's* id (what `WorkerRunner` reattaches the
+  suspended execution by) and its `header.parent_message_id` is the sub-task's
+  own id (the only per-sibling-unique key, so what Group Join keys the result
+  hash by under protocol v2). `_handle_message`'s Group Join owns all Task
+  Group accounting and branches on `protocol_version`; `_aggregate_task_group`
+  orders by `task_order` and must log loudly rather than silently return a
+  short result set. See `docs/adr/0001-unify-call-agent-and-call-agents-behavior.md`.
 
 - `src/by_framework/client/client.py` — `GatewayClient.send_message()` and
   friends; publishes commands to Redis control streams and drives registry

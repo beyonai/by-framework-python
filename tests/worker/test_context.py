@@ -8,7 +8,11 @@ import pytest
 
 import by_framework.worker.context as context_module
 from by_framework import AgentContext
-from by_framework.common.constants import TASK_GROUP_FIELD_ABORTED, RedisKeys
+from by_framework.common.constants import (
+    TASK_GROUP_FIELD_ABORTED,
+    TASK_GROUP_FIELD_TASK_ORDER,
+    RedisKeys,
+)
 from by_framework.core.extensions.plugin import Plugin, PluginManifest
 from by_framework.core.extensions.registry import PluginRegistry
 from by_framework.core.protocol.agent_state import AgentState
@@ -528,18 +532,45 @@ async def test_context_call_agents_marks_unavailable_task_failed():
     dispatched_command = command_from_dict(json.loads(xadd_args[1]["data"]))
     assert dispatched_command.header.target_agent_type == "agent-b"
 
-    # The unavailable task was recorded as FAILED and counted toward completion.
-    assert mock_redis.hincrby.await_count == 1
-    results_writes = [c for c in mock_redis.hset.await_args_list if len(c.args) >= 3]
-    assert len(results_writes) == 1
-    failure_payload = json.loads(results_writes[0].args[2])
-    assert failure_payload["status"] == AgentState.FAILED.value
-    assert failure_payload["target_agent_type"] == "agent-c"
-    assert failure_payload["error_code"] == "AGENT_TYPE_UNAVAILABLE"
+    # The dispatcher does NOT book-keep the group itself. Storing the result
+    # and counting completion belong to GatewayWorker's Group Join, and a
+    # second implementation here is what could push `completed` to `total`
+    # with no reply left to resume the caller.
+    assert mock_redis.hincrby.await_count == 0
+
+    # Instead the unavailable task is queued as the reply a sub-agent would
+    # have sent had it started and failed; the worker flushes it after
+    # process_command returns.
+    assert len(ctx._pending_group_replies) == 1
+    failure_reply = ctx._pending_group_replies[0]
+    assert failure_reply.status == AgentState.FAILED.value
+    assert failure_reply.content == ""
+    assert failure_reply.reply_data["error_code"] == "AGENT_TYPE_UNAVAILABLE"
+    # Addressed back at the caller: message_id is what WorkerRunner uses to
+    # reattach the suspended execution, parent_message_id is the sub-task's
+    # own id that Group Join keys the result hash by.
+    assert failure_reply.header.message_id == "parent-msg"
+    assert failure_reply.header.target_agent_type == "agent-a"
+    assert failure_reply.header.source_agent_type == "agent-c"
+    assert failure_reply.header.parent_message_id == (
+        result["dispatched_tasks"][1]["message_id"]
+    )
+    assert failure_reply.header.task_group_id == result["task_group_id"]
+
+    # The failed task is visible in the dispatch result too, in the same shape
+    # a real sub-agent failure arrives in.
+    assert result["dispatched_tasks"][1]["status"] == AgentState.FAILED.value
+    assert (
+        result["dispatched_tasks"][1]["reply_data"]["error_code"]
+        == "AGENT_TYPE_UNAVAILABLE"
+    )
+    assert result["dispatched_tasks"][0]["status"] == AgentState.QUEUED.value
 
     # Same plugin hooks call_agent's own availability failure fires: a
     # "start"/"error" pair for the unavailable agent-c, alongside the
-    # normal "start"/"complete" pair for the dispatched agent-b.
+    # normal "start"/"complete" pair for the dispatched agent-b. The
+    # synthetic reply must not additionally fire agent-return hooks — those
+    # belong to a sub-agent that actually ran.
     assert [event[0] for event in plugin.events] == [
         "start",
         "complete",
@@ -548,7 +579,7 @@ async def test_context_call_agents_marks_unavailable_task_failed():
     ]
     assert {e[1] for e in plugin.events if e[0] == "start"} == {"agent-b", "agent-c"}
     error_event = next(e for e in plugin.events if e[0] == "error")
-    assert failure_payload["error"] in error_event[1]
+    assert failure_reply.reply_data["error"] in error_event[1]
 
 
 @pytest.mark.asyncio
@@ -995,3 +1026,167 @@ async def test_context_injects_custom_file_permission_policy(tmp_path):
 
     assert result["success"] is False
     assert "blocked write" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_context_call_agents_rejects_shared_message_id_across_tasks():
+    """One message_id for a whole batch would make siblings overwrite each
+    other in the Task Group result hash, which is keyed per sub-task."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.get = AsyncMock(return_value=b"1")
+
+    ctx = AgentContext(
+        session_id="s1",
+        trace_id="t1",
+        redis_client=mock_redis,
+        current_agent_id="agent-a",
+        message_id="parent-msg",
+    )
+
+    with pytest.raises(ValueError, match="message_id"):
+        await ctx.call_agents(
+            tasks=[
+                {"target_agent_type": "agent-b", "content": "one"},
+                {"target_agent_type": "agent-c", "content": "two"},
+            ],
+            message_id="shared-msg",
+        )
+
+    # Still allowed for a single task, where nothing can collide.
+    result = await ctx.call_agents(
+        tasks=[{"target_agent_type": "agent-b", "content": "one"}],
+        message_id="single-msg",
+    )
+    assert result["dispatched_tasks"][0]["message_id"] == "single-msg"
+
+
+@pytest.mark.asyncio
+async def test_context_call_agents_honours_per_task_message_id():
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.get = AsyncMock(return_value=b"1")
+
+    ctx = AgentContext(
+        session_id="s1",
+        trace_id="t1",
+        redis_client=mock_redis,
+        current_agent_id="agent-a",
+        message_id="parent-msg",
+    )
+
+    result = await ctx.call_agents(
+        tasks=[
+            {"target_agent_type": "agent-b", "content": "one", "message_id": "mid-b"},
+            {"target_agent_type": "agent-c", "content": "two", "message_id": "mid-c"},
+        ],
+    )
+
+    assert [t["message_id"] for t in result["dispatched_tasks"]] == ["mid-b", "mid-c"]
+    order_writes = [
+        c
+        for c in mock_redis.hset.await_args_list
+        if len(c.args) >= 3 and c.args[1] == TASK_GROUP_FIELD_TASK_ORDER
+    ]
+    assert len(order_writes) == 1
+    assert json.loads(order_writes[0].args[2]) == ["mid-b", "mid-c"]
+
+
+@pytest.mark.asyncio
+async def test_context_call_agents_per_task_route_policy_reaches_offline_target():
+    """SEND_ANYWAY per task restores the pre-unification ability to queue a
+    task for an agent type whose workers have not started yet — consumer
+    groups are created with id="0", so the message is delivered on start."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    # No agent type has an online worker.
+    mock_redis.smembers = AsyncMock(return_value=set())
+    mock_redis.get = AsyncMock(return_value=b"1")
+
+    ctx = AgentContext(
+        session_id="s1",
+        trace_id="t1",
+        redis_client=mock_redis,
+        current_agent_id="agent-a",
+        message_id="parent-msg",
+    )
+
+    result = await ctx.call_agents(
+        tasks=[
+            {"target_agent_type": "agent-b", "content": "one"},
+            {
+                "target_agent_type": "agent-c",
+                "content": "two",
+                "route_policy": "SEND_ANYWAY",
+            },
+        ],
+    )
+
+    # Default FAIL_FAST rejects agent-b; SEND_ANYWAY dispatches agent-c anyway.
+    assert result["dispatched_tasks"][0]["status"] == AgentState.FAILED.value
+    assert result["dispatched_tasks"][1]["status"] == AgentState.QUEUED.value
+    assert mock_redis.xadd.await_count == 1
+    xadd_args, _ = mock_redis.xadd.call_args
+    assert (
+        command_from_dict(json.loads(xadd_args[1]["data"])).header.target_agent_type
+        == "agent-c"
+    )
+
+
+@pytest.mark.asyncio
+async def test_byai_context_call_agents_accepts_typed_tasks():
+    """call_agents is the primary batch entry point, so the typed facade must
+    override it — not only dispatch_group, or a ByaiAgentTask would be
+    subscripted as a dict by the base implementation."""
+    from unittest.mock import MagicMock
+
+    from by_framework.worker.byai_context import (ByaiAgentContext, ByaiAgentTask)
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.get = AsyncMock(return_value=b"1")
+
+    ctx = ByaiAgentContext(
+        session_id="s1",
+        trace_id="t1",
+        redis_client=mock_redis,
+        current_agent_id="agent-a",
+        message_id="parent-msg",
+    )
+
+    result = await ctx.call_agents(
+        tasks=[
+            ByaiAgentTask(target_agent_type="agent-b", content="one"),
+            ByaiAgentTask(
+                target_agent_type="agent-c", content="two", message_id="mid-c"
+            ),
+        ],
+    )
+
+    assert result["status"] == AgentState.QUEUED.value
+    assert len(result["dispatched_tasks"]) == 2
+    assert result["dispatched_tasks"][1]["message_id"] == "mid-c"
+    assert mock_redis.xadd.await_count == 2
+
+    # dispatch_group stays source-compatible and routes through call_agents.
+    alias_result = await ctx.dispatch_group(
+        tasks=[ByaiAgentTask(target_agent_type="agent-b", content="one")],
+    )
+    assert alias_result["status"] == AgentState.QUEUED.value

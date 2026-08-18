@@ -36,7 +36,10 @@ class EchoWorker(GatewayWorker):
     async def _handle_fanout(self, command, context: AgentContext):
         if isinstance(command, ResumeCommand):
             # The Task Group has completed: command.reply_data is the
-            # aggregated list Group Join built, one entry per echo call.
+            # aggregated list Group Join built, one entry per echo call, in
+            # the order the tasks were dispatched — so joining positionally is
+            # safe here. (command.content is "" on a group resume; reply_data
+            # is the single aggregation channel.)
             aggregate = command.reply_data or []
             parts = [str(item.get("content", "")) for item in aggregate]
             reply = "fanout: " + " | ".join(parts)

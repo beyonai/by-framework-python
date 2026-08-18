@@ -25,9 +25,12 @@ from by_framework.common.constants import (
     MESSAGE_ID_PREFIX,
     TASK_GROUP_FIELD_ABORTED,
     TASK_GROUP_FIELD_COMPLETED,
+    TASK_GROUP_FIELD_PROTOCOL_VERSION,
     TASK_GROUP_FIELD_SOURCE_AGENT,
+    TASK_GROUP_FIELD_TASK_ORDER,
     TASK_GROUP_FIELD_TOTAL,
     TASK_GROUP_ID_PREFIX,
+    TASK_GROUP_PROTOCOL_V2,
     TASK_GROUP_TTL_SECONDS,
     RedisKeys,
 )
@@ -155,6 +158,13 @@ class AgentContext:
         self._permission_transferred = False
         # Flag: execution suspended due to calling agents or waiting
         self._is_suspended = False
+        # Task Group sub-tasks that never reached a worker (their target agent
+        # type was unavailable at dispatch time). Each is a fully-formed
+        # ResumeCommand addressed back at this caller, so Group Join counts and
+        # aggregates it exactly like a real sub-agent's failure reply. The
+        # worker flushes these AFTER process_command returns — see
+        # GatewayWorker._flush_pending_group_replies for why not inline.
+        self._pending_group_replies: list[ResumeCommand] = []
         self._trace_parent_observation_id = ""
         self._token_usage: dict[str, Any] = {}
         self.plugin_registry = plugin_registry
@@ -690,6 +700,11 @@ class AgentContext:
                 )
             return {
                 "status": AgentState.FAILED.value,
+                # message_id stays empty: nothing was dispatched, so there is
+                # no in-flight message to refer to. parent_message_id is the
+                # RESOLVED caller message id (not the raw argument) because
+                # call_agents needs it to address the synthetic failure reply
+                # back at the caller's own suspended execution.
                 "message_id": "",
                 "parent_message_id": parent_message_id or "",
                 "target_agent_type": target_agent_type,
@@ -833,30 +848,60 @@ class AgentContext:
         aggregated, ONLY when ALL tasks in the group are complete.
 
         Args:
-            tasks: A list of dicts, each containing:
+            tasks: A list of dicts. Every key call_agent takes per call is
+                   accepted here per task, with call_agent's own defaults, so a
+                   task that names no routing options behaves exactly like the
+                   equivalent call_agent call:
                    {
-                       "target_agent_type": str,
-                       "content": str,
+                       "target_agent_type": str,           # required
+                       "content": object,
                        "extra_payload": Optional[Dict[str, Any]],
-                       "metadata": Optional[Dict[str, Any]]
+                       "metadata": Optional[Dict[str, Any]],
+                       "message_id": Optional[str],
+                       "route_policy": str,                # default FAIL_FAST
+                       "availability_timeout_ms": int,     # default 30000
+                       "region": Optional[str],
+                       "priority": int,                    # default 0
                    }
             wait_for_reply: bool. If True, sets up Redis counters to wait for all.
+            message_id: Single-task convenience only. A Task Group keys its
+                   results by each sub-task's own dispatch message_id, so one
+                   id shared across a batch would make siblings overwrite each
+                   other; passing it with more than one task raises ValueError.
+                   Use the per-task "message_id" key instead.
+
+        Returns:
+            {"status": "QUEUED", "task_group_id": str, "dispatched_tasks": [...]}
+            where each dispatched task carries message_id, target_agent_type,
+            status, and — when dispatch failed — reply_data with the error.
+
+        On resume, the caller's ResumeCommand carries reply_data as the ordered
+        list of every sub-task's result (dispatch order) and content as "".
         """
         if not tasks:
             raise ValueError("dispatch_group/call_agents requires at least one task")
 
+        if message_id and len(tasks) > 1:
+            raise ValueError(
+                "call_agents/dispatch_group cannot share one message_id across "
+                f"{len(tasks)} tasks: Task Group results are keyed by each "
+                "sub-task's own message_id, so the siblings would overwrite "
+                'each other. Pass a per-task "message_id" instead.'
+            )
+
         task_group_id = f"{TASK_GROUP_ID_PREFIX}{uuid.uuid4().hex[:8]}"
         total_tasks = len(tasks)
         group_dispatch_start_ts = int(time.time() * 1000)
+        group_key = RedisKeys.task_group(task_group_id)
 
         if wait_for_reply:
-            group_key = RedisKeys.task_group(task_group_id)
             await self.redis.hset(  # type: ignore
                 group_key,
                 mapping={
                     TASK_GROUP_FIELD_TOTAL: str(total_tasks),
                     TASK_GROUP_FIELD_COMPLETED: "0",
                     TASK_GROUP_FIELD_SOURCE_AGENT: self.current_agent_id,
+                    TASK_GROUP_FIELD_PROTOCOL_VERSION: TASK_GROUP_PROTOCOL_V2,
                 },
             )
             # Ensure the key expires to prevent leak
@@ -866,13 +911,16 @@ class AgentContext:
             self._permission_transferred = True
 
         dispatched = []
+        pending_failures: list[ResumeCommand] = []
         for task in tasks:
             target_agent_type = task["target_agent_type"]
             content = task.get("content", "")
             extra_payload = task.get("extra_payload", {})
             metadata = dict(task.get("metadata", {}) or {})
 
-            current_message_id = message_id or self.generate_message_id()
+            current_message_id = (
+                task.get("message_id") or message_id or self.generate_message_id()
+            )
             try:
                 task_result = await self._dispatch_single_task(
                     target_agent_type=target_agent_type,
@@ -883,53 +931,76 @@ class AgentContext:
                     message_id=current_message_id,
                     parent_message_id=parent_message_id,
                     task_group_id=task_group_id,
+                    route_policy=task.get("route_policy", RoutePolicy.FAIL_FAST),
+                    availability_timeout_ms=task.get("availability_timeout_ms", 30000),
+                    region=task.get("region"),
+                    priority=task.get("priority", 0),
                 )
             except Exception:
                 # A genuine dispatch-time failure (not an availability-check
                 # rejection, which _dispatch_single_task already turns into a
                 # FAILED result instead of raising). Stop fanning out and mark
                 # the group aborted so already-sent siblings' replies don't
-                # later resume this (now-failed) caller execution.
+                # later resume this (now-failed) caller execution. Synthetic
+                # replies queued so far are dropped with the raise: the worker
+                # only flushes them once process_command returns normally.
                 if wait_for_reply:
                     await self.redis.hset(  # type: ignore
-                        RedisKeys.task_group(task_group_id),
+                        group_key,
                         TASK_GROUP_FIELD_ABORTED,
                         "1",
                     )
                 raise
 
             if task_result["status"] == AgentState.FAILED.value and wait_for_reply:
-                # Target agent type unavailable: record the failure as this
-                # task's result immediately, without blocking the rest of
-                # the batch or waiting for a reply that will never arrive.
-                result_data = {
-                    "status": task_result["status"],
-                    "reply_data": None,
-                    "content": "",
-                    "target_agent_type": target_agent_type,
-                    "metadata": {},
-                    "extra_payload": {},
+                # The target agent type was unavailable, so no worker will ever
+                # reply for this sub-task. Rather than book-keeping the group
+                # here — a second implementation of the accounting that lives in
+                # GatewayWorker's Group Join, and the one that could push
+                # `completed` to `total` with nobody left to resume the caller —
+                # synthesize the reply that a sub-agent WOULD have sent had it
+                # started and failed. Group Join then counts, stores and
+                # aggregates it through the single path it already owns.
+                pending_failures.append(
+                    self._build_group_failure_reply(
+                        task_group_id=task_group_id,
+                        caller_message_id=task_result["parent_message_id"],
+                        task_message_id=current_message_id,
+                        target_agent_type=task_result["target_agent_type"],
+                        error=task_result.get("error"),
+                        error_code=task_result.get("error_code"),
+                        metadata=metadata,
+                    )
+                )
+
+            dispatched_task = {
+                "message_id": current_message_id,
+                # task_result["target_agent_type"] reflects any fallback
+                # reroute _dispatch_single_task performed, so this stays
+                # consistent with what Group Join later reports.
+                "target_agent_type": task_result["target_agent_type"],
+                "status": task_result["status"],
+            }
+            if task_result["status"] == AgentState.FAILED.value:
+                # Same shape a real sub-agent failure arrives in
+                # (GatewayWorker._handle_message's error path), so callers read
+                # dispatch-time and run-time failures the same way.
+                dispatched_task["reply_data"] = {
                     "error": task_result.get("error"),
                     "error_code": task_result.get("error_code"),
                 }
-                results_key = RedisKeys.task_group_results(task_group_id)
-                await self.redis.hset(  # type: ignore
-                    results_key, current_message_id, json.dumps(result_data)
-                )
-                await self.redis.expire(results_key, TASK_GROUP_TTL_SECONDS)
-                await self.redis.hincrby(  # type: ignore
-                    RedisKeys.task_group(task_group_id), TASK_GROUP_FIELD_COMPLETED, 1
-                )
+            dispatched.append(dispatched_task)
 
-            dispatched.append(
-                {
-                    "message_id": current_message_id,
-                    # task_result["target_agent_type"] reflects any fallback
-                    # reroute _dispatch_single_task performed, so this stays
-                    # consistent with what Group Join later reports.
-                    "target_agent_type": task_result["target_agent_type"],
-                }
+        if wait_for_reply:
+            # Written after the loop so it records exactly what was dispatched.
+            # Group Join aggregates in this order and uses it to name results
+            # that never arrived.
+            await self.redis.hset(  # type: ignore
+                group_key,
+                TASK_GROUP_FIELD_TASK_ORDER,
+                json.dumps([item["message_id"] for item in dispatched]),
             )
+            self._pending_group_replies.extend(pending_failures)
 
         # Record aggregate span for the entire group dispatch.
         group_parent_span_id = (
@@ -967,6 +1038,56 @@ class AgentContext:
             "task_group_id": task_group_id,
             "dispatched_tasks": dispatched,
         }
+
+    def _build_group_failure_reply(
+        self,
+        *,
+        task_group_id: str,
+        caller_message_id: str,
+        task_message_id: str,
+        target_agent_type: str,
+        error: Optional[str],
+        error_code: Optional[str],
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> ResumeCommand:
+        """Build the reply a sub-agent WOULD have sent had it started and failed.
+
+        The header derivation mirrors GatewayWorker._enqueue_agent_return
+        exactly, because that shape is load-bearing in two places:
+
+        - header.message_id must be the CALLER's own message id: WorkerRunner
+          reattaches a ResumeCommand to the suspended execution via
+          get_execution_by_message_id(header.message_id), so any other value
+          would orphan the caller's execution instead of resuming it.
+        - header.parent_message_id must be this sub-task's dispatch message id:
+          it is what Group Join keys the result hash by, and it is the only
+          per-sibling-unique id available on a reply.
+
+        reply_data carries the failure detail because that is how a real
+        failure arrives (GatewayWorker._handle_message returns
+        status=FAILED, reply_data={"error": ...}); putting it anywhere else
+        would make dispatch-time and run-time failures read differently.
+        """
+        return ResumeCommand(
+            header=MessageHeader(
+                message_id=caller_message_id,
+                session_id=self.session_id,
+                trace_id=self.trace_id,
+                source_agent_type=target_agent_type,
+                target_agent_type=self.current_agent_id,
+                parent_message_id=task_message_id,
+                task_group_id=task_group_id,
+                user_code=self.agent_runtime_state.session_manager.user_code,
+                user_name=self.agent_runtime_state.session_manager.user_name,
+                metadata=dict(metadata or {}),
+            ),
+            status=AgentState.FAILED.value,
+            content="",
+            reply_data={
+                "error": error,
+                "error_code": error_code or "AGENT_TYPE_UNAVAILABLE",
+            },
+        )
 
     async def dispatch_group(
         self,
@@ -1127,6 +1248,17 @@ class AgentContext:
         else:
             total = int(total_str)
 
+        # Ordering mirrors what Group Join hands the caller on resume: dispatch
+        # order, not the Redis hash's unspecified iteration order. A group from
+        # a pre-v2 dispatcher has no task_order and keeps hash order.
+        raw_order = await self.redis.hget(  # type: ignore
+            group_key, TASK_GROUP_FIELD_TASK_ORDER
+        )
+        try:
+            order = json.loads(raw_order) if raw_order else []
+        except (TypeError, ValueError):
+            order = []
+
         start_time = asyncio.get_running_loop().time()
         results: list[dict[str, Any]] = []
 
@@ -1137,12 +1269,14 @@ class AgentContext:
 
             raw_results = await self.redis.hgetall(results_key)  # type: ignore
             if raw_results:
+                ordered_ids = [m for m in order if m in raw_results]
+                ordered_ids += [m for m in raw_results if m not in set(order)]
                 results = [
                     {
                         "message_id": msg_id,
-                        **json.loads(data),
+                        **json.loads(raw_results[msg_id]),
                     }
-                    for msg_id, data in raw_results.items()
+                    for msg_id in ordered_ids
                 ]
                 if len(results) >= total:
                     break
