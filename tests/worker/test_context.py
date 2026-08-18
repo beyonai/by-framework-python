@@ -541,8 +541,9 @@ async def test_context_call_agents_marks_unavailable_task_failed():
     # Instead the unavailable task is queued as the reply a sub-agent would
     # have sent had it started and failed; the worker flushes it after
     # process_command returns.
-    assert len(ctx._pending_group_replies) == 1
-    failure_reply = ctx._pending_group_replies[0]
+    pending_replies = ctx.drain_pending_group_replies()
+    assert len(pending_replies) == 1
+    failure_reply = pending_replies[0]
     assert failure_reply.status == AgentState.FAILED.value
     assert failure_reply.content == ""
     assert failure_reply.reply_data["error_code"] == "AGENT_TYPE_UNAVAILABLE"
@@ -1029,45 +1030,9 @@ async def test_context_injects_custom_file_permission_policy(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_context_call_agents_rejects_shared_message_id_across_tasks():
-    """One message_id for a whole batch would make siblings overwrite each
-    other in the Task Group result hash, which is keyed per sub-task."""
-    from unittest.mock import MagicMock
-
-    mock_redis = MagicMock()
-    mock_redis.xadd = AsyncMock()
-    mock_redis.hset = AsyncMock()
-    mock_redis.expire = AsyncMock()
-    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
-    mock_redis.get = AsyncMock(return_value=b"1")
-
-    ctx = AgentContext(
-        session_id="s1",
-        trace_id="t1",
-        redis_client=mock_redis,
-        current_agent_id="agent-a",
-        message_id="parent-msg",
-    )
-
-    with pytest.raises(ValueError, match="message_id"):
-        await ctx.call_agents(
-            tasks=[
-                {"target_agent_type": "agent-b", "content": "one"},
-                {"target_agent_type": "agent-c", "content": "two"},
-            ],
-            message_id="shared-msg",
-        )
-
-    # Still allowed for a single task, where nothing can collide.
-    result = await ctx.call_agents(
-        tasks=[{"target_agent_type": "agent-b", "content": "one"}],
-        message_id="single-msg",
-    )
-    assert result["dispatched_tasks"][0]["message_id"] == "single-msg"
-
-
-@pytest.mark.asyncio
-async def test_context_call_agents_honours_per_task_message_id():
+async def test_context_call_agents_derives_unique_ids_from_shared_message_id():
+    """The legacy batch-level argument remains source-compatible without
+    allowing sibling results to collide."""
     from unittest.mock import MagicMock
 
     mock_redis = MagicMock()
@@ -1087,6 +1052,89 @@ async def test_context_call_agents_honours_per_task_message_id():
 
     result = await ctx.call_agents(
         tasks=[
+            {"target_agent_type": "agent-b", "content": "one"},
+            {"target_agent_type": "agent-c", "content": "two"},
+        ],
+        message_id="shared-msg",
+    )
+    assert [task["message_id"] for task in result["dispatched_tasks"]] == [
+        "shared-msg:0",
+        "shared-msg:1",
+    ]
+
+    # Still allowed for a single task, where nothing can collide.
+    result = await ctx.call_agents(
+        tasks=[{"target_agent_type": "agent-b", "content": "one"}],
+        message_id="single-msg",
+    )
+    assert result["dispatched_tasks"][0]["message_id"] == "single-msg"
+
+
+@pytest.mark.asyncio
+async def test_context_call_agents_rejects_duplicate_per_task_ids_before_writes():
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_redis.xadd = AsyncMock()
+
+    ctx = AgentContext(session_id="s1", trace_id="t1", redis_client=mock_redis)
+
+    with pytest.raises(ValueError, match="message_ids must be unique"):
+        await ctx.call_agents(
+            tasks=[
+                {
+                    "target_agent_type": "agent-b",
+                    "content": "one",
+                    "message_id": "duplicate-id",
+                },
+                {
+                    "target_agent_type": "agent-c",
+                    "content": "two",
+                    "message_id": "duplicate-id",
+                },
+            ]
+        )
+
+    mock_redis.hset.assert_not_awaited()
+    mock_redis.expire.assert_not_awaited()
+    mock_redis.xadd.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_context_call_agents_honours_per_task_message_id():
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.get = AsyncMock(return_value=b"1")
+
+    async def assert_task_order_exists_before_dispatch(*_args, **_kwargs):
+        order_writes = [
+            call
+            for call in mock_redis.hset.await_args_list
+            if call.kwargs.get("mapping", {}).get(TASK_GROUP_FIELD_TASK_ORDER)
+        ]
+        assert len(order_writes) == 1
+        assert json.loads(
+            order_writes[0].kwargs["mapping"][TASK_GROUP_FIELD_TASK_ORDER]
+        ) == ["mid-b", "mid-c"]
+
+    mock_redis.xadd = AsyncMock(side_effect=assert_task_order_exists_before_dispatch)
+
+    ctx = AgentContext(
+        session_id="s1",
+        trace_id="t1",
+        redis_client=mock_redis,
+        current_agent_id="agent-a",
+        message_id="parent-msg",
+    )
+
+    result = await ctx.call_agents(
+        tasks=[
             {"target_agent_type": "agent-b", "content": "one", "message_id": "mid-b"},
             {"target_agent_type": "agent-c", "content": "two", "message_id": "mid-c"},
         ],
@@ -1094,12 +1142,14 @@ async def test_context_call_agents_honours_per_task_message_id():
 
     assert [t["message_id"] for t in result["dispatched_tasks"]] == ["mid-b", "mid-c"]
     order_writes = [
-        c
-        for c in mock_redis.hset.await_args_list
-        if len(c.args) >= 3 and c.args[1] == TASK_GROUP_FIELD_TASK_ORDER
+        call
+        for call in mock_redis.hset.await_args_list
+        if call.kwargs.get("mapping", {}).get(TASK_GROUP_FIELD_TASK_ORDER)
     ]
     assert len(order_writes) == 1
-    assert json.loads(order_writes[0].args[2]) == ["mid-b", "mid-c"]
+    assert json.loads(
+        order_writes[0].kwargs["mapping"][TASK_GROUP_FIELD_TASK_ORDER]
+    ) == ["mid-b", "mid-c"]
 
 
 @pytest.mark.asyncio

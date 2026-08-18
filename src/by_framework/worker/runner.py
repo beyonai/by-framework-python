@@ -15,6 +15,7 @@ from by_framework.common.constants import (
     CONTROL_LOOP_SLEEP_SECONDS,
     EXECUTION_ID_PREFIX,
     STREAM_READ_LAST_ID,
+    TASK_GROUP_JOIN_CLAIM_TTL_MS,
     WAIT_FOR_TASKS_TIMEOUT_SECONDS,
     RedisKeys,
 )
@@ -42,6 +43,11 @@ from by_framework.trace.trace_writer import TraceWriteClient
 from by_framework.util.generate_message_id import generate_message_id
 from by_framework.worker.context import current_worker_id_var
 from by_framework.worker.health_server import WorkerHealthServer
+from by_framework.worker.task_group import (
+    TASK_GROUP_JOIN_PENDING_STATUS,
+    TASK_GROUP_JOINED_STATUS,
+    TaskGroupStore,
+)
 from by_framework.worker.worker import GatewayWorker
 
 from ._control_handling import (
@@ -113,6 +119,7 @@ class WorkerRunner:
         # Round-robin cursor for fetch_messages' phase-two blocking read, so
         # no agent_type is permanently starved of the blocking slot.
         self._primary_cursor: int = 0
+        self._pending_claim_last_monotonic: dict[str, float] = {}
         self._consumer_last_tick_monotonic = 0.0
         stream_block_seconds = float(WorkerConfig.stream_block_ms) / 1000.0
         self._consumer_health_timeout_seconds = max(
@@ -244,6 +251,10 @@ class WorkerRunner:
 
         stream_names = list(streams.keys())
 
+        claimed = await self._claim_stale_messages(stream_names, count=count)
+        if claimed:
+            return claimed
+
         async def read_nonblocking(stream_name: str):
             return await self.redis.xreadgroup(
                 groupname=self.group_name,
@@ -269,6 +280,61 @@ class WorkerRunner:
             block=block,
         )
         return await self._parse_xreadgroup_results([blocked])
+
+    async def _claim_stale_messages(
+        self, stream_names: list[str], *, count: int
+    ) -> list[tuple[str, str, dict]]:
+        """Reclaim unacknowledged entries whose Group Join lease can expire."""
+        if not callable(getattr(type(self.redis), "xautoclaim", None)):
+            return []
+
+        now = time.monotonic()
+        scan_interval = min(TASK_GROUP_JOIN_CLAIM_TTL_MS / 2000.0, 60.0)
+        eligible = [
+            stream_name
+            for stream_name in stream_names
+            if now - self._pending_claim_last_monotonic.get(stream_name, float("-inf"))
+            >= scan_interval
+        ]
+        if not eligible:
+            return []
+        for stream_name in eligible:
+            self._pending_claim_last_monotonic[stream_name] = now
+
+        async def claim(stream_name: str):
+            try:
+                response = await self.redis.xautoclaim(
+                    stream_name,
+                    self.group_name,
+                    self.consumer_name,
+                    min_idle_time=TASK_GROUP_JOIN_CLAIM_TTL_MS,
+                    start_id="0-0",
+                    count=count,
+                )
+                return stream_name, response
+            except Exception as error:  # pylint: disable=broad-exception-caught
+                logger.warning(
+                    "[%s] Failed to reclaim pending messages from %s: %s",
+                    self.worker.worker_id,
+                    stream_name,
+                    error,
+                )
+                return stream_name, None
+
+        batches = await asyncio.gather(*(claim(name) for name in eligible))
+        results: list[tuple[str, str, dict]] = []
+        for stream_name, response in batches:
+            if not response or len(response) < 2:
+                continue
+            for msg_id_raw, msg_data in response[1]:
+                msg_id = decode_message_id(msg_id_raw)
+                try:
+                    data_dict = await parse_message_data(msg_data)
+                except Exception:  # pylint: disable=broad-exception-caught
+                    logger.error("Failed to parse reclaimed message: %s", msg_id)
+                    continue
+                results.append((stream_name, msg_id, data_dict))
+        return results
 
     @staticmethod
     async def _parse_xreadgroup_results(batches: list) -> list[tuple[str, str, dict]]:
@@ -515,6 +581,22 @@ class WorkerRunner:
             if not header.message_id:
                 header.message_id = generate_message_id()
 
+            # A committed Task Group duplicate is ACK-only. Check before
+            # touching execution registry state; GatewayWorker repeats this
+            # decision atomically to close the race with mark_joined().
+            if (
+                isinstance(command, ResumeCommand)
+                and header.task_group_id
+                and await TaskGroupStore(self.redis).is_joined(header.task_group_id)
+            ):
+                await self.redis.xack(stream_name, self.group_name, msg_id)
+                logger.info(
+                    "[%s] ACK-only replay for joined TaskGroup %s",
+                    self.worker.worker_id,
+                    header.task_group_id,
+                )
+                return
+
             registry = getattr(self.worker, "registry", None)
             existing_execution = None
 
@@ -652,6 +734,37 @@ class WorkerRunner:
                     cancel_reason=cancel_reason,
                     execution=self._tracker.get_execution(execution_id),
                 )
+                if task_result.status == TASK_GROUP_JOIN_PENDING_STATUS:
+                    logger.info(
+                        "[%s] Leaving TaskGroup %s reply pending for claim recovery",
+                        self.worker.worker_id,
+                        header.task_group_id,
+                    )
+                    return
+                if task_result.status == TASK_GROUP_JOINED_STATUS:
+                    # mark_joined raced the preflight above. Restore the prior
+                    # execution state, ACK the duplicate, and do not emit a
+                    # second completion/trace update.
+                    if (
+                        registry
+                        and existing_execution
+                        and hasattr(registry, "update_execution_status")
+                    ):
+                        await registry.update_execution_status(
+                            execution_id,
+                            header.session_id,
+                            existing_execution.get(
+                                "status", AgentState.COMPLETED.value
+                            ),
+                            worker_id=self.worker.worker_id,
+                        )
+                    await self.redis.xack(stream_name, self.group_name, msg_id)
+                    logger.info(
+                        "[%s] ACK-only raced replay for joined TaskGroup %s",
+                        self.worker.worker_id,
+                        header.task_group_id,
+                    )
+                    return
                 execution_finished_at = int(time.time() * 1000)
                 final_status = task_result.status
                 completion_fields = self._build_completion_observability_fields(

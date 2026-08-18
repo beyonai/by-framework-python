@@ -29,9 +29,9 @@ Concretely:
    internal single-task routine. Every per-call option `call_agent` accepts —
    `route_policy`, `availability_timeout_ms`, `region`, `priority`, `message_id` — is
    accepted per task in a batch, with the same defaults.
-2. One accounting path. Storing a sub-task result, incrementing the completion counter,
-   deciding the group is done, and aggregating happen **only** in the worker's Group Join.
-   A dispatcher must never book-keep the group itself.
+2. One accounting module. `TaskGroupStore` owns group creation, abort, atomic result
+   recording, completion claims, ordering, and aggregation. The worker's Group Join calls
+   that interface; a dispatcher must never store results or increment `completed` itself.
 3. A sub-task whose target agent type is unavailable at dispatch time produces the reply a
    sub-agent *would* have sent had it started and failed, delivered to the caller's control
    stream. It is not special-cased anywhere downstream.
@@ -51,7 +51,10 @@ This section is normative. Implementations in other runtimes must satisfy it exa
 | `source_agent_type` | dispatcher | the caller's agent type |
 | `aborted` | dispatcher | `"1"` once a dispatch-time infrastructure failure aborted the batch |
 | `protocol_version` | dispatcher | `"2"` for this contract; **absent** means a pre-2 dispatcher |
-| `task_order` | dispatcher, after the dispatch loop | JSON array of sub-task dispatch `message_id`s, in dispatch order |
+| `task_order` | dispatcher, before the first task is sent | JSON array of unique sub-task dispatch `message_id`s, in dispatch order |
+| `join_claim` | Group Join | token leasing the right to resume a completed group |
+| `join_claim_expires_at` | Group Join | claim expiry in Unix epoch milliseconds |
+| `joined` | Group Join | `"1"` after the claimed caller resume returns successfully |
 
 `protocol_version` is the rolling-upgrade hinge. A joiner reads it and branches:
 
@@ -60,7 +63,14 @@ This section is normative. Implementations in other runtimes must satisfy it exa
   `content` left untouched). An in-flight group created by a not-yet-upgraded dispatcher
   must keep being joined the way it was written, or a mixed fleet silently reinterprets it.
 
-`task_order` is written after the loop so it records exactly what was dispatched.
+All sub-task IDs are resolved and validated before group creation. `task_order` is written
+in the same group-creation write as `total` and `protocol_version`, before the first task is
+sent. A fast sibling can therefore never complete against a missing or partial order.
+
+The legacy batch-level `message_id` argument remains accepted. For a one-task batch it is
+used unchanged; for a multi-task batch it becomes a prefix (`<message_id>:0`,
+`<message_id>:1`, ...). Explicit per-task IDs override derived IDs, and any collision is
+rejected before Redis or stream state is written.
 
 ### Result hash — `task_group:{group_id}:results`
 
@@ -90,6 +100,10 @@ Stored value:
   "extra_payload": {}
 }
 ```
+
+A failed result also repeats `error` and `error_code` at the top level while retaining them
+inside `reply_data`. Existing consumers keep their current failure payload; helpers shared
+with `call_agent` can use the common top-level shape.
 
 ### Dispatch-time failure
 
@@ -121,15 +135,29 @@ failed.
 
 ```
 if header.task_group_id and group hash has `total`:
-    if `aborted` is set:            discard the reply, do not count it
+    if `aborted` is set:                 discard the reply, do not count it
     read `protocol_version`
-    store the result under (v2 ? header.parent_message_id : header.message_id)
-    completed = hincrby(completed, 1)
-    if completed < total:           the caller stays suspended
-    else if v2:
+    if v2:
+        atomically HSETNX the result and increment only when newly inserted
+        if completed < total:            the caller stays suspended
+        atomically claim the completed join (expired claims are recoverable)
+        if already claimed:              leave the stream entry unacknowledged
+        if already joined:               do not resume again
         aggregate in `task_order` order
-        resume the caller with reply_data = aggregate, content = ""
+        resume with reply_data = aggregate, content = ""
+        mark the claim `joined` after process_command returns or its failure is
+        terminally handled by the framework
+    else:
+        preserve the legacy store/count/resume behavior
 ```
+
+The store-and-count operation is one Redis script. A worker crash after counting but before
+`XACK` can therefore redeliver the same reply without incrementing `completed` twice. The
+join claim closes the second window: a completed group has one active resumer; a crash
+before successful resume can be recovered after the claim lease expires, while a reply
+redelivered after `joined=1` is ACKed without touching caller execution state. `WorkerRunner`
+uses `XAUTOCLAIM` to reclaim stream entries idle for the claim lease; claim contention is
+internal control flow and must not mark the caller execution `FAILED`.
 
 ### Aggregate shape
 
@@ -137,8 +165,11 @@ An ordered list, one entry per dispatched task, in `task_order` order:
 
 ```json
 [{"message_id": "...", "status": "...", "reply_data": ..., "content": "...",
-  "target_agent_type": "...", "metadata": {}, "extra_payload": {}}]
+  "target_agent_type": "...", "metadata": {}, "extra_payload": {},
+  "error": "...", "error_code": "..."}]
 ```
+
+`error` and `error_code` are present only for failed entries.
 
 Rules:
 - Order is dispatch order, never the Redis hash's iteration order.
@@ -158,8 +189,8 @@ Rules:
 - `route_policy: "SEND_ANYWAY"` per task restores the pre-unification behavior of queueing
   for an agent type whose workers have not started (control-stream consumer groups are
   created at id `0`, so such a message is delivered on start).
-- One `message_id` cannot be shared across a batch — results are keyed per sub-task. Pass a
-  per-task `message_id` instead.
+- A legacy batch-level `message_id` remains accepted and is expanded into unique per-task
+  IDs. Explicit per-task IDs are preferred when callers need exact identifiers.
 
 ### For operators — upgrade requirement
 
@@ -178,5 +209,6 @@ with an incomplete aggregate.
   the same bug is still reachable. Decision 2 exists to make it unrepresentable.
 - *Aggregate into `content` as well.* `content`'s list arm is the multimodal content-block
   position; reusing it for sub-task results is type abuse.
-- *Keep the top-level `error`/`error_code` keys on failed aggregate entries.* Diverges from
-  how real sub-agent failures arrive, which is exactly the asymmetry this ADR removes.
+- *Put failure details only in `reply_data`.* Preserves the raw worker-return shape but does
+  not let single-call and batch helpers share the specified top-level failure interface.
+  Failed aggregate entries therefore keep `reply_data` and repeat `error`/`error_code`.

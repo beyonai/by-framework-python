@@ -114,15 +114,22 @@ Entry anatomy:
   as the reply a sub-agent would have sent, and the worker flushes it after
   `process_command` returns. See `docs/adr/0001-unify-call-agent-and-call-agents-behavior.md`.
 
+- `src/by_framework/worker/task_group.py` — `TaskGroupStore`, the single Task
+  Group persistence and accounting module. It resolves collision-free sibling
+  IDs, writes the complete group contract before dispatch, atomically records
+  each unique reply, leases/commits Group Join, and supplies the ordered result
+  view used by both automatic resume and `collect_group_results`. Do not add
+  direct Task Group result writes or completion increments outside this module.
+
 - `src/by_framework/worker/worker.py` — `GatewayWorker`. `_enqueue_agent_return`'s
   header derivation is load-bearing in two directions: a reply's
   `header.message_id` is the *caller's* id (what `WorkerRunner` reattaches the
   suspended execution by) and its `header.parent_message_id` is the sub-task's
   own id (the only per-sibling-unique key, so what Group Join keys the result
-  hash by under protocol v2). `_handle_message`'s Group Join owns all Task
-  Group accounting and branches on `protocol_version`; `_aggregate_task_group`
-  orders by `task_order` and must log loudly rather than silently return a
-  short result set. See `docs/adr/0001-unify-call-agent-and-call-agents-behavior.md`.
+  hash by under protocol v2). `_handle_message`'s Group Join branches on
+  `protocol_version` and delegates the v2 contract to `TaskGroupStore`; legacy
+  unstamped groups retain their original behavior. See
+  `docs/adr/0001-unify-call-agent-and-call-agents-behavior.md`.
 
 - `src/by_framework/client/client.py` — `GatewayClient.send_message()` and
   friends; publishes commands to Redis control streams and drives registry
@@ -141,7 +148,10 @@ Entry anatomy:
 
 - `src/by_framework/worker/runner.py` — `WorkerRunner`, the consume loop:
   `XREADGROUP` fetch, command dispatch, resume/suspend bookkeeping, denylist
-  enforcement. `_active_agent_type_streams()` must read only the in-memory
+  enforcement. It also reclaims lease-expired pending entries with per-stream
+  `XAUTOCLAIM`; a contended Task Group Join stays pending without becoming an
+  execution failure, while a committed Join replay is ACK-only and cannot
+  rewrite caller registry state. `_active_agent_type_streams()` must read only the in-memory
   `self._denied_agent_types` frozenset — no Redis `SISMEMBER` call inside the
   hot consume-loop path; refreshed only by the heartbeat thread's
   `denylist_refresh` callback (bounded staleness ~1 heartbeat interval) (fix

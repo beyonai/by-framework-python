@@ -545,9 +545,15 @@ TASK_GROUP_FIELD_PROTOCOL_VERSION = "protocol_version"
 # Group Join aggregates in this order, and uses it to name results that never
 # arrived instead of silently returning a short list.
 TASK_GROUP_FIELD_TASK_ORDER = "task_order"
+# Group Join claim state. The final unique reply claims the right to resume
+# the caller; Redis redelivery observes this state instead of resuming twice.
+TASK_GROUP_FIELD_JOIN_CLAIM = "join_claim"
+TASK_GROUP_FIELD_JOIN_CLAIM_EXPIRES_AT = "join_claim_expires_at"
+TASK_GROUP_FIELD_JOINED = "joined"
 # Version 2: per-sub-task result keys, ordered aggregation into the caller's
 # reply_data, and content cleared on group resume.
 TASK_GROUP_PROTOCOL_V2 = "2"
+TASK_GROUP_JOIN_CLAIM_TTL_MS = 60 * 60 * 1000
 
 
 # --- Timing and Sleep Constants ---

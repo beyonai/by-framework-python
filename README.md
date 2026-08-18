@@ -416,7 +416,7 @@ Per task, every option `call_agent` takes is accepted, with the same defaults:
 | `target_agent_type` | — | required |
 | `content` | `""` | |
 | `extra_payload`, `metadata` | `{}` | |
-| `message_id` | generated | pass one per task; a batch cannot share one (results are keyed per sub-task) |
+| `message_id` | generated | pass one per task for exact IDs; a legacy batch-level value expands to `<id>:0`, `<id>:1`, ... |
 | `route_policy` | `FAIL_FAST` | `SEND_ANYWAY` queues for an agent type whose workers have not started yet |
 | `availability_timeout_ms` | `30000` | |
 | `region`, `priority` | `None`, `0` | |
@@ -424,7 +424,8 @@ Per task, every option `call_agent` takes is accepted, with the same defaults:
 Behavior worth knowing:
 
 - An unavailable target fails **that task only** — it is recorded as a `FAILED` entry in the
-  aggregate with `reply_data["error_code"]`, and its siblings still dispatch.
+  aggregate with top-level `error`/`error_code` and the same values retained in
+  `reply_data`, and its siblings still dispatch.
 - `call_agents([])` raises `ValueError` rather than silently succeeding.
 - A dispatch-time infrastructure failure marks the group aborted; late sibling replies are
   discarded instead of resuming a caller execution that already failed.

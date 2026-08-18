@@ -411,15 +411,15 @@ async def process_command(self, command, context):
 | `target_agent_type` | — | 必填 |
 | `content` | `""` | |
 | `extra_payload`、`metadata` | `{}` | |
-| `message_id` | 自动生成 | 需逐任务传入；整批不能共用一个（结果按子任务键存储） |
+| `message_id` | 自动生成 | 精确 ID 可逐任务传入；旧的批级值会展开为 `<id>:0`、`<id>:1`…… |
 | `route_policy` | `FAIL_FAST` | `SEND_ANYWAY` 可把消息排入尚未启动的 agent type |
 | `availability_timeout_ms` | `30000` | |
 | `region`、`priority` | `None`、`0` | |
 
 几点行为需要知道：
 
-- 目标不可用**只让该任务失败** —— 它会作为一条 `FAILED` 记录进入聚合结果（带
-  `reply_data["error_code"]`），其余任务照常派发。
+- 目标不可用**只让该任务失败** —— 它会作为一条 `FAILED` 记录进入聚合结果，顶层带
+  `error`/`error_code`，并在 `reply_data` 中保留相同值；其余任务照常派发。
 - `call_agents([])` 抛 `ValueError`，不再静默成功。
 - 派发过程中的基础设施故障会把该组标记为 aborted；迟到的兄弟回包被丢弃，不会去唤醒一个已经失败的
   调用方执行。

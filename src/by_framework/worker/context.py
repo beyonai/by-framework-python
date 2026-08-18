@@ -9,7 +9,6 @@ and inter-agent communication.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import time
 import uuid
@@ -23,15 +22,7 @@ from typing_extensions import deprecated
 from by_framework.common.constants import (
     EXECUTION_ID_PREFIX,
     MESSAGE_ID_PREFIX,
-    TASK_GROUP_FIELD_ABORTED,
-    TASK_GROUP_FIELD_COMPLETED,
-    TASK_GROUP_FIELD_PROTOCOL_VERSION,
-    TASK_GROUP_FIELD_SOURCE_AGENT,
-    TASK_GROUP_FIELD_TASK_ORDER,
-    TASK_GROUP_FIELD_TOTAL,
     TASK_GROUP_ID_PREFIX,
-    TASK_GROUP_PROTOCOL_V2,
-    TASK_GROUP_TTL_SECONDS,
     RedisKeys,
 )
 from by_framework.common.emitter import DataLayoutBuilder, GatewayDataEmitter
@@ -60,6 +51,8 @@ from by_framework.core.runtime import AgentRuntimeState
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.runtime.filestore.base import FileStorage
 from by_framework.trace.span_recorder import (SpanRecorder, TraceSpan, str_to_uint64)
+
+from .task_group import TaskGroupStore
 
 if TYPE_CHECKING:
     from by_framework.core.extensions import PluginRegistry
@@ -864,11 +857,10 @@ class AgentContext:
                        "priority": int,                    # default 0
                    }
             wait_for_reply: bool. If True, sets up Redis counters to wait for all.
-            message_id: Single-task convenience only. A Task Group keys its
-                   results by each sub-task's own dispatch message_id, so one
-                   id shared across a batch would make siblings overwrite each
-                   other; passing it with more than one task raises ValueError.
-                   Use the per-task "message_id" key instead.
+            message_id: Legacy batch-level message ID. For one task it is used
+                   unchanged; for multiple tasks it becomes the prefix for
+                   collision-free per-task IDs. A per-task ``message_id``
+                   overrides the derived value.
 
         Returns:
             {"status": "QUEUED", "task_group_id": str, "dispatched_tasks": [...]}
@@ -881,46 +873,35 @@ class AgentContext:
         if not tasks:
             raise ValueError("dispatch_group/call_agents requires at least one task")
 
-        if message_id and len(tasks) > 1:
-            raise ValueError(
-                "call_agents/dispatch_group cannot share one message_id across "
-                f"{len(tasks)} tasks: Task Group results are keyed by each "
-                "sub-task's own message_id, so the siblings would overwrite "
-                'each other. Pass a per-task "message_id" instead.'
-            )
+        task_message_ids = TaskGroupStore.resolve_message_ids(
+            [task.get("message_id") for task in tasks],
+            shared_message_id=message_id,
+            generate_message_id=self.generate_message_id,
+        )
 
         task_group_id = f"{TASK_GROUP_ID_PREFIX}{uuid.uuid4().hex[:8]}"
         total_tasks = len(tasks)
         group_dispatch_start_ts = int(time.time() * 1000)
-        group_key = RedisKeys.task_group(task_group_id)
+        task_group_store = TaskGroupStore(self.redis)
 
         if wait_for_reply:
-            await self.redis.hset(  # type: ignore
-                group_key,
-                mapping={
-                    TASK_GROUP_FIELD_TOTAL: str(total_tasks),
-                    TASK_GROUP_FIELD_COMPLETED: "0",
-                    TASK_GROUP_FIELD_SOURCE_AGENT: self.current_agent_id,
-                    TASK_GROUP_FIELD_PROTOCOL_VERSION: TASK_GROUP_PROTOCOL_V2,
-                },
+            await task_group_store.create(
+                task_group_id,
+                message_ids=task_message_ids,
+                source_agent_type=self.current_agent_id,
             )
-            # Ensure the key expires to prevent leak
-            await self.redis.expire(group_key, TASK_GROUP_TTL_SECONDS)
             self._is_suspended = True
         else:
             self._permission_transferred = True
 
         dispatched = []
         pending_failures: list[ResumeCommand] = []
-        for task in tasks:
+        for task, current_message_id in zip(tasks, task_message_ids):
             target_agent_type = task["target_agent_type"]
             content = task.get("content", "")
             extra_payload = task.get("extra_payload", {})
             metadata = dict(task.get("metadata", {}) or {})
 
-            current_message_id = (
-                task.get("message_id") or message_id or self.generate_message_id()
-            )
             try:
                 task_result = await self._dispatch_single_task(
                     target_agent_type=target_agent_type,
@@ -945,11 +926,7 @@ class AgentContext:
                 # replies queued so far are dropped with the raise: the worker
                 # only flushes them once process_command returns normally.
                 if wait_for_reply:
-                    await self.redis.hset(  # type: ignore
-                        group_key,
-                        TASK_GROUP_FIELD_ABORTED,
-                        "1",
-                    )
+                    await task_group_store.abort(task_group_id)
                 raise
 
             if task_result["status"] == AgentState.FAILED.value and wait_for_reply:
@@ -992,14 +969,6 @@ class AgentContext:
             dispatched.append(dispatched_task)
 
         if wait_for_reply:
-            # Written after the loop so it records exactly what was dispatched.
-            # Group Join aggregates in this order and uses it to name results
-            # that never arrived.
-            await self.redis.hset(  # type: ignore
-                group_key,
-                TASK_GROUP_FIELD_TASK_ORDER,
-                json.dumps([item["message_id"] for item in dispatched]),
-            )
             self._pending_group_replies.extend(pending_failures)
 
         # Record aggregate span for the entire group dispatch.
@@ -1038,6 +1007,12 @@ class AgentContext:
             "task_group_id": task_group_id,
             "dispatched_tasks": dispatched,
         }
+
+    def drain_pending_group_replies(self) -> list[ResumeCommand]:
+        """Return and clear synthetic Task Group replies queued by dispatch."""
+        replies = list(self._pending_group_replies)
+        self._pending_group_replies.clear()
+        return replies
 
     def _build_group_failure_reply(
         self,
@@ -1235,53 +1210,7 @@ class AgentContext:
                 "content": Optional[str]
             }
         """
-        if not task_group_id:
-            return []
-
-        results_key = RedisKeys.task_group_results(task_group_id)
-        group_key = RedisKeys.task_group(task_group_id)
-        field = TASK_GROUP_FIELD_TOTAL
-        total_str = await self.redis.hget(group_key, field)  # type: ignore
-        if total_str is None:
-            # No group found, try to get whatever results exist
-            total = float("inf")
-        else:
-            total = int(total_str)
-
-        # Ordering mirrors what Group Join hands the caller on resume: dispatch
-        # order, not the Redis hash's unspecified iteration order. A group from
-        # a pre-v2 dispatcher has no task_order and keeps hash order.
-        raw_order = await self.redis.hget(  # type: ignore
-            group_key, TASK_GROUP_FIELD_TASK_ORDER
+        return await TaskGroupStore(self.redis).collect(
+            task_group_id,
+            timeout=timeout,
         )
-        try:
-            order = json.loads(raw_order) if raw_order else []
-        except (TypeError, ValueError):
-            order = []
-
-        start_time = asyncio.get_running_loop().time()
-        results: list[dict[str, Any]] = []
-
-        while len(results) < total:
-            elapsed = asyncio.get_running_loop().time() - start_time
-            if elapsed >= timeout:
-                break
-
-            raw_results = await self.redis.hgetall(results_key)  # type: ignore
-            if raw_results:
-                ordered_ids = [m for m in order if m in raw_results]
-                ordered_ids += [m for m in raw_results if m not in set(order)]
-                results = [
-                    {
-                        "message_id": msg_id,
-                        **json.loads(raw_results[msg_id]),
-                    }
-                    for msg_id in ordered_ids
-                ]
-                if len(results) >= total:
-                    break
-
-            # Wait a bit before polling again
-            await asyncio.sleep(0.1)
-
-        return results

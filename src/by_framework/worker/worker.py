@@ -26,7 +26,6 @@ from by_framework.common.constants import (
     TASK_GROUP_FIELD_ABORTED,
     TASK_GROUP_FIELD_COMPLETED,
     TASK_GROUP_FIELD_PROTOCOL_VERSION,
-    TASK_GROUP_FIELD_TASK_ORDER,
     TASK_GROUP_FIELD_TOTAL,
     TASK_GROUP_PROTOCOL_V2,
     TASK_GROUP_TTL_SECONDS,
@@ -57,6 +56,12 @@ from by_framework.core.runtime.filestore.base import FileStorage
 from by_framework.trace.span_recorder import TraceSpan, str_to_uint64
 from by_framework.worker.context import AgentContext, current_agent_context_var
 from by_framework.worker.heartbeat import WorkerHeartbeat
+from by_framework.worker.task_group import (
+    TASK_GROUP_JOIN_PENDING_STATUS,
+    TASK_GROUP_JOINED_STATUS,
+    TaskGroupJoinState,
+    TaskGroupStore,
+)
 
 from .sandbox.hook_sandbox import active_workspace
 
@@ -304,68 +309,6 @@ class GatewayWorker(ABC):
             self._heartbeat = None
             logger.info("[%s] Heartbeat stopped", self.worker_id)
 
-    async def _aggregate_task_group(
-        self,
-        *,
-        group_key: str,
-        results_key: str,
-        task_group_id: str,
-        total: int,
-    ) -> list[dict[str, Any]]:
-        """Collect a completed Task Group's results in dispatch order.
-
-        Order comes from the group's `task_order` field rather than from
-        `hgetall`, whose order is unspecified — callers fanning out to N
-        agents need to know which result is which without matching by hand.
-
-        Results present in Redis but absent from `task_order` are appended
-        rather than dropped, and a short result set is logged loudly. Silently
-        returning fewer results than the caller dispatched is the failure mode
-        this repo's North Star rules out.
-        """
-        raw_results = await self.redis.hgetall(results_key)  # type: ignore
-        raw_order = await self.redis.hget(  # type: ignore
-            group_key, TASK_GROUP_FIELD_TASK_ORDER
-        )
-        try:
-            order = json.loads(raw_order) if raw_order else []
-        except (TypeError, ValueError):
-            logger.error(
-                "[%s] TaskGroup %s has an unreadable %s field (%r); falling "
-                "back to Redis hash order",
-                self.worker_id,
-                task_group_id,
-                TASK_GROUP_FIELD_TASK_ORDER,
-                raw_order,
-            )
-            order = []
-
-        aggregated: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for msg_id in order:
-            if msg_id in raw_results:
-                aggregated.append(
-                    {"message_id": msg_id, **json.loads(raw_results[msg_id])}
-                )
-                seen.add(msg_id)
-        for msg_id, data in raw_results.items():
-            if msg_id not in seen:
-                aggregated.append({"message_id": msg_id, **json.loads(data)})
-
-        if len(aggregated) != total:
-            missing = [msg_id for msg_id in order if msg_id not in raw_results]
-            logger.error(
-                "[%s] TaskGroup %s aggregated %d result(s) but expected %d; "
-                "missing sub-task message_ids=%s. Resuming the caller with an "
-                "incomplete result set.",
-                self.worker_id,
-                task_group_id,
-                len(aggregated),
-                total,
-                missing or "unknown",
-            )
-        return aggregated
-
     async def _flush_pending_group_replies(self, context: AgentContext) -> None:
         """Deliver replies for Task Group sub-tasks that never reached a worker.
 
@@ -380,11 +323,7 @@ class GatewayWorker(ABC):
         about a dispatch failure will time out, whereas raising here would
         also destroy the caller's own result.
         """
-        pending = getattr(context, "_pending_group_replies", None)
-        if not pending:
-            return
-        replies = list(pending)
-        pending.clear()
+        replies = context.drain_pending_group_replies()
         for reply in replies:
             try:
                 await self.redis.xadd(
@@ -687,6 +626,10 @@ class GatewayWorker(ABC):
         if execution:
             execution.context = context
         process_result: Any = None
+        joined_task_group_id = ""
+        join_claim_token = ""
+        join_process_started = False
+        join_marked = False
 
         logger.info(
             "[%s] Received message: %s (Trace: %s)",
@@ -782,45 +725,82 @@ class GatewayWorker(ABC):
                         )
                         is_v2 = protocol_version == TASK_GROUP_PROTOCOL_V2
 
-                        # Store result in Redis Hash for distributed access
-                        if isinstance(raw_command, ResumeCommand):
-                            result_data = {
-                                "status": raw_command.status,
-                                "reply_data": raw_command.reply_data,
-                                "content": raw_command.content,
-                                # This ResumeCommand flows FROM the sub-agent
-                                # back TO the caller, so its header's
-                                # source_agent_type is the sub-agent that
-                                # produced this result — i.e. the original
-                                # dispatch's target_agent_type.
-                                "target_agent_type": header.source_agent_type,
-                                "metadata": raw_command.header.metadata,
-                                "extra_payload": raw_command.extra_payload,
-                            }
-                            # _enqueue_agent_return sets a reply's header.
-                            # message_id to the ORIGINAL dispatch's
-                            # parent_message_id (the caller's own message
-                            # id) — identical across every sibling in this
-                            # Task Group. Keying results by that would let
-                            # siblings overwrite each other; header.
-                            # parent_message_id on the reply is the
-                            # sub-task's own dispatch-time message_id
-                            # instead, which is unique per task. Pre-v2
-                            # groups keep the old (colliding) key so their
-                            # readers see what they were written to expect.
-                            result_field = (
-                                header.parent_message_id if is_v2 else header.message_id
+                        assert isinstance(raw_command, ResumeCommand)
+                        result_data = TaskGroupStore.build_result(
+                            status=raw_command.status,
+                            reply_data=raw_command.reply_data,
+                            content=raw_command.content,
+                            # This ResumeCommand flows FROM the sub-agent
+                            # back TO the caller, so its header's
+                            # source_agent_type is the sub-agent that
+                            # produced this result — i.e. the original
+                            # dispatch's target_agent_type.
+                            target_agent_type=header.source_agent_type,
+                            metadata=raw_command.header.metadata,
+                            extra_payload=raw_command.extra_payload,
+                        )
+
+                        # Store and count a v2 result atomically. Redis Streams
+                        # may redeliver before XACK; a sibling must count once.
+                        if is_v2:
+                            task_group_store = TaskGroupStore(
+                                self.redis, worker_id=self.worker_id
                             )
+                            decision = await task_group_store.record_reply(
+                                header.task_group_id,
+                                task_message_id=header.parent_message_id,
+                                result=result_data,
+                            )
+                            if decision.state == TaskGroupJoinState.ABORTED:
+                                logger.warning(
+                                    "[%s] TaskGroup %s is aborted, discarding late "
+                                    "reply from sub-task message_id=%s",
+                                    self.worker_id,
+                                    header.task_group_id,
+                                    header.parent_message_id,
+                                )
+                                return AgentTaskResult(
+                                    status=(
+                                        f"{AgentState.CANCELLED.value}: "
+                                        "group_aborted"
+                                    )
+                                )
+                            if decision.state == TaskGroupJoinState.CLAIMED:
+                                # WorkerRunner recognizes this internal status
+                                # and deliberately leaves the stream entry
+                                # pending for lease recovery.
+                                return AgentTaskResult(
+                                    status=TASK_GROUP_JOIN_PENDING_STATUS
+                                )
+                            if decision.state == TaskGroupJoinState.JOINED:
+                                # ACK-only in WorkerRunner: do not mutate the
+                                # already terminal caller execution.
+                                return AgentTaskResult(status=TASK_GROUP_JOINED_STATUS)
+                            if decision.state == TaskGroupJoinState.WAITING:
+                                return AgentTaskResult(
+                                    status=(
+                                        f"{AgentState.QUEUED.value}: "
+                                        "waiting_for_group"
+                                    )
+                                )
+                            if decision.state == TaskGroupJoinState.NOT_FOUND:
+                                raise RuntimeError(
+                                    f"TaskGroup {header.task_group_id} disappeared "
+                                    "during Group Join"
+                                )
+                            completed = decision.completed
+                            join_claim_token = decision.claim_token
+                            joined_task_group_id = header.task_group_id
+                        else:
                             await self.redis.hset(  # type: ignore
                                 results_key,
-                                result_field,
+                                header.message_id,
                                 json.dumps(result_data),
                             )
                             await self.redis.expire(results_key, TASK_GROUP_TTL_SECONDS)
-
-                        completed = await self.redis.hincrby(  # type: ignore
-                            group_key, TASK_GROUP_FIELD_COMPLETED, 1
-                        )
+                            completed = await self.redis.hincrby(  # type: ignore
+                                group_key, TASK_GROUP_FIELD_COMPLETED, 1
+                            )
                         if completed < int(total_str):
                             logger.info(
                                 "[%s] TaskGroup %s completed %d/%s, waiting...",
@@ -839,10 +819,10 @@ class GatewayWorker(ABC):
                             total_str,
                         )
                         if is_v2 and isinstance(command, ResumeCommand):
-                            aggregated_results = await self._aggregate_task_group(
-                                group_key=group_key,
-                                results_key=results_key,
-                                task_group_id=header.task_group_id,
+                            aggregated_results = await TaskGroupStore(
+                                self.redis, worker_id=self.worker_id
+                            ).aggregate(
+                                header.task_group_id,
                                 total=int(total_str),
                             )
                             command.reply_data = aggregated_results
@@ -855,7 +835,17 @@ class GatewayWorker(ABC):
                 # await context.emit_state(
                 #     StateChangeEvent(state=AgentState.RESUMED.value)
                 # )
+            join_process_started = bool(joined_task_group_id)
             process_result = await self.process_command(command, context)
+            if joined_task_group_id:
+                joined = await TaskGroupStore(self.redis).mark_joined(
+                    joined_task_group_id, join_claim_token
+                )
+                if not joined:
+                    raise RuntimeError(
+                        f"TaskGroup {joined_task_group_id} lost its Group Join claim"
+                    )
+                join_marked = True
             # Only reached when process_command returned normally. If it
             # raised, call_agents has already marked the Task Group aborted
             # and these replies must NOT be sent — the caller execution they
@@ -975,6 +965,26 @@ class GatewayWorker(ABC):
             return AgentTaskResult(status=AgentState.CANCELLED.value)
 
         except Exception as e:  # pylint: disable=broad-exception-caught
+            if joined_task_group_id and not join_marked:
+                if not join_process_started:
+                    logger.exception(
+                        "TaskGroup %s failed before caller resume",
+                        joined_task_group_id,
+                    )
+                    return AgentTaskResult(status=TASK_GROUP_JOIN_PENDING_STATUS)
+                # process_command exceptions are terminally handled below and
+                # ACKed by WorkerRunner, so commit the join before returning
+                # FAILED. Otherwise a later duplicate could resume it again.
+                joined = await TaskGroupStore(self.redis).mark_joined(
+                    joined_task_group_id, join_claim_token
+                )
+                if not joined:
+                    logger.error(
+                        "TaskGroup %s could not commit Group Join",
+                        joined_task_group_id,
+                    )
+                    return AgentTaskResult(status=TASK_GROUP_JOIN_PENDING_STATUS)
+                join_marked = True
             error_msg = f"[{self.worker_id}] Task failed: {str(e)}"
             logger.error(error_msg)
             if has_source_agent:

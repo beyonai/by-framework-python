@@ -7,12 +7,21 @@ import pytest
 from by_framework.common.constants import (
     TASK_GROUP_FIELD_ABORTED,
     TASK_GROUP_FIELD_COMPLETED,
+    TASK_GROUP_FIELD_JOIN_CLAIM_EXPIRES_AT,
+    TASK_GROUP_FIELD_JOINED,
     TASK_GROUP_FIELD_TOTAL,
+    TASK_GROUP_JOIN_CLAIM_TTL_MS,
     RedisKeys,
 )
 from by_framework.core.protocol.commands import (ResumeCommand, command_from_dict)
 from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.worker.context import AgentContext
+from by_framework.worker.task_group import (
+    TASK_GROUP_JOIN_PENDING_STATUS,
+    TASK_GROUP_JOINED_STATUS,
+    TaskGroupJoinState,
+    TaskGroupStore,
+)
 from by_framework.worker.worker import GatewayWorker
 
 
@@ -57,9 +66,62 @@ class MockRedis:
     async def expire(self, name, ttl):
         return 1
 
-    async def xadd(self, name, fields):
+    async def xadd(self, name, fields, **_kwargs):
         self.streams.setdefault(name, []).append(fields)
         return "0-1"
+
+    async def eval(self, script, numkeys, *keys_and_args):
+        if numkeys == 1:
+            group_key, claim_field, claim_token, joined_field, expires_field = (
+                keys_and_args
+            )
+            group = self.data.setdefault(group_key, {})
+            if group.get(claim_field) != claim_token:
+                return 0
+            group[joined_field] = "1"
+            group.pop(claim_field, None)
+            group.pop(expires_field, None)
+            return 1
+
+        group_key, results_key, *args = keys_and_args
+        (
+            total_field,
+            completed_field,
+            aborted_field,
+            result_field,
+            result_json,
+            ttl,
+            joined_field,
+            claim_field,
+            expires_field,
+            now_ms,
+            claim_token,
+            claim_ttl_ms,
+        ) = args
+        assert "HSETNX" in script
+        assert int(ttl) > 0
+        group = self.data.setdefault(group_key, {})
+        total = int(group.get(total_field, 0))
+        completed = int(group.get(completed_field, 0))
+        if not total:
+            return [0, completed, total]
+        if group.get(aborted_field):
+            return [1, completed, total]
+
+        results = self.data.setdefault(results_key, {})
+        if result_field not in results:
+            results[result_field] = result_json
+            completed += 1
+            group[completed_field] = completed
+        if completed < total:
+            return [2, completed, total]
+        if group.get(joined_field) == "1":
+            return [5, completed, total]
+        if group.get(claim_field) and int(group.get(expires_field, 0)) > int(now_ms):
+            return [4, completed, total]
+        group[claim_field] = claim_token
+        group[expires_field] = int(now_ms) + int(claim_ttl_ms)
+        return [3, completed, total]
 
     async def smembers(self, name):
         # Every agent type is treated as having one online worker unless the
@@ -324,6 +386,8 @@ async def test_group_join_delivers_aggregate_even_with_partial_failure(tmp_path)
     aggregate = worker.received_commands[0].reply_data
     by_message_id = {item["message_id"]: item for item in aggregate}
     assert by_message_id[msg_b]["status"] == "FAILED"
+    assert by_message_id[msg_b]["error"] == "boom"
+    assert by_message_id[msg_b]["error_code"] is None
     assert by_message_id[msg_c]["status"] == "COMPLETED"
 
 
@@ -568,6 +632,8 @@ async def test_group_with_every_target_offline_still_resumes_caller(tmp_path):
     assert aggregate[0]["status"] == "FAILED"
     assert aggregate[0]["target_agent_type"] == "agent-b"
     assert aggregate[0]["reply_data"]["error_code"] == "AGENT_TYPE_UNAVAILABLE"
+    assert aggregate[0]["error_code"] == "AGENT_TYPE_UNAVAILABLE"
+    assert aggregate[0]["error"] == aggregate[0]["reply_data"]["error"]
 
 
 @pytest.mark.asyncio
@@ -663,6 +729,199 @@ async def test_group_aggregate_follows_dispatch_order_not_completion_order(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_group_join_counts_each_subtask_once_under_redelivery(tmp_path):
+    redis = MockRedis()
+    worker = _make_join_worker(redis, tmp_path, "test-redelivery")
+    caller_context = _make_caller_context(redis)
+
+    dispatch_result = await caller_context.call_agents(
+        tasks=[
+            {"target_agent_type": "agent-b", "content": "one"},
+            {"target_agent_type": "agent-c", "content": "two"},
+        ]
+    )
+    task_group_id = dispatch_result["task_group_id"]
+    msg_b, msg_c = (task["message_id"] for task in dispatch_result["dispatched_tasks"])
+    reply_b = _reply(
+        task_group_id=task_group_id,
+        task_message_id=msg_b,
+        source_agent_type="agent-b",
+        status="COMPLETED",
+        reply_data={"value": "b"},
+    )
+
+    await worker._handle_message(reply_b)
+    await worker._handle_message(reply_b)
+
+    assert worker.received_commands == []
+    assert (
+        redis.data[RedisKeys.task_group(task_group_id)][TASK_GROUP_FIELD_COMPLETED] == 1
+    )
+
+    reply_c = _reply(
+        task_group_id=task_group_id,
+        task_message_id=msg_c,
+        source_agent_type="agent-c",
+        status="COMPLETED",
+        reply_data={"value": "c"},
+    )
+    await worker._handle_message(reply_c)
+    await worker._handle_message(reply_c)
+
+    assert len(worker.received_commands) == 1
+    assert [item["message_id"] for item in worker.received_commands[0].reply_data] == [
+        msg_b,
+        msg_c,
+    ]
+    assert (
+        redis.data[RedisKeys.task_group(task_group_id)][TASK_GROUP_FIELD_COMPLETED] == 2
+    )
+
+
+@pytest.mark.asyncio
+async def test_group_join_claim_can_be_recovered_after_owner_crash():
+    redis = MockRedis()
+    store = TaskGroupStore(redis)
+    task_group_id = "tg-claim-recovery"
+    await store.create(
+        task_group_id,
+        message_ids=["msg-b", "msg-c"],
+        source_agent_type="caller-agent",
+    )
+
+    waiting = await store.record_reply(
+        task_group_id,
+        task_message_id="msg-b",
+        result={"status": "COMPLETED"},
+        now_ms=100,
+        claim_token="worker-one",
+    )
+    ready = await store.record_reply(
+        task_group_id,
+        task_message_id="msg-c",
+        result={"status": "COMPLETED"},
+        now_ms=100,
+        claim_token="worker-one",
+    )
+    still_claimed = await store.record_reply(
+        task_group_id,
+        task_message_id="msg-c",
+        result={"status": "COMPLETED"},
+        now_ms=100 + TASK_GROUP_JOIN_CLAIM_TTL_MS - 1,
+        claim_token="worker-two",
+    )
+    recovered = await store.record_reply(
+        task_group_id,
+        task_message_id="msg-c",
+        result={"status": "COMPLETED"},
+        now_ms=100 + TASK_GROUP_JOIN_CLAIM_TTL_MS + 1,
+        claim_token="worker-two",
+    )
+
+    assert waiting.state == TaskGroupJoinState.WAITING
+    assert ready.state == TaskGroupJoinState.READY
+    assert still_claimed.state == TaskGroupJoinState.CLAIMED
+    assert recovered.state == TaskGroupJoinState.READY
+    assert await store.mark_joined(task_group_id, recovered.claim_token) is True
+
+    joined = await store.record_reply(
+        task_group_id,
+        task_message_id="msg-c",
+        result={"status": "COMPLETED"},
+        now_ms=100 + TASK_GROUP_JOIN_CLAIM_TTL_MS + 2,
+        claim_token="worker-three",
+    )
+    assert joined.state == TaskGroupJoinState.JOINED
+
+
+@pytest.mark.asyncio
+async def test_group_join_does_not_ack_while_another_owner_holds_claim(tmp_path):
+    redis = MockRedis()
+    worker = _make_join_worker(redis, tmp_path, "test-claimed-redelivery")
+    caller_context = _make_caller_context(redis)
+    dispatch_result = await caller_context.call_agents(
+        tasks=[
+            {"target_agent_type": "agent-b", "content": "one"},
+            {"target_agent_type": "agent-c", "content": "two"},
+        ]
+    )
+    task_group_id = dispatch_result["task_group_id"]
+    msg_b, msg_c = (task["message_id"] for task in dispatch_result["dispatched_tasks"])
+    store = TaskGroupStore(redis)
+    await store.record_reply(
+        task_group_id,
+        task_message_id=msg_b,
+        result={"status": "COMPLETED"},
+        claim_token="crashed-worker",
+    )
+    claimed = await store.record_reply(
+        task_group_id,
+        task_message_id=msg_c,
+        result={"status": "COMPLETED"},
+        claim_token="crashed-worker",
+    )
+    assert claimed.state == TaskGroupJoinState.READY
+
+    reply_c = _reply(
+        task_group_id=task_group_id,
+        task_message_id=msg_c,
+        source_agent_type="agent-c",
+        status="COMPLETED",
+    )
+    pending = await worker._handle_message(reply_c)
+    assert pending.status == TASK_GROUP_JOIN_PENDING_STATUS
+    assert worker.received_commands == []
+
+    # Simulate lease expiry after the original owner died. The same pending
+    # Redis Stream entry can now be reclaimed and completes the caller once.
+    redis.data[RedisKeys.task_group(task_group_id)][
+        TASK_GROUP_FIELD_JOIN_CLAIM_EXPIRES_AT
+    ] = 0
+    await worker._handle_message(reply_c)
+    assert len(worker.received_commands) == 1
+
+
+@pytest.mark.asyncio
+async def test_group_join_commits_terminal_caller_failure(tmp_path):
+    redis = MockRedis()
+    worker = _make_join_worker(redis, tmp_path, "test-terminal-failure")
+    worker.process_command = AsyncMock(side_effect=ValueError("caller failed"))
+    caller_context = _make_caller_context(redis)
+    dispatch_result = await caller_context.call_agents(
+        tasks=[
+            {"target_agent_type": "agent-b", "content": "one"},
+            {"target_agent_type": "agent-c", "content": "two"},
+        ]
+    )
+    task_group_id = dispatch_result["task_group_id"]
+    msg_b, msg_c = (task["message_id"] for task in dispatch_result["dispatched_tasks"])
+    await worker._handle_message(
+        _reply(
+            task_group_id=task_group_id,
+            task_message_id=msg_b,
+            source_agent_type="agent-b",
+            status="COMPLETED",
+        )
+    )
+    reply_c = _reply(
+        task_group_id=task_group_id,
+        task_message_id=msg_c,
+        source_agent_type="agent-c",
+        status="COMPLETED",
+    )
+
+    failed = await worker._handle_message(reply_c)
+    assert failed.status == "FAILED"
+    assert (
+        redis.data[RedisKeys.task_group(task_group_id)][TASK_GROUP_FIELD_JOINED] == "1"
+    )
+
+    duplicate = await worker._handle_message(reply_c)
+    assert duplicate.status == TASK_GROUP_JOINED_STATUS
+    assert worker.process_command.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_group_without_protocol_stamp_keeps_legacy_join(tmp_path):
     """A group created by a pre-v2 dispatcher — an old worker still running
     during a rolling upgrade — must be joined the old way: results keyed by
@@ -733,11 +992,9 @@ async def test_group_join_logs_loudly_when_a_result_never_arrived(tmp_path):
     await redis.hincrby(RedisKeys.task_group(task_group_id), TASK_GROUP_FIELD_COMPLETED)
     # by-framework's logger sets propagate=False, so caplog's root handler
     # never sees these records; assert on the module logger directly.
-    with patch("by_framework.worker.worker.logger.error") as mock_error:
-        aggregate = await worker._aggregate_task_group(
-            group_key=RedisKeys.task_group(task_group_id),
-            results_key=RedisKeys.task_group_results(task_group_id),
-            task_group_id=task_group_id,
+    with patch("by_framework.worker.task_group.logger.error") as mock_error:
+        aggregate = await TaskGroupStore(redis, worker_id=worker.worker_id).aggregate(
+            task_group_id,
             total=2,
         )
 
@@ -775,14 +1032,12 @@ async def test_flush_is_skipped_when_process_command_raises(tmp_path):
 
     # agent-b's synthetic failure reply was built but never handed to the
     # context, so there is nothing for the worker to flush.
-    assert caller_context._pending_group_replies == []
+    assert caller_context.drain_pending_group_replies() == []
 
     # The group itself is marked aborted, so even the sibling that WAS sent
     # cannot resume the caller when its reply lands.
     group_hashes = [
-        bucket
-        for key, bucket in redis.data.items()
-        if TASK_GROUP_FIELD_TOTAL in bucket
+        bucket for key, bucket in redis.data.items() if TASK_GROUP_FIELD_TOTAL in bucket
     ]
     assert len(group_hashes) == 1
     assert group_hashes[0][TASK_GROUP_FIELD_ABORTED] == "1"

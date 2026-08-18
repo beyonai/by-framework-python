@@ -56,6 +56,31 @@ class ScriptedXreadgroupRedis:
         pass
 
 
+class ReclaimingRedis(ScriptedXreadgroupRedis):
+    def __init__(self, claimed_message):
+        super().__init__()
+        self.claimed_message = claimed_message
+        self.claim_calls = []
+
+    async def xautoclaim(
+        self,
+        name,
+        groupname,
+        consumername,
+        min_idle_time,
+        start_id="0-0",
+        count=None,
+    ):
+        self.claim_calls.append(
+            (name, groupname, consumername, min_idle_time, start_id, count)
+        )
+        if self.claimed_message is None:
+            return [b"0-0", [], []]
+        message = self.claimed_message
+        self.claimed_message = None
+        return [b"0-0", [message], []]
+
+
 @pytest.mark.asyncio
 async def test_fetch_messages_phase_one_returns_immediately_without_blocking():
     """If any active stream has a message, fetch_messages returns it via the
@@ -85,6 +110,27 @@ async def test_fetch_messages_phase_one_returns_immediately_without_blocking():
     for call in redis_mock.calls:
         assert len(call["streams"]) == 1
         assert call["block"] is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_messages_reclaims_stale_pending_entry_before_new_messages():
+    stream_name = RedisKeys.ctrl_stream("agent-a")
+    redis_mock = ReclaimingRedis(
+        (b"9-0", {b"data": b'{"header": {"message_id": "pending"}}'})
+    )
+    runner = WorkerRunner(
+        redis_client=redis_mock,
+        worker=_FixedAgentTypesWorker(["agent-a"]),
+        group_name="test_group",
+    )
+
+    messages = await runner.fetch_messages()
+
+    assert messages == [
+        (stream_name, "9-0", {"header": {"message_id": "pending"}})
+    ]
+    assert len(redis_mock.claim_calls) == 1
+    assert redis_mock.calls == []
 
 
 @pytest.mark.asyncio
