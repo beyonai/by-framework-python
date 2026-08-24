@@ -165,6 +165,7 @@ Pre-commit hooks are configured in `.pre-commit-config.yaml` and run isort, ruff
 | Redis connection setup, cluster-mode, or key-schema versioning (`RedisConfig`, `RedisKeys`, `_get_redis()`, admin-index writes) | `docs/architecture/redis-cluster-mode.md` |
 | Worker deployment/production-readiness — README's 部署 section, `__main__.py` CLI flags, `run_worker()`'s signature, or shutdown/signal handling | `docs/architecture/production-deployment.md` |
 | Worker readiness/health-check endpoint (`WorkerHealthServer`, `/readyz`, `--health-port`) — building it, or touching anything that changes what "ready" means | `docs/architecture/worker-readiness-endpoint.md` |
+| suspend/resume liveness — the wait index, its idempotency gate, or the sweep that resolves callers whose reply never arrives | `docs/architecture/suspend-resume-liveness.md` |
 
 ## Maintaining this map
 
