@@ -77,7 +77,10 @@ async def test_cancelled_resume_after_single_agent_as_tool_suspend_cleans_up(
     suspend_result = await worker_a._handle_message(  # pylint: disable=protected-access
         _command(), execution=_execution("exec-1", "worker-a")
     )
-    assert suspend_result.status == "QUEUED"
+    # The framework overrides a suspended caller's persisted status: the
+    # harness returns QUEUED so it can unwind, but the execution is parked
+    # on a sub-agent reply, not queued behind a worker.
+    assert suspend_result.status == "WAITING_AGENT"
 
     never_called = StubModelClient(turns=[])
     worker_b = _ChatWorker(
@@ -121,7 +124,7 @@ async def test_cancelled_resume_after_task_group_suspend_discards_all_stray_repl
     suspend_result = await worker_1._handle_message(  # pylint: disable=protected-access
         _command(), execution=_execution("exec-1", "worker-1")
     )
-    assert suspend_result.status == "QUEUED"
+    assert suspend_result.status == "WAITING_AGENT"
     assert await mock_redis.get(RedisKeys.harness_state("exec-1")) is not None
 
     # First straggler (sub_a) arrives after cancellation.

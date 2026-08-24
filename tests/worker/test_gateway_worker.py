@@ -11,6 +11,7 @@ from by_framework import (
     PluginRegistry,
     RunningExecution,
 )
+from by_framework.common.constants import RedisKeys
 from by_framework.core.protocol.agent_state import AgentState
 from by_framework.core.protocol.commands import AskAgentCommand, ResumeCommand
 from by_framework.core.protocol.content_type import SseMessageType
@@ -703,3 +704,435 @@ async def test_worker_logs_context_when_persisted_snapshot_is_missing(tmp_path):
     assert logged_args[3] == "s9"
     assert logged_args[4] == "m9"
     assert logged_args[5] == "snapshot-key-9"
+
+
+def _single_call_dispatch(task_group_id=""):
+    return AskAgentCommand(
+        header=MessageHeader(
+            message_id="child-msg",
+            session_id="sess-persist",
+            trace_id="trace-persist",
+            source_agent_type="agent-a",
+            target_agent_type="structured_agent",
+            parent_message_id="parent-msg",
+            task_group_id=task_group_id,
+            metadata={"request_id": "req-1"},
+        ),
+        content="hello",
+    )
+
+
+def _make_persist_worker(tmp_path, redis_mock):
+    workspace_manager = AsyncMock()
+    workspace_manager.setup_workspace.return_value = {
+        "private": str(tmp_path),
+        "public": str(tmp_path),
+    }
+    return StructuredResultWorker(
+        worker_id="test-persist",
+        redis_client=redis_mock,
+        registry=AsyncMock(),
+        workspace_manager=workspace_manager,
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_persists_single_call_result_before_replying(tmp_path):
+    """A single call_agent's result must survive its reply message.
+
+    mark_execution_finished() only stores error fields, so without this the
+    answer exists nowhere once the reply is lost. The copy reuses the Task
+    Group results Hash as a group of size one, and must be byte-compatible
+    with what the group-join path writes.
+    """
+    redis_mock = AsyncMock()
+    redis_mock.pipeline = MagicMock(
+        return_value=MagicMock(xadd=MagicMock(), execute=AsyncMock(return_value=[]))
+    )
+    worker = _make_persist_worker(tmp_path, redis_mock)
+
+    await worker._handle_message(_single_call_dispatch())
+
+    results_key = RedisKeys.task_group_results("tg-single-child-msg")
+    hset_calls = [
+        c for c in redis_mock.hset.await_args_list if c.args[0] == results_key
+    ]
+    assert len(hset_calls) == 1
+    field, raw = hset_calls[0].args[1], hset_calls[0].args[2]
+    assert field == "child-msg"
+    stored = json.loads(raw)
+
+    callback = ResumeCommand.from_dict(
+        json.loads(redis_mock.xadd.call_args.args[1]["data"])
+    )
+    assert stored == {
+        "status": callback.status,
+        "reply_data": callback.reply_data,
+        "content": callback.content,
+        "target_agent_type": callback.header.source_agent_type,
+        "metadata": callback.header.metadata,
+        "extra_payload": callback.extra_payload,
+    }
+    assert stored["status"] == AgentState.COMPLETED.value
+    assert stored["reply_data"] == {"answer": 42}
+    assert stored["target_agent_type"] == "structured_agent"
+    redis_mock.expire.assert_any_await(results_key, 86400)
+
+
+@pytest.mark.asyncio
+async def test_worker_result_persist_failure_does_not_block_callback(tmp_path):
+    """Losing the recovery copy only costs recoverability — the reply, which
+    is the only thing that resumes the caller, must still be sent."""
+    redis_mock = AsyncMock()
+    redis_mock.pipeline = MagicMock(
+        return_value=MagicMock(xadd=MagicMock(), execute=AsyncMock(return_value=[]))
+    )
+    redis_mock.hset = AsyncMock(side_effect=RuntimeError("redis down"))
+    worker = _make_persist_worker(tmp_path, redis_mock)
+
+    result = await worker._handle_message(_single_call_dispatch())
+
+    assert result.status == AgentState.COMPLETED.value
+    callback = ResumeCommand.from_dict(
+        json.loads(redis_mock.xadd.call_args.args[1]["data"])
+    )
+    assert callback.status == AgentState.COMPLETED.value
+    assert callback.header.target_agent_type == "agent-a"
+
+
+@pytest.mark.asyncio
+async def test_worker_does_not_write_single_call_result_for_group_member(tmp_path):
+    """A Task Group member's result is stored by the group-join path keyed
+    by the group id — writing a second copy here would fork the accounting."""
+    redis_mock = AsyncMock()
+    redis_mock.pipeline = MagicMock(
+        return_value=MagicMock(xadd=MagicMock(), execute=AsyncMock(return_value=[]))
+    )
+    worker = _make_persist_worker(tmp_path, redis_mock)
+
+    await worker._handle_message(_single_call_dispatch(task_group_id="tg-abc"))
+
+    single_key = RedisKeys.task_group_results("tg-single-child-msg")
+    assert not [c for c in redis_mock.hset.await_args_list if c.args[0] == single_key]
+    assert redis_mock.xadd.await_count == 1
+
+
+class SuspendingWorker(GatewayWorker):
+    """Stands in for a middle-of-chain agent: dispatches and unwinds."""
+
+    def get_agent_types(self):
+        return ["middle_agent"]
+
+    async def process_command(self, command, context):
+        context._is_suspended = True  # pylint: disable=protected-access
+        context._suspended_state = AgentState.WAITING_AGENT.value  # pylint: disable=protected-access
+        return {"status": AgentState.QUEUED.value}
+
+
+def _worker_with_workspace(cls, tmp_path, redis_mock, **kwargs):
+    workspace_manager = AsyncMock()
+    workspace_manager.setup_workspace.return_value = {
+        "private": str(tmp_path),
+        "public": str(tmp_path),
+    }
+    return cls(
+        worker_id="test-suspend",
+        redis_client=redis_mock,
+        registry=AsyncMock(),
+        workspace_manager=workspace_manager,
+        **kwargs,
+    )
+
+
+def _mock_redis():
+    redis_mock = AsyncMock()
+    redis_mock.pipeline = MagicMock(
+        return_value=MagicMock(xadd=MagicMock(), execute=AsyncMock(return_value=[]))
+    )
+    return redis_mock
+
+
+def _resumable_worker(cls, tmp_path, redis_mock):
+    """Worker plus the execution fields a resumed execution must carry.
+
+    A resume restores its agent-config snapshot from the execution record
+    (and fails loudly without one), so any resume test has to supply both.
+    """
+    plugin_registry = PluginRegistry()
+    plugin_registry._set_agent_configs([AgentConfig(agent_id="agent_v1")])  # pylint: disable=protected-access
+    snapshot = plugin_registry.get_agent_configs_snapshot()
+    worker = _worker_with_workspace(
+        cls, tmp_path, redis_mock, plugin_registry=plugin_registry
+    )
+    worker.registry.load_agent_configs_snapshot.return_value = snapshot
+    return worker, {
+        "agent_configs_snapshot_key": "snapshot-key",
+        "agent_configs_version": snapshot.version,
+    }
+
+
+def _ctrl_stream_replies(redis_mock, agent_type):
+    return [
+        ResumeCommand.from_dict(json.loads(call.args[1]["data"]))
+        for call in redis_mock.xadd.await_args_list
+        if call.args[0] == RedisKeys.ctrl_stream(agent_type)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_suspended_sub_agent_does_not_reply_to_its_caller(tmp_path):
+    """A suspended execution has no result yet.
+
+    Replying with the value the handler returned so it could unwind wakes the
+    caller early AND burns the single reply it was waiting for — the real
+    result then has nothing left to deliver it with.
+    """
+    redis_mock = _mock_redis()
+    worker = _worker_with_workspace(SuspendingWorker, tmp_path, redis_mock)
+
+    result = await worker._handle_message(
+        AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-b",
+                session_id="sess-chain",
+                trace_id="trace-chain",
+                source_agent_type="agent-a",
+                target_agent_type="middle_agent",
+                parent_message_id="msg-a",
+            ),
+            content="do it",
+        )
+    )
+
+    assert _ctrl_stream_replies(redis_mock, "agent-a") == []
+    assert result.status == AgentState.WAITING_AGENT.value
+
+
+@pytest.mark.asyncio
+async def test_suspended_execution_persists_as_waiting_agent(tmp_path):
+    """The status the framework persists comes from why it suspended, not from
+    whatever non-terminal value the handler happened to return."""
+    redis_mock = _mock_redis()
+    worker = _worker_with_workspace(SuspendingWorker, tmp_path, redis_mock)
+
+    result = await worker._handle_message(
+        AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-root",
+                session_id="sess-chain",
+                trace_id="trace-chain",
+                target_agent_type="middle_agent",
+            ),
+            content="do it",
+        )
+    )
+
+    assert result.status == AgentState.WAITING_AGENT.value
+
+
+class TransferringWorker(SuspendingWorker):
+    """Suspends the context but returns a terminal status anyway."""
+
+    async def process_command(self, command, context):
+        context._is_suspended = True  # pylint: disable=protected-access
+        context._suspended_state = (  # pylint: disable=protected-access
+            AgentState.WAITING_AGENT.value
+        )
+        return {"status": AgentState.COMPLETED.value}
+
+
+@pytest.mark.asyncio
+async def test_terminal_business_status_wins_over_suspension(tmp_path):
+    """A handler that reached a terminal state is finished, whatever it
+    dispatched along the way."""
+    redis_mock = _mock_redis()
+    worker = _worker_with_workspace(TransferringWorker, tmp_path, redis_mock)
+
+    result = await worker._handle_message(
+        AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-root",
+                session_id="sess-chain",
+                trace_id="trace-chain",
+                target_agent_type="middle_agent",
+            ),
+            content="do it",
+        )
+    )
+
+    assert result.status == AgentState.COMPLETED.value
+
+
+@pytest.mark.asyncio
+async def test_terminal_status_despite_suspension_still_replies(tmp_path):
+    """The other half of the rule above, and it has to be the same half.
+
+    Terminal wins for the persisted status, so nothing will ever resume this
+    execution to deliver the reply later. Skipping the reply on the suspension
+    flag alone would leave the caller parked on a reply that provably cannot
+    come — until a sweep bails it out, which is a fallback, not a design.
+    """
+    redis_mock = _mock_redis()
+    worker = _worker_with_workspace(TransferringWorker, tmp_path, redis_mock)
+
+    await worker._handle_message(
+        AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-b",
+                session_id="sess-chain",
+                trace_id="trace-chain",
+                source_agent_type="agent-a",
+                target_agent_type="middle_agent",
+                parent_message_id="msg-a",
+            ),
+            content="do it",
+        )
+    )
+
+    replies = _ctrl_stream_replies(redis_mock, "agent-a")
+    assert len(replies) == 1
+    assert replies[0].status == AgentState.COMPLETED.value
+
+
+@pytest.mark.asyncio
+async def test_resumed_execution_replies_to_its_own_caller_not_the_sub_agent(tmp_path):
+    """The resume that wakes B describes C, the hop below it.
+
+    Routing B's reply off that header sends B's result back down to C and
+    leaves A — the agent actually waiting — with nothing. The caller has to
+    come from the execution record the original dispatch wrote.
+    """
+    redis_mock = _mock_redis()
+    # No group tracker for B's own group, so the join path stays out of the way.
+    redis_mock.hget = AsyncMock(return_value=None)
+    worker, snapshot_fields = _resumable_worker(
+        StructuredResultWorker, tmp_path, redis_mock
+    )
+    resume_from_c = ResumeCommand(
+        header=MessageHeader(
+            message_id="msg-b",  # B's own id: what B is reattached by
+            session_id="sess-chain",
+            trace_id="trace-chain",
+            source_agent_type="agent-c",  # the sub-agent that just finished
+            target_agent_type="structured_agent",
+            parent_message_id="msg-c",  # B's sub-task
+            task_group_id="tg-of-c",  # B's OWN group, not the one B belongs to
+        ),
+        status=AgentState.COMPLETED.value,
+        reply_data={"from": "c"},
+    )
+    execution = RunningExecution(
+        execution_id="exec-b",
+        message_id="msg-b",
+        session_id="sess-chain",
+        worker_id="test-suspend",
+        task=AsyncMock(),
+        cancel_event=AsyncMock(),
+        is_resumed=True,
+        parent_message_id="msg-a",
+        existing_data={
+            "execution_id": "exec-b",
+            "message_id": "msg-b",
+            "session_id": "sess-chain",
+            "status": AgentState.WAITING_AGENT.value,
+            "source_agent_type": "agent-a",
+            "parent_message_id": "msg-a",
+            "task_group_id": "tg-of-a",
+            **snapshot_fields,
+        },
+    )
+
+    await worker._handle_message(resume_from_c, execution=execution)
+
+    assert _ctrl_stream_replies(redis_mock, "agent-c") == []
+    replies = _ctrl_stream_replies(redis_mock, "agent-a")
+    assert len(replies) == 1
+    reply = replies[0]
+    # A reattaches its suspended execution by message_id, and Group Join keys
+    # results by parent_message_id — both must describe the A->B hop.
+    assert reply.header.message_id == "msg-a"
+    assert reply.header.parent_message_id == "msg-b"
+    assert reply.header.task_group_id == "tg-of-a"
+    assert reply.header.source_agent_type == "structured_agent"
+    assert reply.reply_data == {"answer": 42}
+
+
+@pytest.mark.asyncio
+async def test_resumed_root_execution_replies_to_nobody(tmp_path):
+    """A root execution's record names no caller — inventing one from the
+    resume header would send its final answer to its own sub-agent."""
+    redis_mock = _mock_redis()
+    worker, snapshot_fields = _resumable_worker(
+        StructuredResultWorker, tmp_path, redis_mock
+    )
+    execution = RunningExecution(
+        execution_id="exec-root",
+        message_id="msg-root",
+        session_id="sess-chain",
+        worker_id="test-suspend",
+        task=AsyncMock(),
+        cancel_event=AsyncMock(),
+        is_resumed=True,
+        existing_data={
+            "source_agent_type": "",
+            "parent_message_id": "",
+            **snapshot_fields,
+        },
+    )
+
+    await worker._handle_message(
+        ResumeCommand(
+            header=MessageHeader(
+                message_id="msg-root",
+                session_id="sess-chain",
+                trace_id="trace-chain",
+                source_agent_type="agent-b",
+                target_agent_type="structured_agent",
+                parent_message_id="msg-b",
+            ),
+            status=AgentState.COMPLETED.value,
+            reply_data={"from": "b"},
+        ),
+        execution=execution,
+    )
+
+    assert _ctrl_stream_replies(redis_mock, "agent-b") == []
+
+
+@pytest.mark.asyncio
+async def test_failed_suspended_execution_still_replies_to_its_caller(tmp_path):
+    """Suspension only defers a reply while the execution can still produce
+    one. A crash means no resume is coming, so the caller must be told now."""
+
+    class FailingAfterDispatchWorker(GatewayWorker):
+
+        def get_agent_types(self):
+            return ["middle_agent"]
+
+        async def process_command(self, command, context):
+            context._is_suspended = True  # pylint: disable=protected-access
+            context._suspended_state = (  # pylint: disable=protected-access
+                AgentState.WAITING_AGENT.value
+            )
+            raise RuntimeError("boom")
+
+    redis_mock = _mock_redis()
+    worker = _worker_with_workspace(FailingAfterDispatchWorker, tmp_path, redis_mock)
+
+    await worker._handle_message(
+        AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-b",
+                session_id="sess-chain",
+                trace_id="trace-chain",
+                source_agent_type="agent-a",
+                target_agent_type="middle_agent",
+                parent_message_id="msg-a",
+            ),
+            content="do it",
+        )
+    )
+
+    replies = _ctrl_stream_replies(redis_mock, "agent-a")
+    assert len(replies) == 1
+    assert replies[0].status == AgentState.FAILED.value

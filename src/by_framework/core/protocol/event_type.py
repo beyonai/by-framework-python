@@ -21,6 +21,10 @@ class EventType(str, Enum):
         TASK_CREATE: Task creation event
         STEP_COMPLETE: Step completion event
         TASK_STOP: Task stop event
+        ORPHANED_REPLY: A reply that arrived for an already-resolved wait and
+            was therefore dropped by the idempotency gate. Diagnostic only —
+            the sub-agent did real work whose result nobody will consume, so
+            it must not vanish silently.
     """
 
     ANSWER_DELTA = "answerDelta"
@@ -32,3 +36,4 @@ class EventType(str, Enum):
     TASK_CREATE = "taskCreate"
     STEP_COMPLETE = "stepComplete"
     TASK_STOP = "taskStop"
+    ORPHANED_REPLY = "orphanedReply"

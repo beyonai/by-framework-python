@@ -1,9 +1,9 @@
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from by_framework import GatewayProcessor
+from by_framework import GatewayProcessor, RedisKeys
 from by_framework.core.protocol.commands import (
     AskAgentCommand,
     ResumeCommand,
@@ -130,3 +130,186 @@ async def test_processor_passes_layout_builder_to_agent_context():
         "agent": "agent-a",
         "message_id": "msg-layout",
     }
+
+
+@pytest.mark.asyncio
+async def test_processor_callback_message_id_is_the_callers_own_id():
+    """The caller reattaches its suspended execution by the reply's
+    message_id. A freshly minted id resolves to no execution, so the reply
+    starts a disconnected one and the caller waits forever."""
+    redis_mock = AsyncMock()
+    redis_mock.pipeline = MagicMock(
+        return_value=MagicMock(xadd=MagicMock(), execute=AsyncMock(return_value=[]))
+    )
+    processor = GatewayProcessor(worker_id="worker-1", redis_client=redis_mock)
+    original_command = AskAgentCommand(
+        header=MessageHeader(
+            message_id="msg-child",
+            session_id="sess-1",
+            trace_id="trace-1",
+            source_agent_type="agent-a",
+            target_agent_type="agent-b",
+            parent_message_id="msg-caller",
+            task_group_id="tg-1",
+        ),
+        content="hello",
+    )
+
+    await processor._enqueue_callback(original_command, "SUCCESS", {"answer": 42})
+
+    command = command_from_dict(json.loads(redis_mock.xadd.call_args.args[1]["data"]))
+    assert command.header.message_id == "msg-caller"
+    # The only per-sibling-unique value, which Group Join keys results by.
+    assert command.header.parent_message_id == "msg-child"
+    assert command.header.task_group_id == "tg-1"
+
+
+@pytest.mark.asyncio
+async def test_processor_does_not_reply_while_suspended():
+    """Same rule as GatewayWorker: a suspended execution has no result yet."""
+    redis_mock = AsyncMock()
+    redis_mock.pipeline = MagicMock(
+        return_value=MagicMock(xadd=MagicMock(), execute=AsyncMock(return_value=[]))
+    )
+    processor = GatewayProcessor(worker_id="worker-1", redis_client=redis_mock)
+
+    async def handler(command, context):
+        context._is_suspended = True
+        return {"status": "QUEUED"}
+
+    await processor.process(
+        AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-child",
+                session_id="sess-1",
+                trace_id="trace-1",
+                source_agent_type="agent-a",
+                target_agent_type="agent-b",
+                parent_message_id="msg-caller",
+            ),
+            content="hello",
+        ),
+        handler,
+    )
+
+    ctrl_writes = [
+        call
+        for call in redis_mock.xadd.await_args_list
+        if call.args[0] == RedisKeys.ctrl_stream("agent-a")
+    ]
+    assert ctrl_writes == []
+
+
+def _gate_redis(claimed: int, marked: int):
+    """AsyncMock Redis whose wait-index gate answers are pinned."""
+    redis_mock = AsyncMock()
+    redis_mock.pipeline = MagicMock(
+        return_value=MagicMock(
+            xadd=MagicMock(), expire=MagicMock(), execute=AsyncMock(return_value=[])
+        )
+    )
+    redis_mock.zrem = AsyncMock(return_value=claimed)
+    redis_mock.exists = AsyncMock(return_value=marked)
+    return redis_mock
+
+
+def _reply_command():
+    return ResumeCommand(
+        header=MessageHeader(
+            message_id="msg-caller",
+            session_id="sess-1",
+            trace_id="trace-1",
+            source_agent_type="agent-b",
+            target_agent_type="agent-a",
+            parent_message_id="msg-child",
+        ),
+        status="COMPLETED",
+        reply_data={"value": 1},
+    )
+
+
+@pytest.mark.asyncio
+async def test_processor_drops_a_reply_whose_wait_is_already_resolved():
+    """GatewayProcessor is a second, independent entry point for replies, so
+    it needs the same idempotency gate as WorkerRunner — a gate on only one
+    of two doors is not a gate."""
+    redis_mock = _gate_redis(claimed=0, marked=1)
+    processor = GatewayProcessor(worker_id="worker-1", redis_client=redis_mock)
+    handled = []
+
+    async def handler(command, context):
+        handled.append(command)
+        return {"status": "COMPLETED"}
+
+    result = await processor.process(_reply_command(), handler)
+
+    assert result is None
+    assert handled == []
+
+
+@pytest.mark.asyncio
+async def test_processor_keeps_a_reply_that_was_never_registered():
+    """RED LINE: no wait-index entry and no marker means "unknown", not
+    "duplicate" — replies dispatched before this version must still land."""
+    redis_mock = _gate_redis(claimed=0, marked=0)
+    processor = GatewayProcessor(worker_id="worker-1", redis_client=redis_mock)
+    handled = []
+
+    async def handler(command, context):
+        handled.append(command)
+        return {"status": "COMPLETED"}
+
+    await processor.process(_reply_command(), handler)
+
+    assert len(handled) == 1
+
+
+@pytest.mark.asyncio
+async def test_processor_resumed_execution_replies_to_the_original_caller():
+    """A resume's header names the sub-agent that just finished; the caller
+    owed a reply lives in the execution record."""
+    redis_mock = AsyncMock()
+    redis_mock.pipeline = MagicMock(
+        return_value=MagicMock(xadd=MagicMock(), execute=AsyncMock(return_value=[]))
+    )
+    processor = GatewayProcessor(worker_id="worker-1", redis_client=redis_mock)
+
+    async def handler(command, context):
+        return {"status": "COMPLETED", "reply_data": {"done": True}}
+
+    with patch(
+        "by_framework.core.registry.WorkerRegistry.get_execution_by_message_id",
+        new_callable=AsyncMock,
+    ) as lookup:
+        lookup.return_value = {
+            "source_agent_type": "agent-a",
+            "parent_message_id": "msg-caller",
+            "task_group_id": "tg-1",
+        }
+        await processor.process(
+            ResumeCommand(
+                header=MessageHeader(
+                    message_id="msg-middle",
+                    session_id="sess-1",
+                    trace_id="trace-1",
+                    source_agent_type="agent-c",
+                    target_agent_type="agent-b",
+                    parent_message_id="msg-sub",
+                ),
+                status="COMPLETED",
+                reply_data={"from": "c"},
+            ),
+            handler,
+        )
+
+    ctrl_writes = [
+        call
+        for call in redis_mock.xadd.await_args_list
+        if call.args[0] == RedisKeys.ctrl_stream("agent-a")
+    ]
+    assert len(ctrl_writes) == 1
+    reply = command_from_dict(json.loads(ctrl_writes[0].args[1]["data"]))
+    assert reply.header.message_id == "msg-caller"
+    assert reply.header.parent_message_id == "msg-middle"
+    assert reply.header.task_group_id == "tg-1"
+    assert reply.reply_data == {"done": True}

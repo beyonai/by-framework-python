@@ -59,7 +59,10 @@ async def test_multi_target_turn_dispatches_single_task_group_not_sequential_cal
         _command(), execution=_execution("exec-1", "worker-1")
     )
 
-    assert result.status == "QUEUED"
+    # The framework overrides a suspended caller's persisted status: the
+    # harness returns QUEUED so it can unwind, but the execution is parked
+    # on a sub-agent reply, not queued behind a worker.
+    assert result.status == "WAITING_AGENT"
 
     # Exactly one Task Group was created (one task_group hash key), not two
     # independent call_agent dispatches.
@@ -143,7 +146,7 @@ async def test_group_join_resumes_loop_with_each_result_mapped_to_its_tool_call(
     suspend_result = await worker_1._handle_message(  # pylint: disable=protected-access
         _command(), execution=_execution("exec-1", "worker-1")
     )
-    assert suspend_result.status == "QUEUED"
+    assert suspend_result.status == "WAITING_AGENT"
 
     # Extract the task_group_id from the single dispatched AskAgentCommand
     # payloads so the test can simulate both siblings replying.
@@ -267,7 +270,7 @@ async def test_duplicate_sub_agent_target_in_one_turn_keeps_both_results_distinc
     suspend_result = await worker_1._handle_message(  # pylint: disable=protected-access
         _command(), execution=_execution("exec-1", "worker-1")
     )
-    assert suspend_result.status == "QUEUED"
+    assert suspend_result.status == "WAITING_AGENT"
 
     # Recover each dispatch's own unique message_id from what was actually
     # sent on the wire, the same way a real sub-agent's reply would carry

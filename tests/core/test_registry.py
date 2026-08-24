@@ -839,6 +839,11 @@ async def test_get_worker_execution_summary_counts_state_and_liveness():
         "active": 1,
         "queued": 0,
         "running": 1,
+        # Suspended callers persist as WAITING_AGENT / WAITING_USER, not
+        # QUEUED, so they need their own counters or they disappear from the
+        # summary entirely.
+        "waiting_agent": 0,
+        "waiting_user": 0,
         "cancelling": 0,
         "completed": 1,
         "failed": 0,

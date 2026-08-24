@@ -2135,12 +2135,21 @@ def _worker_recommendations(
 def _execution_recommendations(
     execution: dict[str, Any], failures: list[dict[str, Any]]
 ) -> list[str]:
-    status = str(execution.get("status", ""))
+    # A suspended caller persists as WAITING_AGENT/WAITING_USER (possibly
+    # decorated with ": <reason>"), where it used to persist as QUEUED —
+    # without stripping and listing them, every suspended execution would be
+    # told it "已进入终态".
+    status = str(execution.get("status", "")).split(":", 1)[0].strip()
     if status == "FAILED" or failures:
         return [
             "查看 failure error_type/error_message，确认失败阶段。",
             "使用 session_id 或 trace_id 打开会话页面检查调用瀑布。",
             "如果同类失败重复出现，先隔离对应 Worker 或 Agent 类型。",
+        ]
+    if status in {"WAITING_AGENT", "WAITING_USER"}:
+        return [
+            "该执行已挂起等待回复，确认被调用方（子 Agent 或用户）是否仍然存活。",
+            "检查等待索引 sweeper 是否启用，否则回复丢失时不会有兜底唤醒。",
         ]
     if status in {"RUNNING", "QUEUED", "CANCELLING"}:
         return [
