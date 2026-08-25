@@ -30,6 +30,7 @@ from by_framework.core.protocol.commands import (
 )
 from by_framework.core.protocol.results import AgentTaskResult
 from by_framework.core.registry import ExecutionCompletionFields
+from by_framework.core.wait_gate import consume_wait_entry, emit_orphaned_reply
 from by_framework.trace.span_recorder import (
     SpanRecorder,
     TraceSpan,
@@ -100,6 +101,7 @@ class WorkerRunner:
         self._control_task = None
         self._consumer_task: Optional[asyncio.Task] = None
         self._metrics_collector_task: Optional[asyncio.Task] = None
+        self._wait_sweeper_task: Optional[asyncio.Task] = None
         self._running_tasks: set[asyncio.Task] = set()
         self._tracker = ExecutionTracker()
         # Admin-controlled lifecycle: "active" | "suspended" | "evicted"
@@ -515,6 +517,34 @@ class WorkerRunner:
             if not header.message_id:
                 header.message_id = generate_message_id()
 
+            if isinstance(command, ResumeCommand):
+                # Idempotency gate. Must stay HERE: before the execution
+                # lookup below and before GatewayWorker's Task Group join
+                # (which HINCRBYs `completed`, so a duplicate would push it
+                # past `total` and aggregate a second time). Being upstream
+                # of the worker is what makes one gate cover both.
+                gate = await consume_wait_entry(self.redis, command)
+                if not gate.allow:
+                    logger.warning(
+                        "[%s] Dropping reply for an already-resolved wait "
+                        "(%s): message_id=%s, child_message_id=%s, "
+                        "task_group_id=%s, session_id=%s",
+                        self.worker.worker_id,
+                        gate.reason,
+                        header.message_id,
+                        header.parent_message_id,
+                        header.task_group_id,
+                        header.session_id,
+                    )
+                    await emit_orphaned_reply(
+                        self.redis,
+                        command,
+                        worker_id=self.worker.worker_id,
+                        reason=gate.reason,
+                    )
+                    await self.redis.xack(stream_name, self.group_name, msg_id)
+                    return
+
             registry = getattr(self.worker, "registry", None)
             existing_execution = None
 
@@ -561,6 +591,13 @@ class WorkerRunner:
             if cancel_requested:
                 cancel_event.set()
 
+            # QUEUED is the only status an execution can carry while it is
+            # still waiting to be picked up for the FIRST time: the caller
+            # writes it in initialize_execution() and nothing else does.
+            # Anything else — RUNNING, WAITING_AGENT, WAITING_USER, a terminal
+            # state — means this execution has already been through a worker,
+            # so the record (parent_message_id, config snapshot) must be
+            # restored rather than re-derived from the message header.
             is_resumed_execution = isinstance(command, ResumeCommand) or bool(
                 existing_execution
                 and existing_execution.get("status") != AgentState.QUEUED.value
@@ -974,6 +1011,35 @@ class WorkerRunner:
                 )
             except Exception as metrics_collector_err:  # pylint: disable=broad-exception-caught
                 logger.debug("MetricsCollector not started: %s", metrics_collector_err)
+            try:
+                from by_framework.core.wait_sweeper import WaitIndexSweeper
+
+                # Two switches: compensation is opt-in
+                # (BY_FRAMEWORK_WAIT_SWEEPER_ENABLED), pruning of abandoned
+                # entries is on by default, so the default deployment still
+                # starts this task — without it the wait index grows without
+                # bound, since only a reply or a sweep ever removes an entry.
+                # Every worker runs one and claims shards opportunistically,
+                # so the sweep survives any single worker dying without
+                # electing a leader.
+                self._wait_sweeper_task = asyncio.create_task(
+                    WaitIndexSweeper(
+                        self.redis,
+                        worker_id=self.worker.worker_id,
+                        registry=getattr(self.worker, "registry", None),
+                    ).run()
+                )
+            except Exception as wait_sweeper_err:  # pylint: disable=broad-exception-caught
+                # Warn rather than debug, unlike the metrics collector above:
+                # losing this one silently loses the only thing that ever
+                # resolves a caller whose reply never arrives, and an operator
+                # who deliberately switched it on would otherwise see nothing.
+                logger.warning(
+                    "[%s] WaitIndexSweeper not started, suspended callers will "
+                    "not be resolved by this worker: %s",
+                    self.worker.worker_id,
+                    wait_sweeper_err,
+                )
             logger.info(
                 "[%s] Runner started with max_concurrency=%d, waiting for tasks...",
                 self.worker.worker_id,
@@ -1019,6 +1085,10 @@ class WorkerRunner:
             self._metrics_collector_task.cancel()
             await asyncio.gather(self._metrics_collector_task, return_exceptions=True)
             self._metrics_collector_task = None
+        if self._wait_sweeper_task:
+            self._wait_sweeper_task.cancel()
+            await asyncio.gather(self._wait_sweeper_task, return_exceptions=True)
+            self._wait_sweeper_task = None
         if self._consumer_task:
             self._consumer_task.cancel()
             await asyncio.gather(self._consumer_task, return_exceptions=True)

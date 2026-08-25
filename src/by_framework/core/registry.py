@@ -239,6 +239,33 @@ async def check_worker_online(
     return is_legacy or last_seen > 0
 
 
+async def acquire_scoped_lock(
+    redis: Redis,
+    key: str,
+    token: str,
+    ttl_seconds: int,
+) -> bool:
+    """Claim `key` for `token` if nobody holds it (Redlock acquire half).
+
+    The stored value must stay a cjson-decodable object carrying a "token"
+    field: `_REFRESH_LOCK_SCRIPT` / `_RELEASE_LOCK_SCRIPT` parse it that way,
+    and a bare token string would decode as unparseable legacy data, making
+    the holder unable to release its own lock.
+    """
+    stored = await redis.set(
+        key,
+        json.dumps({"token": token}, separators=(",", ":")),
+        nx=True,
+        ex=ttl_seconds,
+    )
+    return bool(stored)
+
+
+async def release_scoped_lock(redis: Redis, key: str, token: str) -> bool:
+    """Release a lock taken with acquire_scoped_lock(), if still owned."""
+    return bool(await redis.eval(_RELEASE_LOCK_SCRIPT, 1, key, token or ""))
+
+
 async def check_agent_type_online(
     redis: Redis,
     agent_type: str,
@@ -1225,6 +1252,10 @@ class WorkerRegistry:
             "active": self._get_int_hash_value(raw_counts, "active_count"),
             "queued": self._get_int_hash_value(raw_counts, "queued_count"),
             "running": self._get_int_hash_value(raw_counts, "running_count"),
+            "waiting_agent": self._get_int_hash_value(
+                raw_counts, "waiting_agent_count"
+            ),
+            "waiting_user": self._get_int_hash_value(raw_counts, "waiting_user_count"),
             "cancelling": self._get_int_hash_value(raw_counts, "cancelling_count"),
             "completed": self._get_int_hash_value(raw_counts, "completed_count"),
             "failed": self._get_int_hash_value(raw_counts, "failed_count"),
@@ -1245,6 +1276,10 @@ class WorkerRegistry:
         status_counts = {
             "QUEUED": counts["queued"],
             "RUNNING": counts["running"],
+            # Suspended callers persist as WAITING_* rather than QUEUED; these
+            # rows keep them visible (zero-valued entries are filtered below).
+            "WAITING_AGENT": counts["waiting_agent"],
+            "WAITING_USER": counts["waiting_user"],
             "CANCELLING": counts["cancelling"],
             "COMPLETED": counts["completed"],
             "FAILED": counts["failed"],

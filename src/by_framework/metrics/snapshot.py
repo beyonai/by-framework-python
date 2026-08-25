@@ -15,7 +15,16 @@ from by_framework.common.logger import logger
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.registry import WorkerRegistry
 
-STATUS_ORDER = ("QUEUED", "RUNNING", "CANCELLING", "COMPLETED", "FAILED", "CANCELLED")
+STATUS_ORDER = (
+    "QUEUED",
+    "RUNNING",
+    "WAITING_AGENT",
+    "WAITING_USER",
+    "CANCELLING",
+    "COMPLETED",
+    "FAILED",
+    "CANCELLED",
+)
 
 REDIS_HISTORY_KEY = "by_framework:obs:history"
 REDIS_HISTORY_TTL_MS = 2 * 60 * 60 * 1000  # Keep two hours of trend data.
@@ -1351,6 +1360,8 @@ async def _build_lightweight_worker_summary(
         "active": _get_hash_int(raw_counts, "active_count"),
         "queued": _get_hash_int(raw_counts, "queued_count"),
         "running": _get_hash_int(raw_counts, "running_count"),
+        "waiting_agent": _get_hash_int(raw_counts, "waiting_agent_count"),
+        "waiting_user": _get_hash_int(raw_counts, "waiting_user_count"),
         "cancelling": _get_hash_int(raw_counts, "cancelling_count"),
         "completed": _get_hash_int(raw_counts, "completed_count"),
         "failed": _get_hash_int(raw_counts, "failed_count"),
@@ -1359,6 +1370,11 @@ async def _build_lightweight_worker_summary(
     status_counts = {
         "QUEUED": counts["queued"],
         "RUNNING": counts["running"],
+        # Suspended callers stopped being counted as QUEUED once the framework
+        # started persisting WAITING_*; without these rows they would vanish
+        # from every worker summary instead of moving column.
+        "WAITING_AGENT": counts["waiting_agent"],
+        "WAITING_USER": counts["waiting_user"],
         "CANCELLING": counts["cancelling"],
         "COMPLETED": counts["completed"],
         "FAILED": counts["failed"],
@@ -2141,7 +2157,19 @@ def _build_agent_health(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 "recent_active_executions": sum(
                     1
                     for execution in recent_executions
-                    if execution.get("status") in ("QUEUED", "RUNNING", "CANCELLING")
+                    # WAITING_* included for the same reason the worker
+                    # summary lists them: a suspended caller used to persist
+                    # as QUEUED, so leaving them out would silently drop
+                    # in-flight executions from this count rather than move
+                    # them to another column.
+                    if execution.get("status")
+                    in (
+                        "QUEUED",
+                        "RUNNING",
+                        "WAITING_AGENT",
+                        "WAITING_USER",
+                        "CANCELLING",
+                    )
                 ),
                 "recent_failed_executions": int(
                     recent_status_counts.get("FAILED", 0) or 0
@@ -2469,7 +2497,10 @@ def _trace_status(spans: list[dict[str, Any]]) -> str:
     statuses = {str(span.get("status", "")) for span in spans}
     if "FAILED" in statuses:
         return "FAILED"
-    if "RUNNING" in statuses or "QUEUED" in statuses:
+    # WAITING_* are the suspended-but-alive statuses (a caller parked on
+    # call_agent/ask_user). Omitting them would let a trace whose deepest hop
+    # is still waiting fall through to COMPLETED.
+    if statuses & {"RUNNING", "QUEUED", "WAITING_AGENT", "WAITING_USER"}:
         return "RUNNING"
     if statuses:
         return "COMPLETED"

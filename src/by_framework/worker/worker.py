@@ -13,6 +13,7 @@ import time
 import traceback
 import uuid
 from abc import ABC, abstractmethod
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
@@ -22,19 +23,21 @@ if TYPE_CHECKING:
 
 from by_framework.common.config import WorkerConfig
 from by_framework.common.constants import (
+    CLIENT_SOURCE_AGENT_TYPE,
     MESSAGE_ID_PREFIX,
     TASK_GROUP_FIELD_ABORTED,
     TASK_GROUP_FIELD_COMPLETED,
     TASK_GROUP_FIELD_TOTAL,
     TASK_GROUP_TTL_SECONDS,
     RedisKeys,
+    single_call_task_group_id,
 )
 from by_framework.common.emitter import DataLayoutBuilder
 from by_framework.common.logger import logger
 from by_framework.common.redis_client import Redis, get_redis
 from by_framework.core.extensions import AgentConfigsSnapshot, PluginRegistry
 from by_framework.core.extensions.agent_config_audit import build_agent_config_audit_projection
-from by_framework.core.protocol.agent_state import AgentState
+from by_framework.core.protocol.agent_state import (AgentState, is_terminal_state)
 from by_framework.core.protocol.commands import (
     CancelTaskCommand,
     GatewayCommand,
@@ -51,6 +54,7 @@ from by_framework.core.protocol.results import (
 )
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.runtime.filestore.base import FileStorage
+from by_framework.core.wait_reply import flush_pending_group_replies
 from by_framework.trace.span_recorder import TraceSpan, str_to_uint64
 from by_framework.worker.context import AgentContext, current_agent_context_var
 from by_framework.worker.heartbeat import WorkerHeartbeat
@@ -315,6 +319,76 @@ class GatewayWorker(ABC):
             self._heartbeat = None
             logger.info("[%s] Heartbeat stopped", self.worker_id)
 
+    @staticmethod
+    def _resolve_reply_command(
+        command: GatewayCommand,
+        execution: Optional["RunningExecution"] = None,
+    ) -> Optional[GatewayCommand]:
+        """Return the command whose caller this execution owes a reply to.
+
+        ``None`` means "nobody is waiting" — a root execution, or a resume we
+        could not attribute.
+
+        For a fresh dispatch the answer is the command itself: its header's
+        ``source_agent_type`` is the caller.
+
+        For a **resumed** execution it is not. The `ResumeCommand` that woke us
+        describes the hop that finished (its ``source_agent_type`` is our
+        *sub*-agent, its ``parent_message_id`` is our sub-task, and its
+        ``task_group_id`` is our sub-group) — replying against that header
+        would send our result back down to the sub-agent we just called. The
+        caller is instead whatever the ORIGINAL dispatch recorded in the
+        execution registry via ``initialize_execution()``, which is why this
+        rebuilds the original dispatch header from the execution snapshot.
+        Treating "is a resume" as "has no caller" is what used to make an
+        A -> B -> C chain silently drop B's result on the floor.
+
+        A root execution's record names ``CLIENT_SOURCE_AGENT_TYPE`` as its
+        source, which is a marker rather than an agent type — it has to be
+        excluded explicitly, or every client-dispatched execution that ever
+        resumes (an ``ask_user`` round is the common one) would post its result
+        to a control stream nobody consumes AND stop emitting the end-of-stream
+        event the user is actually waiting on.
+        """
+        header = command.header
+        if not isinstance(command, ResumeCommand):
+            return command if header.source_agent_type else None
+
+        snapshot = getattr(execution, "existing_data", None) or {}
+        caller_agent_type = str(snapshot.get("source_agent_type", "") or "")
+        if not caller_agent_type or caller_agent_type == CLIENT_SOURCE_AGENT_TYPE:
+            return None
+        return replace(
+            command,
+            header=replace(
+                header,
+                source_agent_type=caller_agent_type,
+                parent_message_id=str(snapshot.get("parent_message_id", "") or ""),
+                task_group_id=str(snapshot.get("task_group_id", "") or ""),
+            ),
+        )
+
+    @staticmethod
+    def _apply_suspended_status(
+        task_result: AgentTaskResult,
+        context: Optional[AgentContext],
+    ) -> AgentTaskResult:
+        """Persist a suspended execution as WAITING_AGENT / WAITING_USER.
+
+        The framework, not the business code, decides this: `AgentContext`
+        knows an execution suspended because it is what suspended it, whereas
+        a business handler is free to return anything (the in-tree agent
+        harness returns plain ``QUEUED``, which is indistinguishable from
+        "still queued behind a worker" once persisted).
+
+        A terminal status wins: a handler that reached COMPLETED/FAILED/
+        CANCELLED after dispatching is finished, whatever it dispatched.
+        """
+        suspended_state = str(getattr(context, "_suspended_state", "") or "")
+        if not suspended_state or is_terminal_state(task_result.status):
+            return task_result
+        return replace(task_result, status=suspended_state)
+
     async def _enqueue_agent_return(
         self,
         command: GatewayCommand,
@@ -386,6 +460,7 @@ class GatewayWorker(ABC):
                 command,
                 callback_command,
             )
+        await self._persist_single_call_result(header, callback_command)
         try:
             await self.redis.xadd(
                 RedisKeys.ctrl_stream(callback_command.header.target_agent_type),
@@ -405,6 +480,62 @@ class GatewayWorker(ABC):
                 context,
                 command,
                 callback_command,
+            )
+
+    async def _persist_single_call_result(
+        self,
+        header: MessageHeader,
+        callback_command: ResumeCommand,
+    ) -> None:
+        """Persist a single (non-group) call_agent result before replying.
+
+        mark_execution_finished() only stores error fields, so a lost reply
+        message used to lose the answer with it. A Task Group already keeps
+        full results in task_group_results; a single call reuses that exact
+        storage as a group of size 1 (see single_call_task_group_id), which
+        keeps recovery on one code path. The reply message then carries no
+        information that isn't recoverable from Redis.
+
+        The stored payload must stay isomorphic to the group-join
+        result_data built in _handle_message, since both feed the same
+        readers. The field is the sub-task's own message_id — identical to
+        the reply's header.parent_message_id the group path keys by.
+
+        Fail-soft: losing the copy only costs recoverability, so a Redis
+        error here must never stop the reply from being sent.
+        """
+        if header.task_group_id:
+            return  # Real Task Group: _handle_message's join already stores it.
+        child_message_id = header.message_id
+        if not child_message_id:
+            return
+        try:
+            results_key = RedisKeys.task_group_results(
+                single_call_task_group_id(child_message_id)
+            )
+            result_data = {
+                "status": callback_command.status,
+                "reply_data": callback_command.reply_data,
+                "content": callback_command.content,
+                # The sub-agent that produced this result, i.e. the original
+                # dispatch's target_agent_type — which is what the reply
+                # carries as its source_agent_type.
+                "target_agent_type": callback_command.header.source_agent_type,
+                "metadata": callback_command.header.metadata,
+                "extra_payload": callback_command.extra_payload,
+            }
+            await self.redis.hset(  # type: ignore
+                results_key,
+                child_message_id,
+                json.dumps(result_data),
+            )
+            await self.redis.expire(results_key, TASK_GROUP_TTL_SECONDS)
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "[%s] Failed to persist single-call result for message_id=%s: %s",
+                self.worker_id,
+                child_message_id,
+                error,
             )
 
     @staticmethod
@@ -540,8 +671,8 @@ class GatewayWorker(ABC):
         # suspended/waiting state”, so they are uniformly handled in lifecycle and state
         # recovery logic (like reloading workspace, persisting state, etc.).
         is_agent_return = isinstance(raw_command, ResumeCommand)
-        source_agent_type = header.source_agent_type
-        has_source_agent = bool(source_agent_type) and not is_agent_return
+        reply_command = self._resolve_reply_command(raw_command, execution)
+        has_source_agent = reply_command is not None
 
         # Get workspace dir from workspace_manager if available
         # Note: We don't use hasattr check because it doesn't work well with mocks
@@ -727,8 +858,13 @@ class GatewayWorker(ABC):
                                 completed,
                                 total_str,
                             )
+                            # Still waiting on the rest of the group: this
+                            # caller is suspended, not queued behind a worker.
                             return AgentTaskResult(
-                                status=f"{AgentState.QUEUED.value}: waiting_for_group"
+                                status=(
+                                    f"{AgentState.WAITING_AGENT.value}"
+                                    ": waiting_for_group"
+                                )
                             )
                         logger.info(
                             "[%s] TaskGroup %s ALL COMPLETED (%s)!",
@@ -750,16 +886,39 @@ class GatewayWorker(ABC):
                 #     StateChangeEvent(state=AgentState.RESUMED.value)
                 # )
             process_result = await self.process_command(command, context)
+            # Only reached when process_command returned normally. Had it
+            # raised, call_agents would already have marked the Task Group
+            # aborted and these stand-ins must NOT go out: the caller
+            # execution they would resume is the one that just failed.
+            await flush_pending_group_replies(self.redis, context, self.worker_id)
             task_result = normalize_process_result(process_result)
 
             # Determine the execution status to return
             # Prefer extracting status from business return results
-            # (e.g., QUEUED, WAITING_USER, etc.)
+            # (e.g., QUEUED, WAITING_USER, etc.), except that a suspension the
+            # framework itself performed overrides it — see
+            # _apply_suspended_status.
+            # "Suspended" has to mean the same thing here as it does for the
+            # persisted status: a handler that reached a terminal state is
+            # finished whatever it dispatched, and it will never be resumed to
+            # produce the reply later — so it owes its caller one NOW. Reading
+            # the flag alone would let such an execution both record itself
+            # COMPLETED and stay silent, which suspends its caller until a
+            # sweep bails it out.
+            is_suspended = bool(
+                getattr(context, "_is_suspended", False)
+            ) and not is_terminal_state(task_result.status)
+            task_result = self._apply_suspended_status(task_result, context)
             final_status = task_result.status
 
-            if has_source_agent:
+            if has_source_agent and not is_suspended:
+                # A suspended execution has no result yet — only the value the
+                # handler returned so it could unwind. Forwarding that as the
+                # reply wakes our caller early with a placeholder and burns the
+                # one reply it was waiting for; the real result goes out when
+                # this execution resumes and finishes.
                 await self._enqueue_agent_return(
-                    raw_command,
+                    reply_command,
                     status=task_result.status,
                     content=task_result.content,
                     reply_data=task_result.reply_data,
@@ -774,8 +933,6 @@ class GatewayWorker(ABC):
             )
             # Call plugin hook on task completion
             await self.plugin_registry.on_task_complete(context, process_result)
-
-            from by_framework.core.protocol.agent_state import is_terminal_state
 
             should_emit_stream_end = (
                 not has_source_agent
@@ -825,7 +982,7 @@ class GatewayWorker(ABC):
                 # Note: parent Agent may be in COMPLETED state but marked
                 # with cancel_requested
                 should_callback = True
-                parent_msg_id = header.parent_message_id
+                parent_msg_id = reply_command.header.parent_message_id
                 if parent_msg_id and hasattr(self, "registry") and self.registry:
                     try:
                         parent_exec = await self.registry.get_execution_by_message_id(
@@ -842,8 +999,11 @@ class GatewayWorker(ABC):
                     except Exception:  # pylint: disable=broad-exception-caught
                         pass  # Conservatively send callback when query fails
                 if should_callback:
+                    # Sent even if the context suspended: a cancelled execution
+                    # will never resume, so this is the caller's last chance to
+                    # hear anything at all.
                     await self._enqueue_agent_return(
-                        command,
+                        reply_command,
                         status=AgentState.CANCELLED.value,
                         reply_data={"reason": reason},
                         context=context,
@@ -867,8 +1027,10 @@ class GatewayWorker(ABC):
             error_msg = f"[{self.worker_id}] Task failed: {str(e)}"
             logger.error(error_msg)
             if has_source_agent:
+                # Also sent regardless of suspension: the execution died, so
+                # no later resume will produce the reply the caller awaits.
                 await self._enqueue_agent_return(
-                    command,
+                    reply_command,
                     status=AgentState.FAILED.value,
                     reply_data={"error": str(e)},
                     context=context,

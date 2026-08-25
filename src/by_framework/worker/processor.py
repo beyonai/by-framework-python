@@ -4,14 +4,15 @@
 
 import traceback
 import uuid
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional
 
 if TYPE_CHECKING:
     from redis.asyncio import Redis
 
-from by_framework.common.constants import MESSAGE_ID_PREFIX
+from by_framework.common.constants import (CLIENT_SOURCE_AGENT_TYPE, MESSAGE_ID_PREFIX)
 from by_framework.common.emitter import DataLayoutBuilder
-from by_framework.core.protocol.agent_state import AgentState
+from by_framework.core.protocol.agent_state import (AgentState, is_terminal_state)
 from by_framework.core.protocol.commands import GatewayCommand, ResumeCommand
 from by_framework.core.protocol.events import StateChangeEvent
 from by_framework.core.protocol.message_header import MessageHeader
@@ -21,6 +22,8 @@ from by_framework.core.protocol.results import (
     normalize_process_result,
 )
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
+from by_framework.core.wait_gate import consume_wait_entry, emit_orphaned_reply
+from by_framework.core.wait_reply import flush_pending_group_replies
 from by_framework.worker.context import AgentContext
 
 ContextHandler = Callable[
@@ -58,13 +61,46 @@ class GatewayProcessor:
         """
         Process a single message using the provided handler function.
         Handles workspace setup, state emission, and error reporting.
+
+        Returns the handler's result, or None when the message was a reply
+        to a wait that is already resolved (see the idempotency gate below);
+        such a message is fully handled and should be acknowledged by the
+        caller's consume loop like any other.
         """
 
         trace_id = uuid.uuid4().hex
         header = command.header
         is_agent_return = isinstance(command, ResumeCommand)
-        source_agent_type = header.source_agent_type
-        has_source_agent = bool(source_agent_type) and not is_agent_return
+
+        if is_agent_return:
+            # Same idempotency gate as WorkerRunner._process_message_from_dict,
+            # and for the same reason: this is a second, independent entry
+            # point for replies (callers that drive their own consume loop
+            # instead of subclassing GatewayWorker). A gate on only one entry
+            # point is not a gate — replies arriving via the other one would
+            # both wake an already-resolved caller and leave the wait-index
+            # entry behind for a sweep to resolve all over again.
+            gate = await consume_wait_entry(self.redis, command)
+            if not gate.allow:
+                self.logger.warning(
+                    "[%s] Dropping reply for an already-resolved wait (%s): "
+                    "message_id=%s, child_message_id=%s, session_id=%s",
+                    self.worker_id,
+                    gate.reason,
+                    header.message_id,
+                    header.parent_message_id,
+                    header.session_id,
+                )
+                await emit_orphaned_reply(
+                    self.redis,
+                    command,
+                    worker_id=self.worker_id,
+                    reason=gate.reason,
+                )
+                return None
+
+        reply_header = await self._resolve_reply_header(command)
+        has_source_agent = reply_header is not None
 
         context = AgentContext(
             session_id=header.session_id,
@@ -110,10 +146,23 @@ class GatewayProcessor:
 
             # Execute User Logic
             result = await handler(command, context)
+            # Same rule as GatewayWorker._handle_message: stand-ins for Task
+            # Group members that never reached a worker go out only once the
+            # handler has returned normally, and never when it raised.
+            await flush_pending_group_replies(self.redis, context, self.worker_id)
             task_result = normalize_process_result(result)
 
             # Lifecycle Success
-            if has_source_agent:
+            # A suspended execution has no result yet — replying with the
+            # value the handler returned so it could unwind would wake the
+            # caller early and consume the one reply it waits for. Same rule
+            # as GatewayWorker._handle_message, including its exception: a
+            # handler that returned a terminal status is finished and will
+            # never be resumed to reply later, so it must reply now.
+            is_suspended = bool(
+                getattr(context, "_is_suspended", False)
+            ) and not is_terminal_state(task_result.status)
+            if has_source_agent and not is_suspended:
                 await self._enqueue_callback(
                     command,
                     task_result.status,
@@ -121,11 +170,11 @@ class GatewayProcessor:
                     content=task_result.content,
                     metadata=task_result.metadata,
                     extra_payload=task_result.extra_payload,
+                    reply_header=reply_header,
                 )
 
             import json
 
-            from by_framework.core.protocol.agent_state import is_terminal_state
             from by_framework.core.protocol.event_type import EventType
 
             final_message = None
@@ -161,13 +210,59 @@ class GatewayProcessor:
 
             if has_source_agent:
                 await self._enqueue_callback(
-                    command, AgentState.FAILED.value, {"error": str(e)}
+                    command,
+                    AgentState.FAILED.value,
+                    {"error": str(e)},
+                    reply_header=reply_header,
                 )
 
             await context.emit_state(
                 StateChangeEvent(state=f"{AgentState.FAILED.value}: {str(e)}")
             )
             raise
+
+    async def _resolve_reply_header(
+        self, command: GatewayCommand
+    ) -> Optional[MessageHeader]:
+        """Return the header describing the caller this execution owes a reply
+        to, or None when nobody is waiting.
+
+        Mirrors ``GatewayWorker._resolve_reply_command``: a resume's header
+        describes the sub-agent that just finished, so the caller has to be
+        read back from the execution record the original dispatch wrote — and,
+        for the same reason as there, ``CLIENT_SOURCE_AGENT_TYPE`` is not a
+        caller. It is what a client writes on a root execution's record, and
+        nothing consumes its control stream.
+        """
+        header = command.header
+        if not isinstance(command, ResumeCommand):
+            return header if header.source_agent_type else None
+
+        execution: Optional[dict[str, Any]] = None
+        try:
+            from by_framework.core.registry import WorkerRegistry
+
+            execution = await WorkerRegistry(self.redis).get_execution_by_message_id(
+                header.message_id, session_id=header.session_id
+            )
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            self.logger.warning(
+                "[%s] Could not resolve the caller of resumed execution %s: %s",
+                self.worker_id,
+                header.message_id,
+                error,
+            )
+            return None
+
+        caller_agent_type = str((execution or {}).get("source_agent_type", "") or "")
+        if not caller_agent_type or caller_agent_type == CLIENT_SOURCE_AGENT_TYPE:
+            return None
+        return replace(
+            header,
+            source_agent_type=caller_agent_type,
+            parent_message_id=str((execution or {}).get("parent_message_id", "") or ""),
+            task_group_id=str((execution or {}).get("task_group_id", "") or ""),
+        )
 
     async def _enqueue_callback(
         self,
@@ -177,23 +272,32 @@ class GatewayProcessor:
         content: str | list[dict[str, Any]] = "",
         metadata: Optional[dict[str, JsonValue]] = None,
         extra_payload: Optional[dict[str, JsonValue]] = None,
+        reply_header: Optional[MessageHeader] = None,
     ):
         """Enqueue callback response to source agent."""
         from by_framework.common.constants import RedisKeys
 
-        header = original_command.header
+        header = reply_header or original_command.header
         merged_metadata = {
             **dict(header.metadata),
             **dict(metadata or {}),
         }
         callback_command = ResumeCommand(
             header=MessageHeader(
-                message_id=f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}",
+                # The caller reattaches its suspended execution by this id, so
+                # it must be the caller's own message_id (this dispatch's
+                # parent_message_id) — a freshly minted id resolves to no
+                # execution and orphans the caller.
+                message_id=(
+                    header.parent_message_id
+                    or f"{MESSAGE_ID_PREFIX}{uuid.uuid4().hex[:8]}"
+                ),
                 session_id=header.session_id,
                 trace_id=header.trace_id or uuid.uuid4().hex,
                 source_agent_type=header.target_agent_type or self.worker_id,
                 target_agent_type=header.source_agent_type,
                 parent_message_id=header.message_id,
+                task_group_id=header.task_group_id or "",
                 user_code=header.user_code,
                 user_name=header.user_name,
                 metadata=merged_metadata,

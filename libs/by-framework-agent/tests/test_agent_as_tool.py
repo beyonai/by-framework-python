@@ -75,7 +75,10 @@ async def test_sub_agent_tool_call_dispatches_via_call_agent(
         _command(), execution=_execution("exec-1", "worker-a")
     )
 
-    assert result.status == "QUEUED"
+    # The framework overrides a suspended caller's persisted status: the
+    # harness returns QUEUED so it can unwind, but the execution is parked
+    # on a sub-agent reply, not queued behind a worker.
+    assert result.status == "WAITING_AGENT"
     dispatched_streams = [call.args[0] for call in mock_redis.xadd.call_args_list]
     assert RedisKeys.ctrl_stream("sub_assistant") in dispatched_streams
 
@@ -100,7 +103,7 @@ async def test_resume_after_sub_agent_reply_on_different_worker_instance(
     suspend_result = await worker_a._handle_message(  # pylint: disable=protected-access
         _command(), execution=_execution("exec-1", "worker-a")
     )
-    assert suspend_result.status == "QUEUED"
+    assert suspend_result.status == "WAITING_AGENT"
 
     second_model_client = StubModelClient(
         turns=[
@@ -189,7 +192,7 @@ async def test_mixed_local_tool_and_sub_agent_call_in_one_turn(
         _command(), execution=_execution("exec-1", "worker-a")
     )
 
-    assert result.status == "QUEUED"
+    assert result.status == "WAITING_AGENT"
     assert local_calls == [{}]
 
     raw_state = await mock_redis.get(RedisKeys.harness_state("exec-1"))

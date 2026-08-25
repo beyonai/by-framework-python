@@ -21,6 +21,8 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
 from typing_extensions import deprecated
 
 from by_framework.common.constants import (
+    DEFAULT_ASK_USER_TIMEOUT_MS,
+    DEFAULT_REPLY_TIMEOUT_MS,
     EXECUTION_ID_PREFIX,
     MESSAGE_ID_PREFIX,
     TASK_GROUP_FIELD_ABORTED,
@@ -56,6 +58,13 @@ from by_framework.core.protocol.message_header import MessageHeader
 from by_framework.core.runtime import AgentRuntimeState
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.runtime.filestore.base import FileStorage
+from by_framework.core.wait_gate import consumed_marker_key
+from by_framework.core.wait_index import encode_member, wait_index_key
+from by_framework.core.wait_reply import (
+    SYNTHESIZED_BY_DISPATCH,
+    failure_reply_data,
+    stand_in_reply,
+)
 from by_framework.trace.span_recorder import (SpanRecorder, TraceSpan, str_to_uint64)
 
 if TYPE_CHECKING:
@@ -155,6 +164,20 @@ class AgentContext:
         self._permission_transferred = False
         # Flag: execution suspended due to calling agents or waiting
         self._is_suspended = False
+        # WHY this execution is suspended, as the AgentState it is waiting in
+        # (WAITING_AGENT / WAITING_USER), or "" when it is not suspended.
+        # The framework persists this instead of whatever non-terminal status
+        # the business returned, so a suspended caller is distinguishable from
+        # one that is merely QUEUED behind a worker. Kept in lockstep with
+        # _is_suspended: both are set together and rolled back together.
+        self._suspended_state = ""
+        # Task Group sub-tasks that never reached a worker because their target
+        # agent type was unavailable at dispatch time. Each is a fully-formed
+        # ResumeCommand addressed back at this caller, so the existing Group
+        # Join counts and aggregates it exactly like a real sub-agent's failure
+        # reply. Flushed by the worker AFTER process_command returns — see
+        # core/wait_reply.flush_pending_group_replies for why not inline.
+        self._pending_group_replies: list[ResumeCommand] = []
         self._trace_parent_observation_id = ""
         self._token_usage: dict[str, Any] = {}
         self.plugin_registry = plugin_registry
@@ -448,16 +471,106 @@ class AgentContext:
             content_type=content_type,
         )
 
+    async def _register_wait(
+        self,
+        *,
+        parent_message_id: str,
+        child_message_id: str,
+        task_group_id: str,
+        timeout_ms: int,
+    ) -> None:
+        """Record "this execution is suspended waiting for a reply" in the
+        wait index, so a reply that never arrives can still be resolved.
+
+        ``parent_message_id`` must be the message_id the awaited reply will
+        carry in ``header.message_id`` — i.e. the id the suspended execution
+        is reattached by — and ``child_message_id`` the reply's
+        ``header.parent_message_id``. That reversal is what makes the entry
+        reconstructible from the reply alone (see
+        ``core/wait_index.member_from_resume``).
+
+        Fail-soft: a failed registration costs the liveness safety net for
+        this one call, but the dispatch itself is what the caller is actually
+        waiting on — never let bookkeeping break it.
+        """
+        try:
+            deadline_ms = int(time.time() * 1000) + max(0, int(timeout_ms))
+            member = encode_member(
+                session_id=self.session_id,
+                parent_message_id=parent_message_id,
+                child_message_id=child_message_id,
+                task_group_id=task_group_id,
+            )
+            await self.redis.zadd(  # type: ignore
+                wait_index_key(self.session_id), {member: deadline_ms}
+            )
+            # A member can legitimately repeat: consecutive ask_user rounds in
+            # one execution all encode to the same member (no sub-task id to
+            # distinguish them). Registering a wait therefore has to void the
+            # previous round's "already consumed" verdict, or the gate would
+            # read it as a duplicate the moment this entry goes missing.
+            # Deliberately after the ZADD and separately guarded: the entry is
+            # what matters, and while it exists the marker is never consulted.
+            try:
+                await self.redis.delete(  # type: ignore
+                    consumed_marker_key(self.session_id, member)
+                )
+            except Exception as error:  # pylint: disable=broad-exception-caught
+                logger.warning(
+                    "Failed to clear consumed marker for wait entry "
+                    "(session=%s, parent=%s): %s",
+                    self.session_id,
+                    parent_message_id,
+                    error,
+                )
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "Failed to register wait index entry (session=%s, parent=%s, "
+                "child=%s): %s",
+                self.session_id,
+                parent_message_id,
+                child_message_id,
+                error,
+            )
+
     async def ask_user(
         self,
         event: Union[AskUserEvent, str],
         message_id: Optional[str] = None,
         parent_message_id: Optional[str] = None,
+        reply_timeout_ms: Optional[int] = None,
     ) -> dict:
         """
         Suspend execution and ask the user for a prompt.
         Accepts an AskUserEvent or a raw string prompt.
+
+        ``reply_timeout_ms`` bounds how long this execution may stay
+        suspended before the liveness sweep resolves it; it defaults to
+        ``DEFAULT_ASK_USER_TIMEOUT_MS``, which is deliberately much larger
+        than ``call_agent``'s default because this one waits on a human.
+
+        Wait-index convention (must be mirrored by the TS/Java ports): an
+        ask_user wait has no sub-task, so its member's ``child_message_id``
+        is the empty string, and its ``parent_message_id`` is this
+        execution's own message_id — which is what the client's
+        ``ResumeCommand`` carries as ``header.message_id`` when the user
+        answers.
         """
+        # Registered BEFORE the prompt goes out, for the same reason
+        # _dispatch_single_task registers before its xadd: the answer can come
+        # back the instant the prompt is visible, and an answer that arrives
+        # before the entry exists passes the gate as unregistered and then
+        # leaves the entry behind it with nothing left to clear it.
+        await self._register_wait(
+            parent_message_id=self.message_id,
+            child_message_id="",
+            task_group_id="",
+            timeout_ms=(
+                DEFAULT_ASK_USER_TIMEOUT_MS
+                if reply_timeout_ms is None
+                else reply_timeout_ms
+            ),
+        )
         await self.emitter.ask_user(
             self.session_id,
             self.trace_id,
@@ -469,6 +582,7 @@ class AgentContext:
             else self.parent_message_id,
         )
         self._is_suspended = True
+        self._suspended_state = AgentState.WAITING_USER.value
         return {"status": AgentState.WAITING_USER.value}
 
     async def update_execution_state(self, status: str) -> None:
@@ -541,6 +655,7 @@ class AgentContext:
         availability_timeout_ms: int = 30000,
         region: Optional[str] = None,
         priority: int = 0,
+        reply_timeout_ms: Optional[int] = None,
     ) -> dict:
         """Push a control-flow message to another agent.
 
@@ -548,6 +663,10 @@ class AgentContext:
 
         Args:
             route_policy: Controls online checks and unavailable-agent behavior.
+            reply_timeout_ms: How long this execution may stay suspended
+                waiting for the reply before the liveness sweep resolves it.
+                Only meaningful when wait_for_reply is True; defaults to
+                DEFAULT_REPLY_TIMEOUT_MS.
         """
         return await self._dispatch_single_task(
             target_agent_type=target_agent_type,
@@ -561,6 +680,7 @@ class AgentContext:
             availability_timeout_ms=availability_timeout_ms,
             region=region,
             priority=priority,
+            reply_timeout_ms=reply_timeout_ms,
         )
 
     async def _dispatch_single_task(
@@ -578,6 +698,7 @@ class AgentContext:
         availability_timeout_ms: int = 30000,
         region: Optional[str] = None,
         priority: int = 0,
+        reply_timeout_ms: Optional[int] = None,
     ) -> dict:
         """Build, availability-check, and dispatch one AskAgentCommand.
 
@@ -588,9 +709,19 @@ class AgentContext:
         message_id = message_id or self.generate_message_id()
         parent_message_id = parent_message_id if parent_message_id else self.message_id
         merged_extra_payload = dict(extra_payload or {})
+        # Snapshot both flags before optimistically flipping them: the
+        # availability check below can still reject this dispatch, and a
+        # dispatch that never happened must not leave the context looking
+        # suspended / handed-off. Restoring the ENTRY value (not False) is
+        # what makes this safe when an earlier call_agent on the same
+        # context legitimately suspended it already.
+        previous_is_suspended = self._is_suspended
+        previous_suspended_state = self._suspended_state
+        previous_permission_transferred = self._permission_transferred
         if wait_for_reply:
             merged_extra_payload["wait_for_reply"] = True
             self._is_suspended = True
+            self._suspended_state = AgentState.WAITING_AGENT.value
         else:
             self._permission_transferred = True
 
@@ -694,6 +825,11 @@ class AgentContext:
                 command.header.metadata["langfuse_parent_observation_id"] = (
                     original_metadata_langfuse_parent
                 )
+            # Nothing was dispatched, so nothing will ever reply: roll the
+            # suspend/hand-off flags back to their pre-call values.
+            self._is_suspended = previous_is_suspended
+            self._suspended_state = previous_suspended_state
+            self._permission_transferred = previous_permission_transferred
             return {
                 "status": AgentState.FAILED.value,
                 "message_id": "",
@@ -733,6 +869,12 @@ class AgentContext:
                         if wait_for_reply
                         else "",
                         "target_agent_type": target_agent_type,
+                        # Recorded so that when this sub-task's own execution
+                        # later suspends and resumes, the worker can rebuild
+                        # who to reply to (source_agent_type) and which group
+                        # the reply belongs to — the resume message itself
+                        # describes the hop that woke it, not this dispatch.
+                        "task_group_id": task_group_id,
                         "stream_name": delivery_stream,
                         "status": "QUEUED",
                         "route_policy": route_policy,
@@ -744,6 +886,23 @@ class AgentContext:
                 )
             except Exception:  # pylint: disable=broad-exception-caught
                 pass  # Fallback if registry fails
+
+        if wait_for_reply:
+            # Registered next to initialize_execution, i.e. BEFORE the control
+            # message goes out: the window that must not exist is "dispatched
+            # but nobody knows we are waiting". The opposite window (registered
+            # but the xadd below raises) surfaces as a sweep that finds a
+            # never-started child, which is exactly what it is.
+            await self._register_wait(
+                parent_message_id=parent_message_id or "",
+                child_message_id=message_id,
+                task_group_id=task_group_id,
+                timeout_ms=(
+                    DEFAULT_REPLY_TIMEOUT_MS
+                    if reply_timeout_ms is None
+                    else reply_timeout_ms
+                ),
+            )
 
         try:
             dispatch_started_at = int(time.time() * 1000)
@@ -832,6 +991,7 @@ class AgentContext:
         wait_for_reply: bool = True,
         message_id: Optional[str] = None,
         parent_message_id: Optional[str] = None,
+        reply_timeout_ms: Optional[int] = None,
     ) -> dict:
         """
         Dispatch multiple tasks concurrently as a Task Group — call_agent's
@@ -847,9 +1007,41 @@ class AgentContext:
                        "metadata": Optional[Dict[str, Any]]
                    }
             wait_for_reply: bool. If True, sets up Redis counters to wait for all.
+            reply_timeout_ms: Per-sub-task reply deadline; each member of the
+                group gets its own wait-index entry with this timeout, since
+                each can go missing independently.
+            message_id: The dispatch-time id for the sub-task. Only valid for
+                a single-task group — see below.
+
+        Raises:
+            ValueError: If ``message_id`` is given for more than one task.
         """
         if not tasks:
             raise ValueError("dispatch_group/call_agents requires at least one task")
+        if message_id and len(tasks) > 1:
+            # A group's per-sibling identity IS its sub-task message_id: Group
+            # Join keys task_group_results by it, and the wait index keys its
+            # entries by it. Pinning one id across the fan-out collapses every
+            # sibling onto the same key, so their results overwrite each other
+            # and their wait entries are one entry — which the idempotency gate
+            # then correctly claims once, dropping the rest, leaving `completed`
+            # short of `total` and the caller suspended forever.
+            #
+            # This parameter has always been broken for a batch (the ids
+            # collided long before the gate existed; it merely upgraded
+            # scrambled results into a hang). Minting a fresh id per task
+            # instead would swap one silent behaviour for another the caller
+            # cannot see, so it fails loudly and the single-task use — where
+            # one id for one sub-task is exactly right — keeps working.
+            raise ValueError(
+                "call_agents/dispatch_group cannot pin message_id across "
+                f"{len(tasks)} tasks: every sub-task would share it, so Task "
+                "Group results (keyed by sub-task message_id) would overwrite "
+                "each other and only one sibling would ever be counted, "
+                "hanging the caller. Omit message_id to have one minted per "
+                "sub-task, or dispatch the tasks individually with call_agent "
+                "if you must choose their ids."
+            )
 
         task_group_id = f"{TASK_GROUP_ID_PREFIX}{uuid.uuid4().hex[:8]}"
         total_tasks = len(tasks)
@@ -868,6 +1060,7 @@ class AgentContext:
             # Ensure the key expires to prevent leak
             await self.redis.expire(group_key, TASK_GROUP_TTL_SECONDS)
             self._is_suspended = True
+            self._suspended_state = AgentState.WAITING_AGENT.value
         else:
             self._permission_transferred = True
 
@@ -889,13 +1082,25 @@ class AgentContext:
                     message_id=current_message_id,
                     parent_message_id=parent_message_id,
                     task_group_id=task_group_id,
+                    reply_timeout_ms=reply_timeout_ms,
                 )
+                if task_result["status"] == AgentState.FAILED.value and wait_for_reply:
+                    await self._queue_undispatched_member_failure(
+                        task_group_id=task_group_id,
+                        caller_message_id=task_result["parent_message_id"],
+                        child_message_id=current_message_id,
+                        task_result=task_result,
+                        metadata=metadata,
+                        reply_timeout_ms=reply_timeout_ms,
+                    )
             except Exception:
                 # A genuine dispatch-time failure (not an availability-check
                 # rejection, which _dispatch_single_task already turns into a
                 # FAILED result instead of raising). Stop fanning out and mark
                 # the group aborted so already-sent siblings' replies don't
-                # later resume this (now-failed) caller execution.
+                # later resume this (now-failed) caller execution. Stand-ins
+                # queued so far die with the raise: the worker only flushes
+                # them once process_command returns normally.
                 if wait_for_reply:
                     await self.redis.hset(  # type: ignore
                         RedisKeys.task_group(task_group_id),
@@ -903,29 +1108,6 @@ class AgentContext:
                         "1",
                     )
                 raise
-
-            if task_result["status"] == AgentState.FAILED.value and wait_for_reply:
-                # Target agent type unavailable: record the failure as this
-                # task's result immediately, without blocking the rest of
-                # the batch or waiting for a reply that will never arrive.
-                result_data = {
-                    "status": task_result["status"],
-                    "reply_data": None,
-                    "content": "",
-                    "target_agent_type": target_agent_type,
-                    "metadata": {},
-                    "extra_payload": {},
-                    "error": task_result.get("error"),
-                    "error_code": task_result.get("error_code"),
-                }
-                results_key = RedisKeys.task_group_results(task_group_id)
-                await self.redis.hset(  # type: ignore
-                    results_key, current_message_id, json.dumps(result_data)
-                )
-                await self.redis.expire(results_key, TASK_GROUP_TTL_SECONDS)
-                await self.redis.hincrby(  # type: ignore
-                    RedisKeys.task_group(task_group_id), TASK_GROUP_FIELD_COMPLETED, 1
-                )
 
             dispatched.append(
                 {
@@ -974,12 +1156,98 @@ class AgentContext:
             "dispatched_tasks": dispatched,
         }
 
+    async def _queue_undispatched_member_failure(
+        self,
+        *,
+        task_group_id: str,
+        caller_message_id: str,
+        child_message_id: str,
+        task_result: dict,
+        metadata: Optional[Dict[str, Any]] = None,
+        reply_timeout_ms: Optional[int] = None,
+    ) -> None:
+        """Handle a group member whose target agent type was unavailable.
+
+        No worker will ever reply for this sub-task, so the group needs one
+        more result from somewhere. It must NOT be booked here. Writing
+        ``task_group_results`` and ``HINCRBY completed`` from the dispatch
+        loop is a second implementation of the accounting that lives in
+        ``GatewayWorker``'s Group Join, and when *that* copy is the increment
+        that reaches ``total`` there is no reply left to trigger the join and
+        the caller stays suspended forever. Two paths reach it: every target
+        being unavailable, and a sibling replying fast enough that a later
+        unavailable target's increment is the one that fills the group.
+
+        So the compensation is a *reply* — the one a sub-agent would have sent
+        had it started and failed — and the join stores it, counts it and
+        aggregates through the single path it already owns. The last
+        accounting event is then always a reply, so the join always runs.
+
+        A wait-index entry is registered for it as well, even though nothing
+        was dispatched. It costs one ZADD, and it buys the only backstop this
+        path has: if the stand-in is never delivered (the flush is fail-soft
+        by necessity — see ``flush_pending_group_replies``), the sweep finds
+        this member's execution recorded FAILED by
+        ``record_failed_route_decision`` and compensates it like any other
+        lost reply, instead of the group hanging on a member that provably
+        cannot answer.
+        """
+        await self._register_wait(
+            parent_message_id=caller_message_id,
+            child_message_id=child_message_id,
+            task_group_id=task_group_id,
+            timeout_ms=(
+                DEFAULT_REPLY_TIMEOUT_MS
+                if reply_timeout_ms is None
+                else reply_timeout_ms
+            ),
+        )
+        if not self.current_agent_id:
+            # Nothing to address the reply to: this context has no agent type,
+            # so a real sub-agent could not have replied either (its dispatch
+            # carried an empty source_agent_type). The wait entry above is what
+            # gets this group unstuck — a sweep can still route by the caller's
+            # own execution record.
+            logger.warning(
+                "Task Group %s sub-task %s cannot be compensated inline: this "
+                "context has no agent type to address the reply to. Leaving it "
+                "to the wait-index sweep.",
+                task_group_id,
+                child_message_id,
+            )
+            return
+        self._pending_group_replies.append(
+            stand_in_reply(
+                session_id=self.session_id,
+                caller_message_id=caller_message_id,
+                caller_agent_type=self.current_agent_id,
+                child_message_id=child_message_id,
+                child_agent_type=task_result["target_agent_type"],
+                task_group_id=task_group_id,
+                trace_id=self.trace_id,
+                status=AgentState.FAILED.value,
+                reply_data=failure_reply_data(
+                    error=str(task_result.get("error") or ""),
+                    error_code=str(
+                        task_result.get("error_code") or "AGENT_TYPE_UNAVAILABLE"
+                    ),
+                    child_message_id=child_message_id,
+                ),
+                metadata=dict(metadata or {}),
+                error_code=str(task_result.get("error_code") or ""),
+                synthesized_by=SYNTHESIZED_BY_DISPATCH,
+                user_code=self.agent_runtime_state.session_manager.user_code,
+                user_name=self.agent_runtime_state.session_manager.user_name,
+            )
+        )
+
     async def dispatch_group(
         self,
         tasks: list[dict[str, Any]],
         wait_for_reply: bool = True,
         message_id: Optional[str] = None,
         parent_message_id: Optional[str] = None,
+        reply_timeout_ms: Optional[int] = None,
     ) -> dict:
         """Alias for call_agents, kept permanently for source compatibility.
 
@@ -991,6 +1259,7 @@ class AgentContext:
             wait_for_reply=wait_for_reply,
             message_id=message_id,
             parent_message_id=parent_message_id,
+            reply_timeout_ms=reply_timeout_ms,
         )
 
     def _serialize_outbound_content(self, content: object) -> WireContent:

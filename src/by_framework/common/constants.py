@@ -298,6 +298,86 @@ class RedisKeys:
         )
 
     @classmethod
+    def wait_index(cls, shard: int) -> str:
+        """ZSET index of suspended callers waiting for a sub-task reply.
+
+        member = encoded wait-index member (see core/wait_index.py),
+        score = deadline in epoch milliseconds. Sharded so sweepers can
+        claim disjoint slices without a global lock; the shard is derived
+        from session_id (see wait_index_shard()).
+
+        Cross-entity index (spans every session), so deliberately left
+        untagged relative to the per-session keys it points at — same rule
+        as trace_index_session/admin_workers.
+        """
+        return cls._versioned(
+            v1_key=f"byai_gateway:wait:index:{shard}",
+            v2_suffix=f"wait:index:{shard}",
+        )
+
+    @classmethod
+    def wait_sweep_lock(cls, shard: int) -> str:
+        """Short-lived claim on one wait_index() shard, held while sweeping it.
+
+        Ownership is advisory: it only keeps two sweepers from doing the same
+        triage at the same moment. Losing it (expiry, a partitioned worker)
+        cannot corrupt anything, because every action a sweep takes is
+        idempotent — a duplicate synthesized reply is caught by the same
+        wait-index gate that catches a duplicate real one. That is why the
+        shards need no leader election: a dead worker's claim simply expires
+        and another worker picks the shard up on its next cycle.
+
+        Cross-entity like the shard it guards, so deliberately untagged.
+        """
+        return cls._versioned(
+            v1_key=f"byai_gateway:wait:sweep_lock:{shard}",
+            v2_suffix=f"wait:sweep_lock:{shard}",
+        )
+
+    @classmethod
+    def wait_consumed(cls, session_id: str, member_digest: str) -> str:
+        """Short-lived marker: "this wait-index entry was already resolved".
+
+        Written by the idempotency gate right after it wins the ZREM for a
+        member, and read when a later ZREM for the same member returns 0.
+        It is the *only* thing that distinguishes the two meanings of that
+        0 — "someone already consumed this wait" (drop the duplicate) from
+        "this wait was never registered" (a pre-upgrade or expired entry,
+        which must be let through). Without it, every rolling upgrade would
+        silently drop in-flight replies.
+
+        Per-session entity, so hash-tagged with the session in v2.
+        """
+        return cls._versioned(
+            v1_key=f"byai_gateway:wait:consumed:{session_id}:{member_digest}",
+            v2_suffix=f"wait:consumed:{{{session_id}}}:{member_digest}",
+        )
+
+    @classmethod
+    def wait_renew_origin(cls, session_id: str, member_digest: str) -> str:
+        """The deadline a wait's renewal budget is measured from.
+
+        Written once (SET NX) by the first sweep that finds the entry due, so
+        it holds the wait's *original* deadline even after renewals have
+        overwritten the ZSET score. Without it a renewal budget cannot exist
+        at all: every sweep would re-measure from the score it just pushed
+        out, and a callee whose worker is alive but making no progress would
+        be renewed forever.
+
+        Sweeper-private: nothing on the reply path reads or writes it, so it
+        is deliberately NOT part of the wait-index member (which must stay
+        rebuildable from a reply alone — see core/wait_index.py). Expiring is
+        safe by design: losing it only restarts the budget from the current
+        deadline, so the TTL is sized well above any plausible budget.
+
+        Per-session entity, so hash-tagged with the session in v2.
+        """
+        return cls._versioned(
+            v1_key=f"byai_gateway:wait:renew_origin:{session_id}:{member_digest}",
+            v2_suffix=f"wait:renew_origin:{{{session_id}}}:{member_digest}",
+        )
+
+    @classmethod
     def harness_state(cls, execution_id: str) -> str:
         """Serialized in-flight native-agent-harness loop state.
 
@@ -531,7 +611,31 @@ class RedisKeys:
 MESSAGE_ID_PREFIX = "msg-"
 EXECUTION_ID_PREFIX = "exec-"
 TASK_GROUP_ID_PREFIX = "tg-"
+# A single call_agent (non-group) dispatch stores its result in the same
+# task_group_results Hash a real group uses, under a group id derived from
+# the sub-task's own message_id — i.e. a group of size 1. Keeps one result
+# storage/recovery path instead of two.
+TASK_GROUP_SINGLE_ID_PREFIX = "tg-single-"
 CANCEL_MESSAGE_ID_PREFIX = "msg-cancel-"
+
+# Sentinel GatewayClient writes as an execution record's source_agent_type for
+# a dispatch it made itself (client/client.py's initialize_execution and
+# record_failed_route_decision). It is NOT an agent type: nothing declares it,
+# so nothing consumes RedisKeys.ctrl_stream(CLIENT_SOURCE_AGENT_TYPE).
+#
+# Load-bearing wherever a resumed execution recovers its caller from its own
+# record instead of from the resume header (GatewayWorker._resolve_reply_command
+# / GatewayProcessor._resolve_reply_header): a root execution's record carries
+# this, and treating it as a caller both posts the result to a stream no one
+# reads and suppresses the end-of-stream event the session data plane owes the
+# user — the visible half of the bug being prevented.
+CLIENT_SOURCE_AGENT_TYPE = "client"
+
+
+def single_call_task_group_id(child_message_id: str) -> str:
+    """Group id under which a single (non-group) call_agent result is stored."""
+    return f"{TASK_GROUP_SINGLE_ID_PREFIX}{child_message_id}"
+
 
 # --- Redis Hash Field Prefixes ---
 # Field prefixes in Session Registry Hash
@@ -562,6 +666,125 @@ HARNESS_STATE_TTL_SECONDS = 86400
 FIRST_RETRY_WAIT_SECONDS = 1.0
 # Maximum retry count
 MAX_RETRY_COUNT = 3
+
+
+# --- Suspended-caller liveness (wait index) ---
+# Number of RedisKeys.wait_index() shards. Fixed: changing it re-maps every
+# session to a different shard, so in-flight entries would be swept by no
+# one. Treat as a cross-SDK protocol constant, not a tunable.
+WAIT_INDEX_SHARDS = 16
+# Default deadline for a call_agent(wait_for_reply=True) reply (1 hour).
+# Machine waiting on machine.
+DEFAULT_REPLY_TIMEOUT_MS = 3_600_000
+# Default deadline for an ask_user reply. Machine waiting on a human, so it
+# is deliberately decoupled from DEFAULT_REPLY_TIMEOUT_MS and aligned with
+# the session TTL (which is in seconds) instead.
+DEFAULT_ASK_USER_TIMEOUT_MS = RedisKeys.DEFAULT_SESSION_TTL * 1000
+# How often a worker's sweeper scans the shards it owns (seconds).
+WAIT_SWEEP_INTERVAL_SECONDS = 30
+# TTL of a RedisKeys.wait_sweep_lock() claim. Must comfortably exceed one
+# shard's sweep so the owner doesn't lose the shard mid-pass, and stay short
+# enough that a crashed sweeper's shards are picked up again quickly.
+WAIT_SWEEP_LOCK_TTL_SECONDS = 60
+# Most due entries one sweep resolves per shard per cycle. Bounds the work
+# (and the Redis traffic) of a single pass after an outage leaves a large
+# backlog; the remainder is simply picked up next cycle, since entries stay
+# in the index until a reply clears them.
+WAIT_SWEEP_BATCH_LIMIT = 200
+# Fixed extension applied when a sweep finds the callee still making
+# progress. Deliberately a constant rather than the original timeout: the
+# wait-index member must stay reconstructible from a reply alone, so it
+# cannot carry the caller's original timeout.
+WAIT_RENEW_INCREMENT_MS = 300_000
+# Hard ceiling on renewals, as a multiple of the caller's own timeout: a wait
+# may be renewed until `registered_at + N * timeout`, after which the callee
+# is declared CHILD_TIMEOUT even though its worker is still alive.
+#
+# Without a ceiling the "worker lease alive -> renew" rule is unconditional,
+# so a callee that is running but making no progress (a hung LLM call, a
+# deadlock) suspends its caller forever — the one failure mode the deadline
+# was supposed to bound. N is deliberately expressed against the caller's
+# timeout rather than a renewal count, so a caller that asked for 10 minutes
+# is not held to the same absolute budget as one that asked for four hours,
+# and so retuning WAIT_RENEW_INCREMENT_MS cannot silently change the bound.
+#
+# Why 3: N must exceed 1 (N == 1 is "never renew", which kills every callee
+# that is merely slow); N == 2 leaves a single extra window, so one
+# under-estimated timeout is enough to kill healthy work; N == 3 means the
+# caller's own estimate has to be off by 200% before that happens, while
+# still bounding the default case at 3 hours — two orders of magnitude below
+# DEFAULT_SESSION_TTL, which matters because once the session data expires
+# there is no execution record left to compensate against and the wait is
+# simply dropped. Override per deployment via
+# BY_FRAMEWORK_WAIT_RENEW_MAX_MULTIPLE.
+WAIT_RENEW_MAX_MULTIPLE = 3
+# TTL of RedisKeys.wait_renew_origin(). Must comfortably exceed the largest
+# budget in use (N * timeout), or the budget silently restarts mid-wait.
+WAIT_RENEW_ORIGIN_TTL_SECONDS = TASK_GROUP_TTL_SECONDS
+# How long RedisKeys.wait_consumed() remembers that a wait was already
+# resolved, i.e. how far apart two copies of the same reply may be and still
+# be recognized as duplicates.
+#
+# Sized off DEFAULT_SESSION_TTL, which is the lifetime of the session
+# registry — and the session registry is what keeps a *wait entry* relevant.
+# A marker that expires while entries of that session are still live leaves
+# two holes, and the second is the dangerous one:
+#
+#   1. A repeated ask_user answer (a human may take days; the ask_user
+#      deadline is DEFAULT_SESSION_TTL itself) is no longer recognized as a
+#      duplicate and wakes the caller a second time.
+#   2. Worse: a stale duplicate sub-agent reply, having lost the marker that
+#      would stop it at its own candidate, falls through to the ask_user
+#      candidate for the same caller and claims a wait that is still live —
+#      after which the real answer is dropped as "already consumed".
+#
+# Both close once the marker outlives every wait it may have to arbitrate,
+# i.e. the session TTL. Erring long costs a handful of idle 1-byte keys with
+# the same lifetime as the session registry they belong to; erring short
+# costs a lost user answer.
+WAIT_CONSUMED_TTL_SECONDS = RedisKeys.DEFAULT_SESSION_TTL
+# How often a sweeper prunes entries that are provably beyond use (see
+# WAIT_PRUNE_AFTER_SECONDS). Deliberately far coarser than
+# WAIT_SWEEP_INTERVAL_SECONDS: this is garbage collection on a multi-day
+# horizon, and it is the only work a sweeper does when compensation is off.
+WAIT_PRUNE_INTERVAL_SECONDS = 3600
+# How far in the past a wait entry's score must lie before pruning it.
+#
+# Every writer of an entry sets its score to its own `now` plus a
+# non-negative offset (registration adds the caller's timeout, a renewal adds
+# WAIT_RENEW_INCREMENT_MS), and only ever does so while the caller's
+# execution record exists. So `now - score > this` proves the entry was last
+# touched more than a session TTL ago, hence that the session registry the
+# sweep would interrogate has expired and no triage is possible any more:
+# the entry can only ever produce "caller missing". Pruning it is therefore
+# not a decision, which is why it needs no opt-in.
+#
+# The margin over DEFAULT_SESSION_TTL is what makes that strict rather than
+# coincident: DEFAULT_ASK_USER_TIMEOUT_MS *equals* the session TTL, so a
+# threshold trimmed to the session TTL exactly would land on the boundary of
+# a live ask_user wait and lose to any clock skew between the worker that
+# registered the entry and the one sweeping it. A day is far beyond plausible
+# skew, and being late costs one ZSET member per unresolved call for one
+# extra day — the asymmetry says err long.
+WAIT_PRUNE_AFTER_SECONDS = RedisKeys.DEFAULT_SESSION_TTL + 86400
+
+
+class LivenessErrorCode:
+    """error_code values carried by synthesized/recovered resume replies.
+
+    Cross-SDK wire contract — Python/TS/Java must emit the same strings;
+    callers match on them. Append only, never rename.
+    """
+
+    # The callee's worker lease expired while its execution was non-terminal.
+    CHILD_WORKER_LOST = "CHILD_WORKER_LOST"
+    # The callee was alive but produced no reply before the deadline.
+    CHILD_TIMEOUT = "CHILD_TIMEOUT"
+    # The dispatch was never picked up by any worker.
+    CHILD_NEVER_STARTED = "CHILD_NEVER_STARTED"
+    # The callee finished and its result was persisted, but the reply
+    # message was lost; the result was recovered from storage.
+    REPLY_LOST_RECOVERED = "REPLY_LOST_RECOVERED"
 
 
 # --- Filesystem Constants ---

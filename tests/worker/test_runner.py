@@ -23,6 +23,27 @@ from by_framework.core.protocol.commands import (
     SuspendWorkerCommand,
 )
 from by_framework.core.protocol.message_header import MessageHeader
+from by_framework.core.wait_index import encode_member, wait_index_key
+
+
+class _MockPipeline:
+    """Records pipelined data-stream writes (used by the emitter)."""
+
+    def __init__(self, redis):
+        self.redis = redis
+        self.commands = []
+
+    def xadd(self, name, fields, **kwargs):
+        self.commands.append(("xadd", name, fields))
+        self.redis.xadds.append((name, fields))
+        return self
+
+    def expire(self, name, ttl):
+        self.commands.append(("expire", name, ttl))
+        return self
+
+    async def execute(self):
+        return [None for _ in self.commands]
 
 
 def _request_readyz(port: int):
@@ -55,6 +76,12 @@ async def _wait_until(predicate, timeout=2.0, interval=0.02):
 
 
 class MockRedisRunner:
+    """Minimal Redis stub with a real ZSET/string store for the wait index.
+
+    The wait-index gate must be exercised for what it does, not for its
+    fail-open path: a stub that simply lacks `zrem` would make every runner
+    test pass through the "gate unavailable" branch and prove nothing.
+    """
 
     def __init__(self, message_to_return):
         self.msg = message_to_return
@@ -62,9 +89,32 @@ class MockRedisRunner:
         self.acked = False
         self.ack_calls = []
         self.group_create_calls = []
+        self.zsets: dict[str, dict[str, float]] = {}
+        self.strings: dict[str, str] = {}
+        self.xadds: list[tuple] = []
 
     async def xgroup_create(self, name, groupname, id="0", mkstream=False):
         self.group_create_calls.append((name, groupname, id, mkstream))
+
+    async def zadd(self, name, mapping):
+        members = self.zsets.setdefault(name, {})
+        added = sum(1 for member in mapping if member not in members)
+        members.update(mapping)
+        return added
+
+    async def zrem(self, name, *members):
+        stored = self.zsets.get(name, {})
+        return sum(1 for member in members if stored.pop(member, None) is not None)
+
+    async def set(self, name, value, ex=None):  # pylint: disable=invalid-name
+        self.strings[name] = value
+        return True
+
+    async def exists(self, *names):
+        return sum(1 for name in names if name in self.strings)
+
+    def pipeline(self):
+        return _MockPipeline(self)
 
     async def xreadgroup(self, groupname, consumername, streams, count=1, block=0):
         self.called_xreadgroup = True
@@ -570,6 +620,80 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(redis_mock.acked)
 
+    async def test_runner_treats_waiting_agent_execution_as_resumed(self):
+        """A suspended caller's record must not be re-derived from the header.
+
+        `is_resumed_execution` infers "this execution has already been through
+        a worker" from `status != QUEUED`. Persisting suspended callers as
+        WAITING_AGENT (rather than QUEUED) is what keeps that inference true
+        for them — get it wrong and the resumed execution loses the
+        parent_message_id/config snapshot restored from its record.
+        """
+        redis_mock = MockRedisRunner(message_to_return=[])
+        worker = ExecutionInspectWorker()
+        worker.registry = AsyncMock()
+        worker.registry.get_execution_by_message_id.return_value = {
+            "execution_id": "exec-waiting",
+            "message_id": "msg-waiting",
+            "session_id": "sess-1",
+            "parent_message_id": "msg-caller",
+            "status": AgentState.WAITING_AGENT.value,
+        }
+
+        runner = WorkerRunner(
+            redis_client=redis_mock, worker=worker, group_name="test_group"
+        )
+        payload = AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-waiting",
+                session_id="sess-1",
+                trace_id="trace-1",
+                target_agent_type="dummy_agent",
+            ),
+            content="test",
+        ).to_dict()
+
+        await runner._process_message_from_dict(
+            RedisKeys.ctrl_stream("dummy_agent"), "1-1", payload
+        )
+
+        self.assertTrue(worker.seen_execution.is_resumed)
+        self.assertEqual(worker.seen_execution.parent_message_id, "msg-caller")
+
+    async def test_runner_does_not_skip_waiting_agent_replay(self):
+        """WAITING_AGENT is not terminal: a suspended caller must stay
+        resumable, so the terminal-replay guard must not swallow it."""
+        redis_mock = MockRedisRunner(message_to_return=[])
+        worker = ExecutionInspectWorker()
+        worker.registry = AsyncMock()
+        worker.registry.get_execution_by_message_id.return_value = {
+            "execution_id": "exec-waiting",
+            "message_id": "msg-waiting",
+            "session_id": "sess-1",
+            "parent_message_id": "",
+            "status": AgentState.WAITING_AGENT.value,
+        }
+
+        runner = WorkerRunner(
+            redis_client=redis_mock, worker=worker, group_name="test_group"
+        )
+        payload = ResumeCommand(
+            header=MessageHeader(
+                message_id="msg-waiting",
+                session_id="sess-1",
+                trace_id="trace-1",
+                target_agent_type="dummy_agent",
+            ),
+            status=AgentState.COMPLETED.value,
+            reply_data={"answer": 1},
+        ).to_dict()
+
+        await runner._process_message_from_dict(
+            RedisKeys.ctrl_stream("dummy_agent"), "1-1", payload
+        )
+
+        self.assertIsNotNone(worker.seen_execution)
+
     async def test_runner_skips_replayed_cancelled_message_and_acks_it(self):
         """Test that cancelled replayed messages are skipped
         without processing and are acked."""
@@ -853,6 +977,127 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
             ),
             captured.output,
         )
+
+    def _resume_payload(self):
+        """A reply shaped like GatewayWorker._enqueue_agent_return's."""
+        return ResumeCommand(
+            header=MessageHeader(
+                message_id="msg-caller",
+                session_id="sess-gate",
+                trace_id="trace-1",
+                source_agent_type="agent-b",
+                target_agent_type="dummy_agent",
+                parent_message_id="msg-child",
+            ),
+            status=AgentState.COMPLETED.value,
+            reply_data={"value": 1},
+        ).to_dict()
+
+    def _gated_runner(self, redis_mock):
+        worker = ExecutionInspectWorker()
+        worker.registry = AsyncMock()
+        worker.registry.get_execution_by_message_id.return_value = {
+            "execution_id": "exec-caller",
+            "message_id": "msg-caller",
+            "session_id": "sess-gate",
+            "parent_message_id": "",
+            "status": AgentState.WAITING_AGENT.value,
+        }
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            span_recorder=AsyncMock(),
+        )
+        runner._trace_writer = AsyncMock()
+        return runner, worker
+
+    async def test_runner_wakes_the_caller_once_for_a_duplicated_reply(self):
+        """The gate's reason for existing: once a sweep can synthesize a
+        reply, two copies exist for one wait. The second must not re-run a
+        caller that already resumed."""
+        redis_mock = MockRedisRunner(message_to_return=[])
+        runner, worker = self._gated_runner(redis_mock)
+        # The entry the dispatch wrote when the caller suspended.
+        member = encode_member("sess-gate", "msg-caller", "msg-child", "")
+        redis_mock.zsets[wait_index_key("sess-gate")] = {member: 1.0}
+        stream = RedisKeys.ctrl_stream("dummy_agent")
+        payload = self._resume_payload()
+
+        await runner._process_message_from_dict(stream, "1-0", payload)
+        self.assertIsNotNone(worker.seen_execution)
+
+        worker.seen_execution = None
+        await runner._process_message_from_dict(stream, "1-1", payload)
+
+        self.assertIsNone(worker.seen_execution)
+        # Dropped, not left dangling: the message is acked...
+        self.assertIn((stream, "test_group", ("1-1",)), redis_mock.ack_calls)
+        # ...and the discarded work is announced on the data plane, since the
+        # sub-agent really ran and nobody will consume its result.
+        events = [
+            json.loads(fields["data"])
+            for stream_name, fields in redis_mock.xadds
+            if "data" in fields
+        ]
+        self.assertTrue(
+            any(event["event_type"] == "orphanedReply" for event in events), events
+        )
+
+    async def test_runner_processes_a_reply_that_was_never_registered(self):
+        """RED LINE: a reply whose wait predates this version (or whose entry
+        expired) has no index entry at all. Treating that like a duplicate
+        would drop every in-flight reply during a rolling upgrade."""
+        redis_mock = MockRedisRunner(message_to_return=[])
+        runner, worker = self._gated_runner(redis_mock)
+
+        await runner._process_message_from_dict(
+            RedisKeys.ctrl_stream("dummy_agent"), "1-0", self._resume_payload()
+        )
+
+        self.assertIsNotNone(worker.seen_execution)
+
+    async def test_runner_processes_a_reply_when_the_gate_is_unavailable(self):
+        """RED LINE: the gate fails open. A Redis hiccup must cost a possible
+        duplicate, never a silently swallowed reply."""
+
+        class BrokenGateRedis(MockRedisRunner):
+
+            async def zrem(self, name, *members):
+                raise ConnectionError("redis is down")
+
+        redis_mock = BrokenGateRedis(message_to_return=[])
+        runner, worker = self._gated_runner(redis_mock)
+        member = encode_member("sess-gate", "msg-caller", "msg-child", "")
+        redis_mock.zsets[wait_index_key("sess-gate")] = {member: 1.0}
+
+        await runner._process_message_from_dict(
+            RedisKeys.ctrl_stream("dummy_agent"), "1-0", self._resume_payload()
+        )
+
+        self.assertIsNotNone(worker.seen_execution)
+
+    async def test_runner_does_not_gate_a_fresh_ask_agent_command(self):
+        """Only replies resolve a wait. An AskAgentCommand that happens to
+        collide with a consumed marker must still be processed."""
+        redis_mock = MockRedisRunner(message_to_return=[])
+        runner, worker = self._gated_runner(redis_mock)
+        worker.registry.get_execution_by_message_id.return_value = None
+        payload = AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-caller",
+                session_id="sess-gate",
+                trace_id="trace-1",
+                target_agent_type="dummy_agent",
+            ),
+            content="hello",
+        ).to_dict()
+
+        await runner._process_message_from_dict(
+            RedisKeys.ctrl_stream("dummy_agent"), "1-0", payload
+        )
+
+        self.assertIsNotNone(worker.seen_execution)
 
     async def test_runner_does_not_warn_when_resume_command_execution_resolves(self):
         """A ResumeCommand that correctly resolves to its suspended execution
