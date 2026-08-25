@@ -999,7 +999,7 @@ class WaitIndexSweeper:
             ),
             extra_payload={},
             error_code=error_code,
-            metadata={},
+            metadata=dict(child.get("metadata") or {}),
         )
         return outcome if emitted else OUTCOME_UNROUTABLE
 

@@ -1508,3 +1508,34 @@ async def test_dispatch_records_task_group_id_on_the_execution():
     payload = init_execution.await_args.args[0]
     assert payload["task_group_id"] == group["task_group_id"]
     assert payload["source_agent_type"] == "agent-a"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_records_caller_metadata_on_the_execution():
+    """A resumed sub-task rebuilds its reply header's metadata from this
+    snapshot, not from whatever message wakes it — so the caller's original
+    metadata has to be persisted here, same as the routing fields above."""
+    from unittest.mock import patch
+
+    mock_redis = _online_redis()
+    ctx = AgentContext(
+        session_id="s1",
+        trace_id="t1",
+        redis_client=mock_redis,
+        current_agent_id="agent-a",
+        message_id="parent-msg",
+    )
+
+    with patch(
+        "by_framework.core.registry.WorkerRegistry.initialize_execution",
+        new_callable=AsyncMock,
+    ) as init_execution:
+        await ctx.call_agent(
+            target_agent_type="agent-b",
+            content="one",
+            metadata={"caller": "agent-a", "request_id": "req-1"},
+        )
+
+    payload = init_execution.await_args.args[0]
+    assert payload["metadata"]["caller"] == "agent-a"
+    assert payload["metadata"]["request_id"] == "req-1"

@@ -456,6 +456,10 @@ class TestOddEntries(unittest.IsolatedAsyncioTestCase):
             target_agent_type="agent-b",
             status=AgentState.COMPLETED.value,
             worker_id="worker-b",
+            # A's original dispatch metadata, persisted at
+            # initialize_execution() time: the synthesized failure must
+            # restore it instead of emitting an empty dict.
+            metadata={"caller": "original", "request_id": "req-1"},
         )
         _due_member(
             self.redis,
@@ -475,6 +479,13 @@ class TestOddEntries(unittest.IsolatedAsyncioTestCase):
             reply["body"]["reply_data"]["error_code"],
             LivenessErrorCode.REPLY_LOST_RECOVERED,
         )
+        # A's original metadata rides along the synthesized failure, same as
+        # every other reply shape to A — not discarded as `{}`.
+        reply_metadata = reply["header"]["metadata"]
+        self.assertEqual(reply_metadata["caller"], "original")
+        self.assertEqual(reply_metadata["request_id"], "req-1")
+        # The sweeper's own provenance keys still ride on top.
+        self.assertEqual(reply_metadata["synthesized_by"], "wait_sweeper")
 
     async def test_dead_worker_reply_mirrors_a_real_agent_return(self):
         self._add_suspended_caller()
