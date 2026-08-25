@@ -431,7 +431,13 @@ Entry anatomy:
   to no execution. `_resolve_reply_header()` must read a resumed execution's
   caller from the execution record, not from the resume header (which names
   the sub-agent), while excluding `CLIENT_SOURCE_AGENT_TYPE` for the reason
-  spelled out under `worker.py`; and no callback may be sent while
+  spelled out under `worker.py`; it restores **four** fields from that record
+  — `source_agent_type`, `parent_message_id`, `task_group_id` and
+  `metadata` — the last one as a full replacement, never merged with the
+  waking message's own metadata, exactly as `worker.py`'s
+  `_resolve_reply_command()` does (restoring only the three routing fields is
+  the drift this entry warns about: it shipped that way and leaked the waking
+  hop's metadata to the caller); and no callback may be sent while
   `context._is_suspended` (with the same terminal-status exception).
   Being a *second* entry point for replies, it carries the same
   `core/wait_gate.py` gate as `runner.py` — a gate on one of two doors is not

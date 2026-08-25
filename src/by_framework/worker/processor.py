@@ -233,6 +233,16 @@ class GatewayProcessor:
         for the same reason as there, ``CLIENT_SOURCE_AGENT_TYPE`` is not a
         caller. It is what a client writes on a root execution's record, and
         nothing consumes its control stream.
+
+        Four fields come from that snapshot, not from the waking message:
+        ``source_agent_type``, ``parent_message_id``, ``task_group_id`` and
+        ``metadata``. The last one is restored as a full replacement rather
+        than a merge, exactly as ``GatewayWorker._resolve_reply_command``
+        does it: the waking message (an ``ask_user`` answer, or a sub-call's
+        reply) is transient plumbing for that one hop, not something the
+        caller ever sent. A snapshot missing the field (an execution recorded
+        before it existed) degrades to an empty dict rather than leaking the
+        waking message's metadata to the caller.
         """
         header = command.header
         if not isinstance(command, ResumeCommand):
@@ -262,6 +272,7 @@ class GatewayProcessor:
             source_agent_type=caller_agent_type,
             parent_message_id=str((execution or {}).get("parent_message_id", "") or ""),
             task_group_id=str((execution or {}).get("task_group_id", "") or ""),
+            metadata=dict((execution or {}).get("metadata") or {}),
         )
 
     async def _enqueue_callback(
