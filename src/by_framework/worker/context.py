@@ -875,6 +875,11 @@ class AgentContext:
                         # the reply belongs to — the resume message itself
                         # describes the hop that woke it, not this dispatch.
                         "task_group_id": task_group_id,
+                        # A's original dispatch metadata, so a resumed reply
+                        # can restore it as the base layer instead of
+                        # inheriting whatever message last woke this
+                        # execution up (see _resolve_reply_command).
+                        "metadata": dict(command.header.metadata),
                         "stream_name": delivery_stream,
                         "status": "QUEUED",
                         "route_policy": route_policy,

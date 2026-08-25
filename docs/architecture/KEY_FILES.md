@@ -194,9 +194,14 @@ Entry anatomy:
   and *no* reply — registration happens before the dispatch `xadd`, so a
   failed `xadd` leaves exactly that. Synthesized failures must stay shaped
   like a sub-agent's own failure (`error`/`error_code` in `reply_data`,
-  same stream, same header id reversal). Two switches, and they must stay
-  separate: *compensation* (the triage, replies, renewals, cancellation) is
-  off unless `BY_FRAMEWORK_WAIT_SWEEPER_ENABLED` is set and is the rollback
+  same stream, same header id reversal). `_synthesize_failure()` seeds its
+  reply's metadata from `child.get("metadata")` — the callee's execution
+  snapshot, where `context.py`'s `initialize_execution()` persists the
+  caller's original dispatch metadata — instead of an empty dict, so a
+  caller that never gets a real reply at all still gets its own metadata
+  back, consistent with every other reply shape to it. Two switches, and
+  they must stay separate: *compensation* (the triage, replies, renewals,
+  cancellation) is off unless `BY_FRAMEWORK_WAIT_SWEEPER_ENABLED` is set and is the rollback
   switch for the whole liveness feature, while *pruning* is on by default
   (`BY_FRAMEWORK_WAIT_PRUNE_ENABLED`) because nothing else ever removes a
   wait-index entry — with compensation off, every call whose reply never
@@ -340,6 +345,14 @@ Entry anatomy:
   `ask_user` round is the common one) posts its result to a control stream
   nobody consumes and, worse, stops emitting the end-of-stream event the user
   is waiting on, because it now believes it owes an agent a reply.
+  `_resolve_reply_command()` restores `header.metadata` from the same
+  execution snapshot (`existing_data["metadata"]`) as a full *replacement*,
+  never merged with the resuming command's own metadata: that metadata
+  belongs to whatever woke this execution up (an `ask_user` answer, or a
+  sub-call's reply), not to the original caller, and leaking it would let a
+  transient hop overwrite the caller's own data instead of being layered
+  under `task_result.metadata` like `_enqueue_agent_return()`'s merge
+  already does correctly.
   The success path must NOT reply while `context._is_suspended` — a suspended
   execution has no result, and forwarding the value the handler returned in
   order to unwind both wakes the caller early and consumes the single reply it
@@ -397,7 +410,12 @@ Entry anatomy:
   so: it is bookkeeping, not the dispatch.
   `initialize_execution()`'s payload carries `source_agent_type` and
   `task_group_id` because they are the only durable record of who a
-  suspended callee owes its reply to (see `worker.py`).
+  suspended callee owes its reply to (see `worker.py`). It also carries
+  `metadata` (a copy of the dispatched `command.header.metadata`) for the
+  same reason: it is the only durable record of what the caller's metadata
+  *was*, and `worker.py`'s `_resolve_reply_command()` reads it back
+  verbatim so a caller's metadata survives however many times the callee
+  suspends and resumes before it finally replies.
   `_suspended_state` records *which* state the execution is waiting in and is
   what the framework persists; keep it set/rolled-back in lockstep with
   `_is_suspended`.

@@ -219,10 +219,13 @@ class WorkspaceManagerStub:
 class ChainAgent(GatewayWorker):
     """Calls `next_agent_type` on first contact, answers on resume."""
 
-    def __init__(self, agent_type, next_agent_type, *args, **kwargs):
+    def __init__(
+        self, agent_type, next_agent_type, *args, dispatch_metadata=None, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.agent_type = agent_type
         self.next_agent_type = next_agent_type
+        self.dispatch_metadata = dispatch_metadata
         self.dispatch_calls = 0
         self.resume_payloads: list[Any] = []
 
@@ -235,12 +238,20 @@ class ChainAgent(GatewayWorker):
             return {
                 "status": AgentState.COMPLETED.value,
                 "reply_data": {"from": self.agent_type, "sub": command.reply_data},
+                # Own metadata this link contributes: must override
+                # same-named keys from whatever it was dispatched with, while
+                # leaving other inherited keys untouched.
+                "metadata": {
+                    "agent": self.agent_type,
+                    "tag": f"from-{self.agent_type}",
+                },
             }
         self.dispatch_calls += 1
         await context.call_agent(
             target_agent_type=self.next_agent_type,
             content="delegate",
             wait_for_reply=True,
+            metadata=self.dispatch_metadata,
         )
         return {"status": AgentState.QUEUED.value}
 
@@ -261,6 +272,9 @@ class AskingMiddleAgent(GatewayWorker):
             return {
                 "status": AgentState.COMPLETED.value,
                 "reply_data": {"from": "agent-b", "user_said": command.content},
+                # Own metadata this link contributes: must override
+                # same-named keys from A's original dispatch metadata.
+                "metadata": {"agent": "agent-b", "tag": "from-agent-b"},
             }
         return await context.ask_user("which colour?")
 
@@ -318,7 +332,17 @@ class TestNestedChain(unittest.IsolatedAsyncioTestCase):
         workspace = WorkspaceManagerStub()
 
         self.agent_a = ChainAgent(
-            "agent-a", "agent-b", "worker-a", self.redis, self.registry, workspace
+            "agent-a",
+            "agent-b",
+            "worker-a",
+            self.redis,
+            self.registry,
+            workspace,
+            # A's own dispatch metadata to B: the "A's original metadata"
+            # this task is about. Must reach A's own reply intact even
+            # though B suspends (via a nested call_agent to C) before B
+            # finally replies.
+            dispatch_metadata={"caller": "agent-a", "tag": "keep"},
         )
         self.agent_b = ChainAgent(
             "agent-b", "agent-c", "worker-b", self.redis, self.registry, workspace
@@ -373,6 +397,12 @@ class TestNestedChain(unittest.IsolatedAsyncioTestCase):
         # Addressed to A's suspended execution, and identifying B's sub-task.
         self.assertEqual(reply.header.message_id, "msg-root")
         self.assertEqual(reply.header.source_agent_type, "agent-b")
+        # A's own dispatch metadata to B survives B suspending on a nested
+        # call_agent to C, and B's own returned metadata overrides same-named
+        # keys instead of being discarded or replacing the whole dict.
+        self.assertEqual(reply.header.metadata["caller"], "agent-a")
+        self.assertEqual(reply.header.metadata["tag"], "from-agent-b")
+        self.assertEqual(reply.header.metadata["agent"], "agent-b")
 
         await self._step("agent-a")  # A resumes with B's answer
 
@@ -437,7 +467,15 @@ class TestSubAgentAsksTheUser(unittest.IsolatedAsyncioTestCase):
         workspace = WorkspaceManagerStub()
 
         self.agent_a = ChainAgent(
-            "agent-a", "agent-b", "worker-a", self.redis, self.registry, workspace
+            "agent-a",
+            "agent-b",
+            "worker-a",
+            self.redis,
+            self.registry,
+            workspace,
+            # A's own dispatch metadata to B: must reach A's reply intact
+            # even though B suspends on ask_user before it replies.
+            dispatch_metadata={"caller": "agent-a", "tag": "keep"},
         )
         self.agent_b = AskingMiddleAgent(
             "worker-b", self.redis, self.registry, workspace
@@ -472,7 +510,7 @@ class TestSubAgentAsksTheUser(unittest.IsolatedAsyncioTestCase):
         await runner._run_once()
         await runner.wait_for_tasks()
 
-    async def _answer_the_user_prompt(self, message_id, answer="Pink"):
+    async def _answer_the_user_prompt(self, message_id, answer="Pink", metadata=None):
         """What a client sends when the person replies.
 
         `GatewayClient.send_message(action_type=RESUME)` reuses the suspended
@@ -487,6 +525,7 @@ class TestSubAgentAsksTheUser(unittest.IsolatedAsyncioTestCase):
                     session_id=self.session_id,
                     trace_id="trace-ask",
                     target_agent_type="agent-b",
+                    metadata=metadata or {},
                 ),
                 content=answer,
             ).to_redis_payload(),
@@ -512,7 +551,12 @@ class TestSubAgentAsksTheUser(unittest.IsolatedAsyncioTestCase):
         await self._step("agent-b")
         b_dispatch = _dispatched_message_id(self.redis, "agent-b")
 
-        await self._answer_the_user_prompt(b_dispatch)
+        await self._answer_the_user_prompt(
+            b_dispatch,
+            # The answering client's own metadata for this hop: transient
+            # plumbing that must not leak through to A.
+            metadata={"caller": "should-not-leak", "client_tag": "should-not-leak"},
+        )
         await self._step("agent-b")
 
         self.assertEqual(self.agent_b.user_answers, ["Pink"])
@@ -522,6 +566,14 @@ class TestSubAgentAsksTheUser(unittest.IsolatedAsyncioTestCase):
         # record its own dispatch wrote, which is the whole point.
         self.assertEqual(replies_to_a[0].header.message_id, "msg-root")
         self.assertEqual(replies_to_a[0].header.source_agent_type, "agent-b")
+        # A's own dispatch metadata to B survives the ask_user round-trip —
+        # it is NOT replaced by the answering client's own resume metadata —
+        # and B's own returned metadata overrides same-named keys.
+        reply_metadata = replies_to_a[0].header.metadata
+        self.assertEqual(reply_metadata["caller"], "agent-a")
+        self.assertEqual(reply_metadata["tag"], "from-agent-b")
+        self.assertEqual(reply_metadata["agent"], "agent-b")
+        self.assertNotIn("client_tag", reply_metadata)
 
         await self._step("agent-a")
 
