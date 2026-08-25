@@ -343,6 +343,14 @@ class GatewayWorker(ABC):
         Treating "is a resume" as "has no caller" is what used to make an
         A -> B -> C chain silently drop B's result on the floor.
 
+        ``header.metadata`` is restored the same way, as a full replacement
+        rather than a merge with the waking message's own metadata: the
+        waking message (an ``ask_user`` answer, or a sub-call's reply) is
+        transient plumbing for that hop, not something A ever sent or asked
+        for. If A's original metadata is missing from the snapshot (an
+        execution recorded before this field existed), this degrades to an
+        empty dict rather than leaking the waking message's metadata to A.
+
         A root execution's record names ``CLIENT_SOURCE_AGENT_TYPE`` as its
         source, which is a marker rather than an agent type — it has to be
         excluded explicitly, or every client-dispatched execution that ever
@@ -365,6 +373,7 @@ class GatewayWorker(ABC):
                 source_agent_type=caller_agent_type,
                 parent_message_id=str(snapshot.get("parent_message_id", "") or ""),
                 task_group_id=str(snapshot.get("task_group_id", "") or ""),
+                metadata=dict(snapshot.get("metadata") or {}),
             ),
         )
 

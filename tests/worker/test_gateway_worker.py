@@ -1017,6 +1017,10 @@ async def test_resumed_execution_replies_to_its_own_caller_not_the_sub_agent(tmp
             target_agent_type="structured_agent",
             parent_message_id="msg-c",  # B's sub-task
             task_group_id="tg-of-c",  # B's OWN group, not the one B belongs to
+            # C's own metadata for this hop: transient plumbing that must not
+            # leak through to A — A's original metadata below is the base
+            # instead.
+            metadata={"caller": "should-not-leak", "from_c": "should-not-leak"},
         ),
         status=AgentState.COMPLETED.value,
         reply_data={"from": "c"},
@@ -1038,6 +1042,9 @@ async def test_resumed_execution_replies_to_its_own_caller_not_the_sub_agent(tmp
             "source_agent_type": "agent-a",
             "parent_message_id": "msg-a",
             "task_group_id": "tg-of-a",
+            # A's original dispatch metadata, persisted at
+            # initialize_execution() time.
+            "metadata": {"caller": "original", "request_id": "req-1"},
             **snapshot_fields,
         },
     )
@@ -1055,6 +1062,13 @@ async def test_resumed_execution_replies_to_its_own_caller_not_the_sub_agent(tmp
     assert reply.header.task_group_id == "tg-of-a"
     assert reply.header.source_agent_type == "structured_agent"
     assert reply.reply_data == {"answer": 42}
+    # A's original metadata is the base, B's own task_result.metadata
+    # (StructuredResultWorker returns {"tokens": 123, "caller": "overridden"})
+    # overrides same-named keys; C's waking metadata does not leak through.
+    assert reply.header.metadata["caller"] == "overridden"
+    assert reply.header.metadata["request_id"] == "req-1"
+    assert reply.header.metadata["tokens"] == 123
+    assert "from_c" not in reply.header.metadata
 
 
 @pytest.mark.asyncio
