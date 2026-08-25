@@ -297,6 +297,20 @@ class RedisKeys:
             v2_suffix=f"task_group:{{{group_id}}}:results",
         )
 
+    @classmethod
+    def harness_state(cls, execution_id: str) -> str:
+        """Serialized in-flight native-agent-harness loop state.
+
+        Keyed purely by execution_id — the same identity the registry
+        already reattaches on RESUME — so any worker instance that picks up
+        the eventual ResumeCommand can rehydrate the loop, not only the one
+        that started it.
+        """
+        return cls._versioned(
+            v1_key=f"byai_gateway:harness_state:{execution_id}",
+            v2_suffix=f"harness_state:{{{execution_id}}}",
+        )
+
     # --- Registry ---
     @classmethod
     def known_workers(cls) -> str:
@@ -529,6 +543,10 @@ MSG_MAP_PREFIX = "msg_map:"
 TASK_GROUP_FIELD_TOTAL = "total"
 TASK_GROUP_FIELD_COMPLETED = "completed"
 TASK_GROUP_FIELD_SOURCE_AGENT = "source_agent_type"
+# Set once dispatch fails partway through a batch; any reply that arrives
+# for an aborted group is discarded instead of resuming the (already
+# terminated) caller execution.
+TASK_GROUP_FIELD_ABORTED = "aborted"
 
 
 # --- Timing and Sleep Constants ---
@@ -538,6 +556,8 @@ CONTROL_LOOP_SLEEP_SECONDS = 0.01
 WAIT_FOR_TASKS_TIMEOUT_SECONDS = 5.0
 # Task group Key TTL (seconds), default 1 day
 TASK_GROUP_TTL_SECONDS = 86400
+# Native agent harness loop-state Key TTL (seconds), default 1 day
+HARNESS_STATE_TTL_SECONDS = 86400
 # First retry wait time (seconds)
 FIRST_RETRY_WAIT_SECONDS = 1.0
 # Maximum retry count

@@ -8,8 +8,10 @@ import pytest
 
 import by_framework.worker.context as context_module
 from by_framework import AgentContext
+from by_framework.common.constants import TASK_GROUP_FIELD_ABORTED, RedisKeys
 from by_framework.core.extensions.plugin import Plugin, PluginManifest
 from by_framework.core.extensions.registry import PluginRegistry
+from by_framework.core.protocol.agent_state import AgentState
 from by_framework.core.protocol.byai_codec import ByaiContentCodec
 from by_framework.core.protocol.commands import (AskAgentCommand, command_from_dict)
 from by_framework.core.protocol.message import (BaiYingMessage, BaiYingMessageRole)
@@ -327,6 +329,8 @@ async def test_context_dispatch_group_propagates_langfuse_observation_id():
     mock_pipe = MagicMock()
     mock_pipe.execute = AsyncMock(return_value=[])
     mock_redis.pipeline.return_value = mock_pipe
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.get = AsyncMock(return_value=b"1")
 
     ctx = AgentContext(session_id="s1", trace_id="t1", redis_client=mock_redis)
 
@@ -365,6 +369,8 @@ async def test_context_dispatch_group_prefers_metadata_langfuse_parent():
     mock_pipe = MagicMock()
     mock_pipe.execute = AsyncMock(return_value=[])
     mock_redis.pipeline.return_value = mock_pipe
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.get = AsyncMock(return_value=b"1")
 
     ctx = AgentContext(session_id="s1", trace_id="t1", redis_client=mock_redis)
 
@@ -405,6 +411,8 @@ async def test_context_dispatch_group_triggers_plugin_lifecycle_hooks():
     mock_pipe = MagicMock()
     mock_pipe.execute = AsyncMock(return_value=[])
     mock_redis.pipeline.return_value = mock_pipe
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.get = AsyncMock(return_value=b"1")
 
     plugin = RecordingCallAgentPlugin()
     registry = PluginRegistry()
@@ -426,7 +434,7 @@ async def test_context_dispatch_group_triggers_plugin_lifecycle_hooks():
         ],
     )
 
-    assert result["status"] == "GROUP_QUEUED"
+    assert result["status"] == AgentState.QUEUED.value
     assert [event[0] for event in plugin.events] == [
         "start",
         "complete",
@@ -437,6 +445,129 @@ async def test_context_dispatch_group_triggers_plugin_lifecycle_hooks():
         "agent-b",
         "agent-c",
     }
+
+
+@pytest.mark.asyncio
+async def test_context_call_agents_dispatches_like_dispatch_group():
+    """call_agents is call_agent's plural: same dispatch, same status vocabulary."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.get = AsyncMock(return_value=b"1")
+
+    ctx = AgentContext(
+        session_id="s1",
+        trace_id="t1",
+        redis_client=mock_redis,
+        current_agent_id="agent-a",
+        message_id="parent-msg",
+    )
+
+    result = await ctx.call_agents(
+        tasks=[
+            {"target_agent_type": "agent-b", "content": "one"},
+            {"target_agent_type": "agent-c", "content": "two"},
+        ],
+    )
+
+    assert result["status"] == AgentState.QUEUED.value
+    assert len(result["dispatched_tasks"]) == 2
+    assert mock_redis.xadd.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_context_call_agents_marks_unavailable_task_failed():
+    """An offline target agent type fails fast as one group member, the
+    rest of the batch still dispatches."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock()
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_redis.hincrby = AsyncMock(return_value=1)
+
+    async def smembers_side_effect(name):
+        if name == RedisKeys.agent_type_members("agent-b"):
+            return {b"worker-1"}
+        return set()
+
+    mock_redis.smembers = AsyncMock(side_effect=smembers_side_effect)
+    mock_redis.get = AsyncMock(return_value=b"1")
+
+    plugin = RecordingCallAgentPlugin()
+    registry = PluginRegistry()
+    registry.register_bundle(plugin)
+
+    ctx = AgentContext(
+        session_id="s1",
+        trace_id="t1",
+        redis_client=mock_redis,
+        current_agent_id="agent-a",
+        message_id="parent-msg",
+        plugin_registry=registry,
+    )
+
+    result = await ctx.call_agents(
+        tasks=[
+            {"target_agent_type": "agent-b", "content": "one"},
+            {"target_agent_type": "agent-c", "content": "two"},
+        ],
+    )
+
+    assert result["status"] == AgentState.QUEUED.value
+    assert len(result["dispatched_tasks"]) == 2
+
+    # Only the available target actually got dispatched.
+    assert mock_redis.xadd.await_count == 1
+    xadd_args, _ = mock_redis.xadd.call_args
+    dispatched_command = command_from_dict(json.loads(xadd_args[1]["data"]))
+    assert dispatched_command.header.target_agent_type == "agent-b"
+
+    # The unavailable task was recorded as FAILED and counted toward completion.
+    assert mock_redis.hincrby.await_count == 1
+    results_writes = [c for c in mock_redis.hset.await_args_list if len(c.args) >= 3]
+    assert len(results_writes) == 1
+    failure_payload = json.loads(results_writes[0].args[2])
+    assert failure_payload["status"] == AgentState.FAILED.value
+    assert failure_payload["target_agent_type"] == "agent-c"
+    assert failure_payload["error_code"] == "AGENT_TYPE_UNAVAILABLE"
+
+    # Same plugin hooks call_agent's own availability failure fires: a
+    # "start"/"error" pair for the unavailable agent-c, alongside the
+    # normal "start"/"complete" pair for the dispatched agent-b.
+    assert [event[0] for event in plugin.events] == [
+        "start",
+        "complete",
+        "start",
+        "error",
+    ]
+    assert {e[1] for e in plugin.events if e[0] == "start"} == {"agent-b", "agent-c"}
+    error_event = next(e for e in plugin.events if e[0] == "error")
+    assert failure_payload["error"] in error_event[1]
+
+
+@pytest.mark.asyncio
+async def test_context_dispatch_group_rejects_empty_task_list():
+    """An empty task list is a caller bug, not a valid no-op group."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_redis.xadd = AsyncMock()
+
+    ctx = AgentContext(session_id="s1", trace_id="t1", redis_client=mock_redis)
+
+    with pytest.raises(ValueError):
+        await ctx.dispatch_group(tasks=[])
+
+    mock_redis.hset.assert_not_called()
+    mock_redis.xadd.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -451,6 +582,8 @@ async def test_context_dispatch_group_triggers_error_hook_on_dispatch_failure():
     mock_pipe = MagicMock()
     mock_pipe.execute = AsyncMock(return_value=[])
     mock_redis.pipeline.return_value = mock_pipe
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.get = AsyncMock(return_value=b"1")
 
     plugin = RecordingCallAgentPlugin()
     registry = PluginRegistry()
@@ -473,6 +606,49 @@ async def test_context_dispatch_group_triggers_error_hook_on_dispatch_failure():
     assert [event[0] for event in plugin.events] == ["start", "error"]
     assert plugin.events[0][1] == "agent-b"
     assert "redis down" in plugin.events[1][1]
+
+
+@pytest.mark.asyncio
+async def test_context_call_agents_marks_group_aborted_on_mid_dispatch_failure():
+    """A dispatch-time infra error stops the batch and marks the Task Group
+    aborted, so already-sent siblings' replies won't later resume a caller
+    execution that already ended in failure."""
+    from unittest.mock import MagicMock
+
+    mock_redis = MagicMock()
+    mock_redis.xadd = AsyncMock(side_effect=[None, RuntimeError("redis down")])
+    mock_redis.hset = AsyncMock()
+    mock_redis.expire = AsyncMock()
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.get = AsyncMock(return_value=b"1")
+
+    ctx = AgentContext(
+        session_id="s1",
+        trace_id="t1",
+        redis_client=mock_redis,
+        current_agent_id="agent-a",
+        message_id="parent-msg",
+    )
+
+    with pytest.raises(RuntimeError, match="redis down"):
+        await ctx.call_agents(
+            tasks=[
+                {"target_agent_type": "agent-b", "content": "one"},
+                {"target_agent_type": "agent-c", "content": "two"},
+                {"target_agent_type": "agent-d", "content": "three"},
+            ],
+        )
+
+    # Only the two tasks up to (and including) the failing one were attempted.
+    assert mock_redis.xadd.await_count == 2
+
+    abort_writes = [
+        c
+        for c in mock_redis.hset.await_args_list
+        if len(c.args) >= 2 and c.args[1] == TASK_GROUP_FIELD_ABORTED
+    ]
+    assert len(abort_writes) == 1
+    assert abort_writes[0].args[2] == "1"
 
 
 @pytest.mark.asyncio
@@ -637,6 +813,8 @@ async def test_context_dispatch_group_serializes_baiying_message_with_codec():
     mock_pipe = MagicMock()
     mock_pipe.execute = AsyncMock(return_value=[])
     mock_redis.pipeline.return_value = mock_pipe
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.get = AsyncMock(return_value=b"1")
 
     ctx = AgentContext(
         session_id="s1",
@@ -682,6 +860,8 @@ async def test_context_dispatch_group_records_dispatch_spans():
     mock_pipe = MagicMock()
     mock_pipe.execute = AsyncMock(return_value=[])
     mock_redis.pipeline.return_value = mock_pipe
+    mock_redis.smembers = AsyncMock(return_value={b"worker-1"})
+    mock_redis.get = AsyncMock(return_value=b"1")
     span_recorder = AsyncMock()
 
     ctx = AgentContext(

@@ -45,6 +45,7 @@ packages = ["src/by_framework"]
 
 [tool.uv.workspace]
 members = [
+    "libs/by-framework-agent",
     "libs/by-framework-history-postgres",
     "libs/by-framework-history-byclaw",
     "libs/by-framework-langgraph",
