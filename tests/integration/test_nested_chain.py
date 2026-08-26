@@ -228,11 +228,16 @@ class ChainAgent(GatewayWorker):
         self.dispatch_metadata = dispatch_metadata
         self.dispatch_calls = 0
         self.resume_payloads: list[Any] = []
+        # What each invocation was actually handed, so a test can assert on
+        # the inbound direction (what this agent reads) as well as on the
+        # outbound one (what it sends).
+        self.seen_metadata: list[dict] = []
 
     def get_agent_types(self) -> list[str]:
         return [self.agent_type]
 
     async def process_command(self, command, context: Any):
+        self.seen_metadata.append(dict(command.header.metadata))
         if isinstance(command, ResumeCommand):
             self.resume_payloads.append(command.reply_data)
             return {
@@ -262,11 +267,13 @@ class AskingMiddleAgent(GatewayWorker):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.user_answers: list[Any] = []
+        self.seen_metadata: list[dict] = []
 
     def get_agent_types(self) -> list[str]:
         return ["agent-b"]
 
     async def process_command(self, command, context: Any):
+        self.seen_metadata.append(dict(command.header.metadata))
         if isinstance(command, ResumeCommand):
             self.user_answers.append(command.content)
             return {
@@ -500,6 +507,10 @@ class TestSubAgentAsksTheUser(unittest.IsolatedAsyncioTestCase):
                     session_id=self.session_id,
                     trace_id="trace-ask",
                     target_agent_type="agent-a",
+                    # A's OWN request metadata — distinct from the metadata A
+                    # passes down to B, and never forwarded to B. A must be
+                    # able to read it again after B wakes it back up.
+                    metadata={"root": "from-client"},
                 ),
                 content="start",
             ).to_redis_payload(),
@@ -575,6 +586,15 @@ class TestSubAgentAsksTheUser(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reply_metadata["agent"], "agent-b")
         self.assertNotIn("client_tag", reply_metadata)
 
+        # The INBOUND direction, which is a different rule: B is the addressee
+        # of the client's answer, so that answer's metadata is payload for B
+        # rather than someone else's plumbing. B reads its own dispatch
+        # metadata AND the answer's, with the answer winning collisions.
+        b_resumed_with = self.agent_b.seen_metadata[1]
+        self.assertEqual(b_resumed_with["tag"], "keep")
+        self.assertEqual(b_resumed_with["caller"], "should-not-leak")
+        self.assertEqual(b_resumed_with["client_tag"], "should-not-leak")
+
         await self._step("agent-a")
 
         self.assertEqual(
@@ -583,6 +603,29 @@ class TestSubAgentAsksTheUser(unittest.IsolatedAsyncioTestCase):
         )
         # Both links have unwound: nothing is left parked in the wait index.
         self.assertEqual(_wait_members(self.redis, self.session_id), [])
+
+    async def test_a_reads_its_own_root_metadata_after_b_wakes_it(self):
+        """The reported bug: A's own metadata vanished once B woke it.
+
+        A never gets its request metadata back from B — B replies with what A
+        dispatched B *with*, not with what A itself was dispatched with. The
+        only copy is on A's own execution record, which is why the worker
+        picking a message up records its metadata rather than relying on
+        whoever sent it (a client root dispatch writes no such field).
+        """
+        await self._step("agent-a")
+        await self._step("agent-b")
+        b_dispatch = _dispatched_message_id(self.redis, "agent-b")
+        await self._answer_the_user_prompt(b_dispatch)
+        await self._step("agent-b")
+        await self._step("agent-a")
+
+        a_resumed_with = self.agent_a.seen_metadata[1]
+        # What the client dispatched A with, still readable after the suspend.
+        self.assertEqual(a_resumed_with["root"], "from-client")
+        # And B's reply metadata layered on top.
+        self.assertEqual(a_resumed_with["agent"], "agent-b")
+        self.assertEqual(a_resumed_with["tag"], "from-agent-b")
 
     async def test_a_resume_naming_the_wrong_execution_cannot_reach_a(self):
         """The contract the whole path rests on, pinned as a test.
@@ -713,6 +756,111 @@ class TestRootExecutionAsksTheUser(unittest.IsolatedAsyncioTestCase):
         # Nobody else can close this stream: believing it owes an agent a reply
         # is exactly what stops the root from emitting the end event.
         self.assertIn(EventType.APP_STREAM_RESPONSE.value, events)
+
+
+class AskThenDelegateAgent(GatewayWorker):
+    """Suspends on a human first, then calls a sub-agent once resumed."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.seen_metadata: list[dict] = []
+
+    def get_agent_types(self) -> list[str]:
+        return ["agent-b"]
+
+    async def process_command(self, command, context: Any):
+        self.seen_metadata.append(dict(command.header.metadata))
+        if isinstance(command, ResumeCommand):
+            await context.call_agent(
+                target_agent_type="agent-c",
+                content="delegate",
+                wait_for_reply=True,
+            )
+            return {"status": AgentState.QUEUED.value}
+        return await context.ask_user("which colour?")
+
+
+class TestTracePlumbingSurvivesTheInboundRestore(unittest.IsolatedAsyncioTestCase):
+    """Restoring a hop's metadata must not restore its span ids with it.
+
+    The framework injects `trace_parent_span_id`, `framework_parent_span_id`
+    and `langfuse_parent_observation_id` into every dispatch's metadata, so a
+    stored copy describes the dispatch that created the execution — not the
+    hop resuming it now. `AgentContext._resolve_call_langfuse_parent_id()`
+    reads that key straight off the current command as its last-resort
+    fallback, so letting the stale value back in would parent a post-resume
+    call to an observation from before the suspend.
+    """
+
+    session_id = "sess-trace"
+
+    async def asyncSetUp(self):
+        self.redis = FakeRedis()
+        self.registry = WorkerRegistry(self.redis)
+        self.agent = AskThenDelegateAgent(
+            "worker-b", self.redis, self.registry, WorkspaceManagerStub()
+        )
+        self.runner = WorkerRunner(self.redis, self.agent, group_name="test-group")
+        await self.runner.setup_streams()
+        for agent_type in ("agent-b", "agent-c"):
+            await self.redis.sadd(
+                RedisKeys.agent_type_members(agent_type), self.agent.worker_id
+            )
+        await self.redis.set(RedisKeys.worker_online_lease(self.agent.worker_id), "1")
+
+        await self.redis.xadd(
+            RedisKeys.ctrl_stream("agent-b"),
+            AskAgentCommand(
+                header=MessageHeader(
+                    message_id="msg-root",
+                    session_id=self.session_id,
+                    trace_id="trace-plumbing",
+                    target_agent_type="agent-b",
+                    metadata={
+                        "tenant": "acme",
+                        "langfuse_parent_observation_id": "observation-before-suspend",
+                    },
+                ),
+                content="start",
+            ).to_redis_payload(),
+        )
+
+    async def _step(self):
+        await self.runner._run_once()
+        await self.runner.wait_for_tasks()
+
+    async def test_a_call_made_after_a_resume_does_not_reuse_the_stale_parent(self):
+        await self._step()
+        await self.redis.xadd(
+            RedisKeys.ctrl_stream("agent-b"),
+            ResumeCommand(
+                header=MessageHeader(
+                    message_id="msg-root",
+                    session_id=self.session_id,
+                    trace_id="trace-plumbing",
+                    target_agent_type="agent-b",
+                ),
+                content="Pink",
+            ).to_redis_payload(),
+        )
+        await self._step()
+
+        dispatched = _ctrl_messages(self.redis, "agent-c")
+        self.assertEqual(len(dispatched), 1)
+        header = dispatched[0]["header"]
+        self.assertNotEqual(
+            header["langfuse_parent_observation_id"], "observation-before-suspend"
+        )
+        self.assertNotEqual(
+            header["metadata"].get("langfuse_parent_observation_id"),
+            "observation-before-suspend",
+        )
+        # The business half of the same stored metadata IS restored, which is
+        # what makes the exclusion a filter rather than a switch: `tenant`
+        # comes back, the span id sitting next to it in the same dict does not.
+        resumed_with = self.agent.seen_metadata[1]
+        self.assertEqual(resumed_with["tenant"], "acme")
+        self.assertNotIn("langfuse_parent_observation_id", resumed_with)
 
 
 if __name__ == "__main__":

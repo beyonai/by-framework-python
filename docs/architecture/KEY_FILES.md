@@ -260,7 +260,13 @@ Entry anatomy:
   implementations fall back to minting a fresh execution_id. Root-dispatch
   trace writes (`_write_trace_root_start/_end`) must only fire when
   `not parent_message_id` — firing them on every `call_agent` hop would
-  duplicate trace roots.
+  duplicate trace roots. `initialize_execution()`'s payload carries the
+  dispatch `metadata`: a root agent suspends (an `ask_user` round is the
+  common case) and comes back on a `ResumeCommand` carrying the *callee's*
+  metadata, so the record is the only place its own request metadata still
+  exists for `worker.py`'s inbound restore to find. `runner.py` records the
+  same field independently on first pickup, which is what makes this work
+  for dispatchers that don't write it (TS/Java callers, a bare `xadd`).
 
 - `src/by_framework/worker/runner.py` — `WorkerRunner`, the consume loop:
   `XREADGROUP` fetch, command dispatch, resume/suspend bookkeeping, denylist
@@ -290,7 +296,16 @@ Entry anatomy:
   suspended caller persists as `WAITING_AGENT`/`WAITING_USER` precisely to
   keep that inference true; reusing QUEUED for any post-pickup state silently
   makes a resume re-derive its identity from the message header instead of
-  the record. Every `ResumeCommand` passes the `core/wait_gate.py`
+  the record. On a **non-resume** pickup it also writes `header.metadata`
+  onto the record (as an `update_execution_status` kwarg, or in the
+  `save_execution` fallback payload): `header.metadata` *is* the dispatch
+  metadata by definition, so recording it here — rather than trusting
+  whoever sent the message to have done it — is what makes
+  `worker.py`'s inbound restore work for a client root dispatch and for a
+  TS/Java caller, neither of which writes the field. The `ResumeCommand`
+  guard is load-bearing: a resume writing its own waking metadata over the
+  record would destroy the stored original that the restore exists to
+  recover, and nothing else keeps a copy. Every `ResumeCommand` passes the `core/wait_gate.py`
   idempotency gate *here*, before the execution lookup — and being upstream
   of `GatewayWorker` is what also puts it before Task Group join, whose
   `HINCRBY completed` a duplicate would push past `total` and aggregate a
@@ -353,6 +368,22 @@ Entry anatomy:
   transient hop overwrite the caller's own data instead of being layered
   under `task_result.metadata` like `_enqueue_agent_return()`'s merge
   already does correctly.
+  That is the OUTBOUND direction. The INBOUND one — what this execution's own
+  handler reads — is `_restore_inbound_metadata()`, and it is deliberately a
+  different rule: the original dispatch metadata from the same snapshot is
+  the base and the waking message's metadata is **merged on top** (waking
+  message wins collisions), because this agent *is* the addressee of that
+  message. Without it, everything a handler was dispatched with disappears
+  the moment it first suspends. Two constraints keep the directions from
+  contaminating each other: the restore must build a NEW command
+  (`prepare_command_for_processing()` returns the *same* object for the base
+  worker, so an in-place header mutation would rewrite `raw_command`'s and
+  leak the merge into the reply), and `_resolve_reply_command()` must keep
+  taking `raw_command`. The shared merge rule, including which framework
+  trace keys are excluded from the restored base, lives in
+  `_resume_metadata.py` — one copy, because the last time these two files
+  each carried their own version of a resume rule the processor was left
+  behind for a whole commit.
   The success path must NOT reply while `context._is_suspended` — a suspended
   execution has no result, and forwarding the value the handler returned in
   order to unwind both wakes the caller early and consumes the single reply it
@@ -437,8 +468,16 @@ Entry anatomy:
   waking message's own metadata, exactly as `worker.py`'s
   `_resolve_reply_command()` does (restoring only the three routing fields is
   the drift this entry warns about: it shipped that way and leaked the waking
-  hop's metadata to the caller); and no callback may be sent while
-  `context._is_suspended` (with the same terminal-status exception).
+  hop's metadata to the caller); `_restore_inbound_metadata()` mirrors
+  `worker.py`'s inbound merge for what the *handler* reads, and must run even
+  when `_resolve_reply_header()` returned `None` — a client-dispatched root
+  is owed no reply but still has its own metadata to get back, so the two
+  must not share a short-circuit. `_load_execution_snapshot()` is the single
+  registry read feeding both directions; being fail-soft there is what keeps
+  a registry error a degrade rather than a lost reply. The reply is built
+  from `raw_command`, never the inbound-restored one. And no callback may be
+  sent while `context._is_suspended` (with the same terminal-status
+  exception).
   Being a *second* entry point for replies, it carries the same
   `core/wait_gate.py` gate as `runner.py` — a gate on one of two doors is not
   a gate, and an ungated reply here would both wake a resolved caller and
@@ -446,6 +485,25 @@ Entry anatomy:
   `process()` returns `None` for a reply it drops. It also flushes
   `call_agents`' queued stand-ins on the same terms as `worker.py` — after
   the handler returns, never when it raised.
+
+- `src/by_framework/worker/_resume_metadata.py` — the one copy of the
+  **inbound** resume-metadata rule, shared by `worker.py` and `processor.py`
+  so the two cannot drift again. `merge_resume_metadata()` puts the
+  execution's original dispatch metadata underneath the waking message's
+  (waking message wins collisions) — the opposite of the outbound
+  replacement, because a resumed handler *is* the addressee of the message
+  that woke it. `FRAMEWORK_HOP_METADATA_KEYS` (`trace_parent_span_id`,
+  `framework_parent_span_id`, `langfuse_parent_observation_id`) are dropped
+  from the restored base: the framework injects them per dispatch, so a
+  stored copy describes the hop that *created* the execution, and
+  `context.py`'s `_resolve_call_langfuse_parent_id()` reads that key straight
+  off the current command — restoring it would parent a post-resume call to
+  an observation from before the suspend. The filter belongs here, at read
+  time, and not at write time: the outbound path deliberately restores the
+  stored dict verbatim, trace keys included, to stay identical to the
+  non-suspended reply. A missing/absent stored value degrades to the waking
+  message's metadata unchanged, which is the pre-restore behaviour, so old
+  records and cross-SDK callers need no migration or version gate.
 
 - `src/by_framework/core/registry.py` — `WorkerRegistry`: Redis-backed worker
   membership/heartbeat/execution-state, admin lifecycle, locking primitives.

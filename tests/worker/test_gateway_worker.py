@@ -1113,6 +1113,188 @@ async def test_resumed_root_execution_replies_to_nobody(tmp_path):
     assert _ctrl_stream_replies(redis_mock, "agent-b") == []
 
 
+class InboundMetadataWorker(GatewayWorker):
+    """Records what the handler is actually handed, header and context alike."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.seen_metadata = None
+        self.seen_context_metadata = None
+
+    def get_agent_types(self):
+        return ["structured_agent"]
+
+    async def process_command(self, command, context):
+        self.seen_metadata = dict(command.header.metadata)
+        self.seen_context_metadata = dict(context.current_command.header.metadata)
+        return {"status": AgentState.COMPLETED.value, "reply_data": {"ok": True}}
+
+
+def _inbound_resume(metadata):
+    return ResumeCommand(
+        header=MessageHeader(
+            message_id="msg-b",
+            session_id="sess-chain",
+            trace_id="trace-chain",
+            source_agent_type="agent-c",
+            target_agent_type="structured_agent",
+            parent_message_id="msg-c",
+            metadata=metadata,
+        ),
+        status=AgentState.COMPLETED.value,
+        reply_data={"from": "c"},
+    )
+
+
+def _inbound_execution(snapshot_fields, stored_metadata):
+    existing_data = {
+        "execution_id": "exec-b",
+        "message_id": "msg-b",
+        "session_id": "sess-chain",
+        "status": AgentState.WAITING_AGENT.value,
+        "source_agent_type": "agent-a",
+        "parent_message_id": "msg-a",
+        **snapshot_fields,
+    }
+    if stored_metadata is not None:
+        existing_data["metadata"] = stored_metadata
+    return RunningExecution(
+        execution_id="exec-b",
+        message_id="msg-b",
+        session_id="sess-chain",
+        worker_id="test-suspend",
+        task=AsyncMock(),
+        cancel_event=AsyncMock(),
+        is_resumed=True,
+        parent_message_id="msg-a",
+        existing_data=existing_data,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resumed_handler_reads_its_own_dispatch_metadata(tmp_path):
+    """The inbound mirror of _resolve_reply_command, and a different rule.
+
+    A resumed handler used to see only the metadata of whatever woke it up,
+    so everything it was originally dispatched with vanished the first time
+    it suspended. Here the original is the base and the waking message is
+    merged on top — this agent IS the addressee of that message, so its
+    metadata is payload rather than someone else's plumbing.
+    """
+    redis_mock = _mock_redis()
+    worker, snapshot_fields = _resumable_worker(
+        InboundMetadataWorker, tmp_path, redis_mock
+    )
+
+    await worker._handle_message(
+        _inbound_resume({"answer": "Pink", "tag": "from-waking"}),
+        execution=_inbound_execution(
+            snapshot_fields, {"tenant": "acme", "tag": "from-dispatch"}
+        ),
+    )
+
+    assert worker.seen_metadata["tenant"] == "acme"
+    assert worker.seen_metadata["answer"] == "Pink"
+    # The newer, more specific hop wins a collision.
+    assert worker.seen_metadata["tag"] == "from-waking"
+    # The context must not disagree with the command handed to the handler.
+    assert worker.seen_context_metadata == worker.seen_metadata
+
+
+@pytest.mark.asyncio
+async def test_inbound_restore_drops_the_snapshots_stale_trace_keys(tmp_path):
+    """Span ids describe a hop, and the stored ones describe the wrong one."""
+    redis_mock = _mock_redis()
+    worker, snapshot_fields = _resumable_worker(
+        InboundMetadataWorker, tmp_path, redis_mock
+    )
+
+    await worker._handle_message(
+        _inbound_resume({}),
+        execution=_inbound_execution(
+            snapshot_fields,
+            {
+                "tenant": "acme",
+                "trace_parent_span_id": "stale-trace",
+                "framework_parent_span_id": "stale-framework",
+                "langfuse_parent_observation_id": "stale-langfuse",
+            },
+        ),
+    )
+
+    assert worker.seen_metadata == {"tenant": "acme"}
+
+
+@pytest.mark.asyncio
+async def test_inbound_restore_degrades_when_the_snapshot_predates_the_field(
+    tmp_path,
+):
+    """An execution recorded before this existed, or by another SDK."""
+    redis_mock = _mock_redis()
+    worker, snapshot_fields = _resumable_worker(
+        InboundMetadataWorker, tmp_path, redis_mock
+    )
+
+    await worker._handle_message(
+        _inbound_resume({"client_tag": "t"}),
+        execution=_inbound_execution(snapshot_fields, None),
+    )
+
+    assert worker.seen_metadata == {"client_tag": "t"}
+
+
+@pytest.mark.asyncio
+async def test_inbound_restore_does_not_mutate_the_command_it_replies_from(
+    tmp_path,
+):
+    """The outbound reply must not inherit the inbound merge.
+
+    prepare_command_for_processing() returns the SAME object for the base
+    worker, so a header mutated in place here would also rewrite the command
+    _resolve_reply_command builds the reply from.
+    """
+    redis_mock = _mock_redis()
+    worker, snapshot_fields = _resumable_worker(
+        InboundMetadataWorker, tmp_path, redis_mock
+    )
+    raw_command = _inbound_resume({"answer": "Pink"})
+
+    await worker._handle_message(
+        raw_command,
+        execution=_inbound_execution(snapshot_fields, {"tenant": "acme"}),
+    )
+
+    assert raw_command.header.metadata == {"answer": "Pink"}
+    # And the reply that went out carries the OUTBOUND rule's result: the
+    # stored dispatch metadata wholesale, with no key from the waking message.
+    reply = _ctrl_stream_replies(redis_mock, "agent-a")[0]
+    assert reply.header.metadata["tenant"] == "acme"
+    assert "answer" not in reply.header.metadata
+
+
+@pytest.mark.asyncio
+async def test_first_dispatch_metadata_is_left_alone(tmp_path):
+    """Only a resume restores. A fresh dispatch has nothing to restore from."""
+    redis_mock = _mock_redis()
+    worker = _worker_with_workspace(InboundMetadataWorker, tmp_path, redis_mock)
+
+    await worker._handle_message(
+        AskAgentCommand(
+            header=MessageHeader(
+                message_id="msg-b",
+                session_id="sess-chain",
+                trace_id="trace-chain",
+                source_agent_type="agent-a",
+                target_agent_type="structured_agent",
+                metadata={"tenant": "acme"},
+            ),
+            content="hello",
+        )
+    )
+
+    assert worker.seen_metadata == {"tenant": "acme"}
+
+
 @pytest.mark.asyncio
 async def test_failed_suspended_execution_still_replies_to_its_caller(tmp_path):
     """Suspension only defers a reply while the execution can still produce

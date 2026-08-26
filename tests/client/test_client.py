@@ -1341,6 +1341,34 @@ async def test_client_send_message_ask_agent_does_not_query_registry_for_resume_
 
 
 @pytest.mark.asyncio
+async def test_client_root_dispatch_records_its_metadata_on_the_execution():
+    """A root execution's own dispatch metadata has to be on its record.
+
+    The agent will suspend (an `ask_user` round is the common case) and come
+    back on a ResumeCommand carrying the *callee's* metadata; the only way it
+    can still read what the client originally sent is for the client to have
+    recorded it here.
+    """
+    mock_redis = AsyncMock()
+    mock_registry = AsyncMock()
+
+    client = GatewayClient(redis_client=mock_redis, registry=mock_registry)
+    await client.send_message(
+        target_agent_type="langgraph_agent",
+        session_id="s1",
+        content="hello",
+        action_type="ASK_AGENT",
+        message_id="msg-new",
+        target_worker_id="worker-42",
+        metadata={"tenant": "acme", "req": "r-1"},
+    )
+
+    initialized = mock_registry.initialize_execution.await_args.args[0]
+    assert initialized["metadata"]["tenant"] == "acme"
+    assert initialized["metadata"]["req"] == "r-1"
+
+
+@pytest.mark.asyncio
 async def test_client_send_message_resume_falls_back_when_registry_lacks_lookup():
     """A registry double/implementation without get_execution_by_message_id
     must not blow up a RESUME send -- mirror the defensive hasattr() guard
@@ -1349,6 +1377,7 @@ async def test_client_send_message_resume_falls_back_when_registry_lacks_lookup(
     mock_redis = AsyncMock()
 
     class RegistryWithoutLookup:
+
         async def initialize_execution(self, execution):
             return None
 

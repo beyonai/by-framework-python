@@ -24,6 +24,7 @@ from by_framework.core.protocol.results import (
 from by_framework.core.runtime.file_permissions import FilePermissionPolicy
 from by_framework.core.wait_gate import consume_wait_entry, emit_orphaned_reply
 from by_framework.core.wait_reply import flush_pending_group_replies
+from by_framework.worker._resume_metadata import merge_resume_metadata
 from by_framework.worker.context import AgentContext
 
 ContextHandler = Callable[
@@ -99,8 +100,18 @@ class GatewayProcessor:
                 )
                 return None
 
-        reply_header = await self._resolve_reply_header(command)
+        # One lookup feeds both directions: the header this execution replies
+        # with, and the header its own handler reads. They are different
+        # rules over the same record — see _resolve_reply_header and
+        # _restore_inbound_metadata.
+        snapshot = (
+            await self._load_execution_snapshot(command) if is_agent_return else None
+        )
+        raw_command = command
+        reply_header = self._resolve_reply_header(command, snapshot)
         has_source_agent = reply_header is not None
+        command = self._restore_inbound_metadata(command, is_agent_return, snapshot)
+        header = command.header
 
         context = AgentContext(
             session_id=header.session_id,
@@ -163,8 +174,10 @@ class GatewayProcessor:
                 getattr(context, "_is_suspended", False)
             ) and not is_terminal_state(task_result.status)
             if has_source_agent and not is_suspended:
+                # raw_command, not the inbound-restored one: the reply is the
+                # outbound direction and must not inherit the inbound merge.
                 await self._enqueue_callback(
-                    command,
+                    raw_command,
                     task_result.status,
                     task_result.reply_data,
                     content=task_result.content,
@@ -210,7 +223,7 @@ class GatewayProcessor:
 
             if has_source_agent:
                 await self._enqueue_callback(
-                    command,
+                    raw_command,
                     AgentState.FAILED.value,
                     {"error": str(e)},
                     reply_header=reply_header,
@@ -221,8 +234,36 @@ class GatewayProcessor:
             )
             raise
 
-    async def _resolve_reply_header(
+    async def _load_execution_snapshot(
         self, command: GatewayCommand
+    ) -> Optional[dict[str, Any]]:
+        """Read the execution record the original dispatch wrote.
+
+        Fetched once per resume and shared by both restore directions.
+        Fail-soft: a registry error degrades to "no record", which each caller
+        then handles as its own no-op.
+        """
+        header = command.header
+        try:
+            from by_framework.core.registry import WorkerRegistry
+
+            return await WorkerRegistry(self.redis).get_execution_by_message_id(
+                header.message_id, session_id=header.session_id
+            )
+        except Exception as error:  # pylint: disable=broad-exception-caught
+            self.logger.warning(
+                "[%s] Could not load the execution record of resumed execution "
+                "%s: %s",
+                self.worker_id,
+                header.message_id,
+                error,
+            )
+            return None
+
+    def _resolve_reply_header(
+        self,
+        command: GatewayCommand,
+        snapshot: Optional[dict[str, Any]],
     ) -> Optional[MessageHeader]:
         """Return the header describing the caller this execution owes a reply
         to, or None when nobody is waiting.
@@ -243,36 +284,51 @@ class GatewayProcessor:
         caller ever sent. A snapshot missing the field (an execution recorded
         before it existed) degrades to an empty dict rather than leaking the
         waking message's metadata to the caller.
+
+        This is the OUTBOUND direction only. What the handler itself reads is
+        ``_restore_inbound_metadata``, which merges rather than replaces —
+        and which must run even when this returns None, since a
+        client-dispatched root has no caller but still has its own metadata
+        to get back.
         """
         header = command.header
         if not isinstance(command, ResumeCommand):
             return header if header.source_agent_type else None
 
-        execution: Optional[dict[str, Any]] = None
-        try:
-            from by_framework.core.registry import WorkerRegistry
-
-            execution = await WorkerRegistry(self.redis).get_execution_by_message_id(
-                header.message_id, session_id=header.session_id
-            )
-        except Exception as error:  # pylint: disable=broad-exception-caught
-            self.logger.warning(
-                "[%s] Could not resolve the caller of resumed execution %s: %s",
-                self.worker_id,
-                header.message_id,
-                error,
-            )
-            return None
-
-        caller_agent_type = str((execution or {}).get("source_agent_type", "") or "")
+        caller_agent_type = str((snapshot or {}).get("source_agent_type", "") or "")
         if not caller_agent_type or caller_agent_type == CLIENT_SOURCE_AGENT_TYPE:
             return None
         return replace(
             header,
             source_agent_type=caller_agent_type,
-            parent_message_id=str((execution or {}).get("parent_message_id", "") or ""),
-            task_group_id=str((execution or {}).get("task_group_id", "") or ""),
-            metadata=dict((execution or {}).get("metadata") or {}),
+            parent_message_id=str((snapshot or {}).get("parent_message_id", "") or ""),
+            task_group_id=str((snapshot or {}).get("task_group_id", "") or ""),
+            metadata=dict((snapshot or {}).get("metadata") or {}),
+        )
+
+    @staticmethod
+    def _restore_inbound_metadata(
+        command: GatewayCommand,
+        is_agent_return: bool,
+        snapshot: Optional[dict[str, Any]],
+    ) -> GatewayCommand:
+        """Give a resumed handler its own dispatch metadata back.
+
+        Mirrors ``GatewayWorker._restore_inbound_metadata``, including its
+        merge-don't-replace rule and its no-mutation rule; see that docstring
+        for why the inbound direction differs from the outbound one.
+        """
+        if not is_agent_return:
+            return command
+        return replace(
+            command,
+            header=replace(
+                command.header,
+                metadata=merge_resume_metadata(
+                    (snapshot or {}).get("metadata"),
+                    command.header.metadata,
+                ),
+            ),
         )
 
     async def _enqueue_callback(
