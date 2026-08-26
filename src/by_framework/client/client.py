@@ -971,6 +971,12 @@ class GatewayClient:
                         "parent_message_id": params["parent_message_id"] or "",
                         "source_agent_type": CLIENT_SOURCE_AGENT_TYPE,
                         "target_agent_type": params["target_agent_type"],
+                        # What this execution was dispatched with, so a worker
+                        # can restore it after the execution suspends and
+                        # resumes (see worker/_resume_metadata.py). Only the
+                        # non-RESUME branch reaches here, so this never
+                        # overwrites a suspended execution's original.
+                        "metadata": dict(metadata or {}),
                         "stream_name": route.stream_name,
                         "status": "QUEUED",
                         "route_policy": route_policy,

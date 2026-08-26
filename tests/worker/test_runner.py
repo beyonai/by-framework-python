@@ -602,6 +602,7 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
                 session_id="sess-1",
                 trace_id="trace-1",
                 target_agent_type="dummy_agent",
+                metadata={"tenant": "acme"},
             ),
             content="test",
         ).to_dict()
@@ -612,11 +613,16 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(worker.seen_execution)
         self.assertFalse(worker.seen_execution.is_resumed)
+        # The dispatch metadata is recorded by the worker picking the message
+        # up, not only by whoever sent it: that is what makes it present for
+        # a client root dispatch and for a TS/Java caller, neither of which
+        # writes the field. _handle_message restores it on resume.
         worker.registry.update_execution_status.assert_awaited_once_with(
             "exec-queued",
             "sess-1",
             "RUNNING",
             worker_id="worker-1",
+            metadata={"tenant": "acme"},
         )
         self.assertTrue(redis_mock.acked)
 
@@ -659,6 +665,52 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(worker.seen_execution.is_resumed)
         self.assertEqual(worker.seen_execution.parent_message_id, "msg-caller")
+
+    async def test_resume_does_not_overwrite_the_recorded_dispatch_metadata(self):
+        """The stored original is the only copy — a resume must not clobber it.
+
+        The record's `metadata` is what this execution was ORIGINALLY
+        dispatched with, and `_handle_message` restores it so a resumed
+        handler can still read it. Writing the waking message's metadata over
+        it on the way in would destroy exactly what the restore exists to
+        recover, and nothing else keeps a copy.
+        """
+        redis_mock = MockRedisRunner(message_to_return=[])
+        worker = ExecutionInspectWorker()
+        worker.registry = AsyncMock()
+        worker.registry.get_execution_by_message_id.return_value = {
+            "execution_id": "exec-waiting",
+            "message_id": "msg-waiting",
+            "session_id": "sess-1",
+            "parent_message_id": "msg-caller",
+            "status": AgentState.WAITING_USER.value,
+            "metadata": {"tenant": "acme"},
+        }
+
+        runner = WorkerRunner(
+            redis_client=redis_mock, worker=worker, group_name="test_group"
+        )
+        payload = ResumeCommand(
+            header=MessageHeader(
+                message_id="msg-waiting",
+                session_id="sess-1",
+                trace_id="trace-1",
+                target_agent_type="dummy_agent",
+                metadata={"client_tag": "this-hop-only"},
+            ),
+            content="Pink",
+        ).to_dict()
+
+        await runner._process_message_from_dict(
+            RedisKeys.ctrl_stream("dummy_agent"), "1-1", payload
+        )
+
+        worker.registry.update_execution_status.assert_awaited_once_with(
+            "exec-waiting",
+            "sess-1",
+            "RUNNING",
+            worker_id="worker-1",
+        )
 
     async def test_runner_does_not_skip_waiting_agent_replay(self):
         """WAITING_AGENT is not terminal: a suspended caller must stay

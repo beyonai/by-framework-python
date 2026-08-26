@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from by_framework import GatewayProcessor, RedisKeys
+from by_framework.common.constants import CLIENT_SOURCE_AGENT_TYPE
 from by_framework.core.protocol.commands import (
     AskAgentCommand,
     ResumeCommand,
@@ -313,3 +314,222 @@ async def test_processor_resumed_execution_replies_to_the_original_caller():
     assert reply.header.parent_message_id == "msg-middle"
     assert reply.header.task_group_id == "tg-1"
     assert reply.reply_data == {"done": True}
+
+
+async def _resume_reply_to_caller(snapshot, handler_result, waking_metadata):
+    """Drive one resumed execution through GatewayProcessor and return the
+    reply command it posted to the caller's control stream.
+
+    The waking ResumeCommand names agent-c (the sub-agent that just finished)
+    and carries its own metadata for that hop; the caller owed a reply is
+    whatever the execution snapshot names.
+    """
+    redis_mock = AsyncMock()
+    redis_mock.pipeline = MagicMock(
+        return_value=MagicMock(xadd=MagicMock(), execute=AsyncMock(return_value=[]))
+    )
+    processor = GatewayProcessor(worker_id="worker-1", redis_client=redis_mock)
+
+    async def handler(command, context):
+        return handler_result
+
+    with patch(
+        "by_framework.core.registry.WorkerRegistry.get_execution_by_message_id",
+        new_callable=AsyncMock,
+    ) as lookup:
+        lookup.return_value = snapshot
+        await processor.process(
+            ResumeCommand(
+                header=MessageHeader(
+                    message_id="msg-middle",
+                    session_id="sess-1",
+                    trace_id="trace-1",
+                    source_agent_type="agent-c",
+                    target_agent_type="agent-b",
+                    parent_message_id="msg-sub",
+                    metadata=waking_metadata,
+                ),
+                status="COMPLETED",
+                reply_data={"from": "c"},
+            ),
+            handler,
+        )
+
+    ctrl_writes = [
+        call
+        for call in redis_mock.xadd.await_args_list
+        if call.args[0] == RedisKeys.ctrl_stream("agent-a")
+    ]
+    assert len(ctrl_writes) == 1
+    reply = command_from_dict(json.loads(ctrl_writes[0].args[1]["data"]))
+    # Proves the reply went through the resume rebuild rather than straight off
+    # the incoming header: the waking command names agent-c as its source and
+    # "msg-sub" as its parent, so only the execution snapshot can put this
+    # reply on agent-a's stream carrying the caller's own id.
+    assert reply.header.message_id == "msg-caller"
+    return reply
+
+
+@pytest.mark.asyncio
+async def test_processor_resumed_reply_carries_the_callers_own_metadata():
+    """Same rule as GatewayWorker._resolve_reply_command: the caller's
+    original dispatch metadata is restored wholesale from the execution
+    snapshot. The metadata on the message that woke this execution up is
+    plumbing for that one hop and must not reach the caller."""
+    reply = await _resume_reply_to_caller(
+        snapshot={
+            "source_agent_type": "agent-a",
+            "parent_message_id": "msg-caller",
+            "task_group_id": "tg-1",
+            # A's original dispatch metadata, persisted at
+            # initialize_execution() time.
+            "metadata": {"caller": "original", "request_id": "req-1"},
+        },
+        handler_result={
+            "status": "COMPLETED",
+            "reply_data": {"done": True},
+            # This link's own metadata: overrides same-named keys from the
+            # caller's, leaves the rest alone.
+            "metadata": {"caller": "overridden", "tokens": 123},
+        },
+        waking_metadata={"caller": "should-not-leak", "from_c": "should-not-leak"},
+    )
+
+    assert reply.header.metadata["request_id"] == "req-1"
+    assert reply.header.metadata["caller"] == "overridden"
+    assert reply.header.metadata["tokens"] == 123
+    assert "from_c" not in reply.header.metadata
+
+
+@pytest.mark.asyncio
+async def test_processor_resumed_reply_metadata_is_empty_without_a_snapshot_value():
+    """An execution recorded before the snapshot carried metadata degrades to
+    an empty dict — never to the waking message's metadata."""
+    reply = await _resume_reply_to_caller(
+        snapshot={
+            "source_agent_type": "agent-a",
+            "parent_message_id": "msg-caller",
+            "task_group_id": "",
+        },
+        handler_result={"status": "COMPLETED", "reply_data": {"done": True}},
+        waking_metadata={"caller": "should-not-leak", "from_c": "should-not-leak"},
+    )
+
+    assert reply.header.metadata == {}
+
+
+async def _resumed_handler_sees(snapshot, waking_metadata):
+    """Drive one resumed execution through GatewayProcessor and return what
+    the handler was actually handed — the inbound direction.
+
+    Uses a client-dispatched root (`source_agent_type` is the client
+    sentinel, so nobody is owed a reply) on purpose: that is the case the
+    outbound resolver short-circuits to None, and the inbound restore has to
+    run anyway.
+    """
+    redis_mock = AsyncMock()
+    redis_mock.pipeline = MagicMock(
+        return_value=MagicMock(xadd=MagicMock(), execute=AsyncMock(return_value=[]))
+    )
+    processor = GatewayProcessor(worker_id="worker-1", redis_client=redis_mock)
+    seen = {}
+
+    async def handler(command, context):
+        seen["header"] = dict(command.header.metadata)
+        seen["context"] = dict(context.current_command.header.metadata)
+        return {"status": "COMPLETED", "reply_data": {"done": True}}
+
+    with patch(
+        "by_framework.core.registry.WorkerRegistry.get_execution_by_message_id",
+        new_callable=AsyncMock,
+    ) as lookup:
+        lookup.return_value = snapshot
+        await processor.process(
+            ResumeCommand(
+                header=MessageHeader(
+                    message_id="msg-root",
+                    session_id="sess-1",
+                    trace_id="trace-1",
+                    source_agent_type="agent-b",
+                    target_agent_type="agent-a",
+                    parent_message_id="msg-sub",
+                    metadata=waking_metadata,
+                ),
+                status="COMPLETED",
+                reply_data={"from": "b"},
+            ),
+            handler,
+        )
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_processor_resumed_handler_reads_its_own_dispatch_metadata():
+    """The inbound direction: merged, not replaced.
+
+    Mirrors GatewayWorker._restore_inbound_metadata. The handler is the
+    addressee of the waking message, so that message's metadata is payload
+    here rather than someone else's plumbing — it layers on top of what this
+    execution was originally dispatched with instead of erasing it.
+    """
+    seen = await _resumed_handler_sees(
+        snapshot={
+            "source_agent_type": CLIENT_SOURCE_AGENT_TYPE,
+            "parent_message_id": "",
+            "metadata": {"tenant": "acme", "tag": "from-dispatch"},
+        },
+        waking_metadata={"answer": "Pink", "tag": "from-waking"},
+    )
+
+    assert seen["header"]["tenant"] == "acme"
+    assert seen["header"]["answer"] == "Pink"
+    assert seen["header"]["tag"] == "from-waking"
+    assert seen["context"] == seen["header"]
+
+
+@pytest.mark.asyncio
+async def test_processor_inbound_restore_drops_stale_trace_keys():
+    seen = await _resumed_handler_sees(
+        snapshot={
+            "source_agent_type": CLIENT_SOURCE_AGENT_TYPE,
+            "metadata": {
+                "tenant": "acme",
+                "trace_parent_span_id": "stale-trace",
+                "framework_parent_span_id": "stale-framework",
+                "langfuse_parent_observation_id": "stale-langfuse",
+            },
+        },
+        waking_metadata={},
+    )
+
+    assert seen["header"] == {"tenant": "acme"}
+
+
+@pytest.mark.asyncio
+async def test_processor_inbound_restore_degrades_without_a_snapshot_value():
+    """No stored metadata (old record, or another SDK's caller) leaves the
+    waking message's metadata exactly as it arrived."""
+    seen = await _resumed_handler_sees(
+        snapshot={"source_agent_type": CLIENT_SOURCE_AGENT_TYPE},
+        waking_metadata={"client_tag": "t"},
+    )
+
+    assert seen["header"] == {"client_tag": "t"}
+
+
+@pytest.mark.asyncio
+async def test_processor_inbound_restore_does_not_leak_into_the_reply():
+    """The two directions share a record, not a rule: the reply keeps the
+    replacement semantics even though the handler saw a merge."""
+    reply = await _resume_reply_to_caller(
+        snapshot={
+            "source_agent_type": "agent-a",
+            "parent_message_id": "msg-caller",
+            "task_group_id": "tg-1",
+            "metadata": {"caller": "original"},
+        },
+        handler_result={"status": "COMPLETED", "reply_data": {"done": True}},
+        waking_metadata={"from_c": "should-not-leak"},
+    )
+
+    assert reply.header.metadata == {"caller": "original"}
