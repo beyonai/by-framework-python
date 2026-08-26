@@ -625,11 +625,33 @@ class WorkerRunner:
             if registry:
                 if existing_execution:
                     if hasattr(registry, "update_execution_status"):
+                        status_fields: dict[str, Any] = {
+                            "worker_id": self.worker.worker_id
+                        }
+                        if not isinstance(command, ResumeCommand):
+                            # The dispatch metadata, recorded by whoever is
+                            # executing the message rather than by whoever
+                            # sent it: header.metadata IS the dispatch
+                            # metadata by definition, so this is correct for
+                            # every dispatcher — including a client root
+                            # dispatch and a TS/Java caller, neither of which
+                            # writes the field (see context.py's
+                            # initialize_execution, which does, and is kept
+                            # because it is the only record that exists
+                            # before a callee is ever picked up).
+                            # _handle_message reads it back to restore what
+                            # this execution was originally asked for once it
+                            # resumes.
+                            #
+                            # A ResumeCommand must NOT write it: the waking
+                            # message's metadata would overwrite the very
+                            # original this exists to preserve.
+                            status_fields["metadata"] = dict(header.metadata)
                         await registry.update_execution_status(
                             execution_id,
                             header.session_id,
                             "RUNNING",
-                            worker_id=self.worker.worker_id,
+                            **status_fields,
                         )
                 elif hasattr(registry, "save_execution"):
                     await registry.save_execution(
@@ -641,6 +663,12 @@ class WorkerRunner:
                             "parent_message_id": header.parent_message_id or "",
                             "worker_id": self.worker.worker_id,
                             "target_agent_type": header.target_agent_type,
+                            # Same reason as the update branch above. This one
+                            # is the no-existing-record fallback, so there is
+                            # no stored original to protect and no ResumeCommand
+                            # guard to make: whatever woke this is all this
+                            # execution has ever been told.
+                            "metadata": dict(header.metadata),
                             "stream_name": stream_name,
                             "redis_message_id": msg_id,
                             "status": "RUNNING",

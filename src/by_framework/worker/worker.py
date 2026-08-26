@@ -59,6 +59,7 @@ from by_framework.trace.span_recorder import TraceSpan, str_to_uint64
 from by_framework.worker.context import AgentContext, current_agent_context_var
 from by_framework.worker.heartbeat import WorkerHeartbeat
 
+from ._resume_metadata import merge_resume_metadata
 from .sandbox.hook_sandbox import active_workspace
 
 
@@ -378,6 +379,47 @@ class GatewayWorker(ABC):
         )
 
     @staticmethod
+    def _restore_inbound_metadata(
+        command: GatewayCommand,
+        is_agent_return: bool,
+        execution: Optional["RunningExecution"],
+    ) -> GatewayCommand:
+        """Give a resumed handler its own dispatch metadata back.
+
+        The mirror image of ``_resolve_reply_command``, and deliberately not
+        the same rule. That one rebuilds the header this execution *sends*;
+        this one rebuilds the header it *reads*. A resumed handler otherwise
+        sees only the metadata of whatever woke it up — an ``ask_user``
+        answer's, or a sub-call's reply — and everything the execution was
+        originally dispatched with is gone from the moment it first suspends.
+
+        Merged, not replaced (the opposite of the outbound direction): this
+        agent IS the addressee of the waking message, so its metadata is real
+        payload here rather than someone else's plumbing. Original dispatch
+        metadata is the base, the waking message wins on collisions. See
+        ``_resume_metadata.py`` for why the framework's per-hop trace keys are
+        excluded from the base.
+
+        Returns a NEW command — never mutates. ``prepare_command_for_processing``
+        returns the *same* object for the base worker (only ``ByaiWorker``
+        rebuilds it), so mutating the header here would also rewrite
+        ``raw_command``'s and leak this merge into the reply that goes out.
+        """
+        if not is_agent_return:
+            return command
+        snapshot = getattr(execution, "existing_data", None) or {}
+        return replace(
+            command,
+            header=replace(
+                command.header,
+                metadata=merge_resume_metadata(
+                    snapshot.get("metadata"),
+                    command.header.metadata,
+                ),
+            ),
+        )
+
+    @staticmethod
     def _apply_suspended_status(
         task_result: AgentTaskResult,
         context: Optional[AgentContext],
@@ -682,6 +724,7 @@ class GatewayWorker(ABC):
         is_agent_return = isinstance(raw_command, ResumeCommand)
         reply_command = self._resolve_reply_command(raw_command, execution)
         has_source_agent = reply_command is not None
+        command = self._restore_inbound_metadata(command, is_agent_return, execution)
 
         # Get workspace dir from workspace_manager if available
         # Note: We don't use hasattr check because it doesn't work well with mocks
