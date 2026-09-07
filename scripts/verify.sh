@@ -35,6 +35,7 @@ CHECKS=(
   "$_MAP_DIR/check-doc-discipline.sh"
   "$_MAP_DIR/check-map-territory.sh"
   "$_MAP_DIR/check-entry-freshness.sh"
+  "$_MAP_DIR/check-metric-catalog.sh"
 )
 
 if [ "${#CHECKS[@]}" -eq 0 ]; then

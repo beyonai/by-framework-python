@@ -1,5 +1,7 @@
 """Tests for the observability metric catalog."""
 
+import pytest
+
 from by_framework.metrics import (
     PROMETHEUS_AVAILABLE,
     build_observability_diagnostics_metrics,
@@ -69,8 +71,13 @@ def test_snapshot_prometheus_exporter_matches_metric_catalog_types():
 
 def test_runtime_prometheus_metrics_have_catalog_metadata():
     """Runtime and diagnostics metrics include legacy debug metadata."""
+    # skip, not `return`: without prometheus-client this check inspects nothing,
+    # and reporting that as a pass is how an uncatalogued metric reached main
+    # while CI stayed green. A skip is at least visible in the summary.
+    # scripts/check-metric-catalog.sh enforces the same rule statically, so the
+    # coverage does not depend on this optional dependency being installed.
     if not PROMETHEUS_AVAILABLE:
-        return
+        pytest.skip("prometheus-client not installed (root 'observability' extra)")
     record_execution_started_metrics(agent_type="catalog-agent")
     record_execution_metrics(
         status="COMPLETED",
@@ -106,7 +113,12 @@ def test_runtime_prometheus_metrics_have_catalog_metadata():
                 exported_types[name] = metric_type
 
     catalog = get_metric_catalog()
-    assert exported_types
+    # Pin the runtime metrics this test just recorded. `assert exported_types`
+    # alone is satisfied by the hand-built diagnostics block below, so it stayed
+    # green even when the Prometheus registry contributed nothing at all.
+    assert "by_framework_executions_started_total" in exported_types
+    assert "by_framework_execution_total_duration_seconds" in exported_types
+    assert "by_framework_availability_routing_ms" in exported_types
     for name, metric_type in exported_types.items():
         assert name in catalog
         assert catalog[name].kind.value == metric_type
