@@ -367,6 +367,60 @@ _CATALOG: dict[str, MetricDefinition] = {
             "Instrumentation reliability signal pinpointing exporter failures."
         ),
     ),
+    # Self-monitoring for the background collector in metrics/collector.py.
+    # Exactly one process holds its Redis lock and writes history points, so
+    # these answer "is anyone still collecting?" — a gap here means the
+    # dashboards go stale silently rather than erroring.
+    "by_framework_metrics_collector_cycles_total": MetricDefinition(
+        name="by_framework_metrics_collector_cycles_total",
+        kind=MetricKind.COUNTER,
+        unit=MetricUnit.NONE,
+        labels=("result",),
+        description=(
+            "Metrics collector cycles by result "
+            "(success, snapshot_failed, lock_skipped, disabled)."
+        ),
+        interpretation=(
+            "Collector health signal: only the lock holder reports success, so "
+            "lock_skipped dominating across a fleet is expected."
+        ),
+    ),
+    "by_framework_metrics_collector_snapshot_duration_ms": MetricDefinition(
+        name="by_framework_metrics_collector_snapshot_duration_ms",
+        kind=MetricKind.HISTOGRAM,
+        unit=MetricUnit.MILLISECONDS,
+        description=(
+            "Duration of one collector snapshot build plus history write."
+        ),
+        interpretation=(
+            "Latency signal for collection itself; approaching the collection "
+            "interval means cycles are about to overlap."
+        ),
+    ),
+    "by_framework_metrics_collector_lock_held": MetricDefinition(
+        name="by_framework_metrics_collector_lock_held",
+        kind=MetricKind.GAUGE,
+        unit=MetricUnit.NONE,
+        description=(
+            "Whether this process currently holds the metrics collector lock."
+        ),
+        interpretation=(
+            "Saturation signal: should sum to 1 across the fleet — 0 means "
+            "nobody is collecting, above 1 means the lock split."
+        ),
+    ),
+    "by_framework_metrics_collector_last_success_timestamp_ms": MetricDefinition(
+        name="by_framework_metrics_collector_last_success_timestamp_ms",
+        kind=MetricKind.GAUGE,
+        unit=MetricUnit.MILLISECONDS,
+        description=(
+            "Unix timestamp in milliseconds of the last successful collection."
+        ),
+        interpretation=(
+            "Freshness signal: alert on now minus this value exceeding a few "
+            "collection intervals."
+        ),
+    ),
 }
 
 
