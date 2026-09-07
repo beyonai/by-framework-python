@@ -166,6 +166,7 @@ Pre-commit hooks are configured in `.pre-commit-config.yaml` and run isort, ruff
 | Worker deployment/production-readiness — README's 部署 section, `__main__.py` CLI flags, `run_worker()`'s signature, or shutdown/signal handling | `docs/architecture/production-deployment.md` |
 | Worker readiness/health-check endpoint (`WorkerHealthServer`, `/readyz`, `--health-port`) — building it, or touching anything that changes what "ready" means | `docs/architecture/worker-readiness-endpoint.md` |
 | suspend/resume liveness — the wait index, its idempotency gate, or the sweep that resolves callers whose reply never arrives | `docs/architecture/suspend-resume-liveness.md` |
+| Langfuse tracing state held in worker memory — `_active_workflows`, trace-output uploads, or anything that queues/retains per-task telemetry | `docs/architecture/langfuse-tracing-memory.md` |
 
 ## Maintaining this map
 
