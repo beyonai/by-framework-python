@@ -1,5 +1,8 @@
+import asyncio
 import sys
+import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -1105,3 +1108,358 @@ def test_langfuse_trace_provider_factory_builds_plugin_from_env(monkeypatch):
     plugin = LangfuseTraceProviderFactory().build_plugin_from_env()
 
     assert isinstance(plugin, LangfusePlugin)
+
+
+# ---------------------------------------------------------------------------
+# Memory-bound regressions.
+#
+# Langfuse reporting is best-effort telemetry. Every degraded path below must
+# shed load (drop + count) rather than queue without a bound — an unreachable
+# or slow Langfuse may cost trace fidelity, never worker memory or a clean
+# shutdown.
+# ---------------------------------------------------------------------------
+
+
+class WorkflowOnlyTracer(FakeTracer):
+    """Tracer whose workflow span succeeds but whose later calls blow up.
+
+    Reproduces the window in ``on_task_start`` between registering the workflow
+    in ``_active_workflows`` and claiming it on the context: the plugin
+    registry swallows the exception, so anything left in the table without an
+    owner used to stay there until LRU eviction.
+    """
+
+    def start_observation(self, request: Any) -> FakeObservation:
+        if "agent.workflow" in request.name:
+            return super().start_observation(request)
+        raise RuntimeError("langfuse SDK transient error")
+
+
+class NoObservationTracer(FakeTracer):
+    """Tracer that only materializes the workflow span, returning None elsewhere."""
+
+    def start_observation(self, request: Any) -> Optional[FakeObservation]:
+        if "agent.workflow" in request.name:
+            return super().start_observation(request)
+        return None
+
+
+class BlockingTraceOutputTracer(FakeTracer):
+    """Tracer whose trace-output upload never finishes on its own."""
+
+    def __init__(self, release: Any):
+        super().__init__()
+        self._release = release
+
+    def update_trace_output(self, trace_id: str, output: Any) -> None:
+        self._release.wait(timeout=30)
+
+
+@pytest.mark.asyncio
+async def test_workflow_entry_released_when_task_start_partially_fails():
+    """A tracer failure after workflow registration must not orphan the entry."""
+    plugin = LangfusePlugin(
+        tracer=WorkflowOnlyTracer(),
+        observation_store=FakeObservationStore(),
+    )
+
+    for idx in range(20):
+        context = _build_context(message_id=f"msg-{idx}")
+        try:
+            await plugin.on_task_start(context)
+        except RuntimeError:
+            pass  # the real PluginRegistry._execute_hook swallows this
+        await plugin.on_task_complete(context, {"status": "SUCCESS"})
+
+    assert plugin._active_workflows == OrderedDict()  # pylint: disable=protected-access
+
+
+@pytest.mark.asyncio
+async def test_task_error_releases_workflow_without_execution_observations():
+    """on_task_error must clean up the workflow even with no agent/worker spans."""
+    tracer = NoObservationTracer()
+    plugin = LangfusePlugin(tracer=tracer, observation_store=FakeObservationStore())
+
+    for idx in range(10):
+        context = _build_context(message_id=f"msg-{idx}")
+        await plugin.on_task_start(context)
+        await plugin.on_task_error(context, RuntimeError("boom"))
+
+    assert not plugin._active_workflows  # pylint: disable=protected-access
+    workflow = tracer_first_workflow_observation(plugin)
+    assert workflow is None or workflow.ended_with is not None
+
+
+@pytest.mark.asyncio
+async def test_task_cancel_releases_workflow_without_execution_observations():
+    """on_task_cancel must clean up the workflow even with no agent/worker spans."""
+    plugin = LangfusePlugin(
+        tracer=NoObservationTracer(),
+        observation_store=FakeObservationStore(),
+    )
+
+    for idx in range(10):
+        context = _build_context(message_id=f"msg-{idx}")
+        await plugin.on_task_start(context)
+        cancel_command = CancelTaskCommand(
+            header=MessageHeader(
+                message_id=f"cancel-{idx}",
+                session_id="session-1",
+                trace_id="12345678901234567890123456789012",
+            ),
+            target_message_id=f"msg-{idx}",
+            reason="stopped",
+        )
+        await plugin.on_task_cancel(context, cancel_command)
+
+    assert not plugin._active_workflows  # pylint: disable=protected-access
+
+
+def tracer_first_workflow_observation(plugin: LangfusePlugin) -> Any:
+    """Return the first tracked workflow observation, if any remain."""
+    entries = list(plugin._active_workflows.values())  # pylint: disable=protected-access
+    return entries[0].observation if entries else None
+
+
+@pytest.mark.asyncio
+async def test_suspended_workflows_expire_after_ttl(monkeypatch):
+    """A suspended task that never resumes must not pin its workflow forever."""
+    tracer = FakeTracer()
+    plugin = LangfusePlugin(
+        tracer=tracer,
+        observation_store=FakeObservationStore(),
+        workflow_ttl_seconds=60.0,
+    )
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(langfuse_module.time, "monotonic", lambda: clock["now"])
+
+    stranded = []
+    for idx in range(5):
+        context = _build_context(message_id=f"stranded-{idx}")
+        await plugin.on_task_start(context)
+        await plugin.on_task_complete(context, {"status": "QUEUED"})
+        stranded.append(
+            getattr(context, langfuse_module.LANGFUSE_WORKFLOW_OBSERVATION_ATTR)
+        )
+
+    assert len(plugin._active_workflows) == 5  # pylint: disable=protected-access
+
+    clock["now"] += 61.0
+    trigger = _build_context(message_id="fresh")
+    await plugin.on_task_start(trigger)
+
+    # Only the freshly started workflow survives; the stranded ones are closed.
+    assert list(plugin._active_workflows) == [("session-1", "fresh")]  # pylint: disable=protected-access
+    for observation in stranded:
+        assert observation.ended_with is not None
+        assert observation.updates[-1]["level"] == "WARNING"
+        assert "expired" in observation.updates[-1]["status_message"]
+
+
+@pytest.mark.asyncio
+async def test_workflow_ttl_refreshed_on_resume(monkeypatch):
+    """Reusing a workflow must push its deadline out, not inherit the old one."""
+    plugin = LangfusePlugin(
+        tracer=FakeTracer(),
+        observation_store=FakeObservationStore(),
+        workflow_ttl_seconds=60.0,
+    )
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(langfuse_module.time, "monotonic", lambda: clock["now"])
+
+    context = _build_context(message_id="msg-1")
+    await plugin.on_task_start(context)
+    await plugin.on_task_complete(context, {"status": "QUEUED"})
+
+    clock["now"] += 50.0
+    resumed = _build_context(message_id="msg-1")
+    await plugin.on_task_start(resumed)  # touch refreshes the deadline
+
+    clock["now"] += 40.0  # 90s since creation, but only 40s since the touch
+    await plugin.on_task_start(_build_context(message_id="msg-2"))
+
+    assert ("session-1", "msg-1") in plugin._active_workflows  # pylint: disable=protected-access
+
+
+@pytest.mark.asyncio
+async def test_task_output_is_serialized_exactly_once(monkeypatch):
+    """_end_observation / _update_trace_output must not re-serialize the output."""
+    plugin = LangfusePlugin(
+        tracer=FakeTracer(), observation_store=FakeObservationStore()
+    )
+    context = _build_context()
+    await plugin.on_task_start(context)
+
+    original = LangfusePlugin._serialize_value
+    calls = {"count": 0}
+
+    def counting_serialize(value: Any) -> Any:
+        calls["count"] += 1
+        return original(value)
+
+    monkeypatch.setattr(
+        LangfusePlugin, "_serialize_value", staticmethod(counting_serialize)
+    )
+
+    await plugin.on_task_complete(context, {"status": "SUCCESS", "content": "done"})
+
+    # One entry for the result dict plus one per value as _serialize_value
+    # recurses. The pre-fix code walked the same payload three separate times —
+    # once in on_task_complete, again in _end_observation, again in
+    # _update_trace_output — for 9 calls on this input.
+    values = 2
+    assert calls["count"] == 1 + values
+
+
+@pytest.mark.asyncio
+async def test_pending_trace_output_updates_are_bounded():
+    """A slow Langfuse must cost trace outputs, not unbounded memory."""
+    plugin = LangfusePlugin(
+        tracer=SlowTraceOutputTracer(),
+        observation_store=FakeObservationStore(),
+        max_pending_trace_output_updates=4,
+        shutdown_flush_timeout_seconds=0.5,
+    )
+
+    try:
+        for idx in range(60):
+            context = _build_context(message_id=f"msg-{idx}", trace_id=f"{idx:032x}")
+            plugin._update_trace_output(context, output={"status": "SUCCESS"})  # pylint: disable=protected-access
+
+        assert len(plugin._pending_trace_output_updates) <= 4  # pylint: disable=protected-access
+        assert plugin._dropped_trace_output_updates > 0  # pylint: disable=protected-access
+    finally:
+        await plugin.on_worker_shutdown(None)
+
+
+@pytest.mark.asyncio
+async def test_trace_output_uploads_avoid_the_default_executor():
+    """Langfuse uploads must not starve the shared asyncio default executor."""
+    plugin = LangfusePlugin(
+        tracer=SlowTraceOutputTracer(),
+        observation_store=FakeObservationStore(),
+        shutdown_flush_timeout_seconds=1.0,
+    )
+
+    try:
+        context = _build_context()
+        plugin._update_trace_output(context, output={"status": "SUCCESS"})  # pylint: disable=protected-access
+
+        assert plugin._trace_output_executor is not None  # pylint: disable=protected-access
+        assert asyncio.get_running_loop()._default_executor is None
+    finally:
+        await plugin.on_worker_shutdown(None)
+
+
+@pytest.mark.asyncio
+async def test_worker_shutdown_is_bounded_when_uploads_hang():
+    """An unreachable Langfuse must not hold worker shutdown open."""
+    release = threading.Event()
+    plugin = LangfusePlugin(
+        tracer=BlockingTraceOutputTracer(release),
+        observation_store=FakeObservationStore(),
+        shutdown_flush_timeout_seconds=0.3,
+    )
+
+    try:
+        for idx in range(3):
+            context = _build_context(message_id=f"msg-{idx}", trace_id=f"{idx:032x}")
+            plugin._update_trace_output(context, output={"status": "SUCCESS"})  # pylint: disable=protected-access
+
+        started = time.monotonic()
+        await plugin.on_worker_shutdown(None)
+        elapsed = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert elapsed < 5.0
+
+
+def test_sdk_tracer_reuses_one_http_client(monkeypatch):
+    """Trace-output uploads must pool connections instead of dialing per call."""
+    created: list[Any] = []
+
+    class FakeResponse:
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeHttpClient:
+
+        def __init__(self, **kwargs: Any):
+            self.kwargs = kwargs
+            self.posts: list[tuple[str, Any]] = []
+            self.closed = False
+            created.append(self)
+
+        def post(self, url: str, json: Any = None) -> FakeResponse:
+            self.posts.append((url, json))
+            return FakeResponse()
+
+        def close(self) -> None:
+            self.closed = True
+
+    monkeypatch.setitem(sys.modules, "httpx", SimpleNamespace(Client=FakeHttpClient))
+
+    config = LangfuseConfig(
+        secret_key="sk", public_key="pk", base_url="http://localhost:3000/"
+    )
+    tracer = langfuse_module._SdkLangfuseTracer(FakeSdkClient(), config)
+
+    for _ in range(5):
+        tracer.update_trace_output("trace-hex", {"status": "SUCCESS"})
+
+    assert len(created) == 1
+    assert len(created[0].posts) == 5
+    assert created[0].kwargs["base_url"] == "http://localhost:3000"
+
+    tracer.shutdown()
+    assert created[0].closed is True
+
+
+def test_langchain_callback_subclass_is_created_once(monkeypatch):
+    """build_langchain_callback must not mint a fresh handler class per task."""
+
+    class BaseCallbackHandler:  # pylint: disable=too-few-public-methods
+
+        def __init__(self, **kwargs: Any):
+            self.kwargs = kwargs
+
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk")
+    monkeypatch.setenv("LANGFUSE_BASE_URL", "http://localhost:3000")
+    monkeypatch.setitem(
+        sys.modules,
+        "langfuse.langchain",
+        SimpleNamespace(CallbackHandler=BaseCallbackHandler),
+    )
+
+    handlers = [
+        build_langchain_callback(
+            trace_id=f"trace-{idx}", parent_observation_id="0" * 16
+        )
+        for idx in range(5)
+    ]
+
+    assert all(handler is not None for handler in handlers)
+    assert len({type(handler) for handler in handlers}) == 1
+
+
+def test_active_workflow_cap_reads_environment(monkeypatch):
+    """The workflow cap is tunable, and an explicit kwarg still wins."""
+    monkeypatch.setenv(langfuse_module.ENV_MAX_ACTIVE_WORKFLOWS, "25")
+
+    assert LangfusePlugin()._max_active_workflows == 25  # pylint: disable=protected-access
+    # CLAUDE.md invariant: an explicit kwarg is never discarded by config/env.
+    assert LangfusePlugin(max_active_workflows=7)._max_active_workflows == 7  # pylint: disable=protected-access
+
+
+def test_invalid_environment_tunable_falls_back_to_default(monkeypatch):
+    """A malformed override must degrade to the default, not raise."""
+    monkeypatch.setenv(langfuse_module.ENV_WORKFLOW_TTL_SECONDS, "not-a-number")
+
+    plugin = LangfusePlugin()
+
+    assert plugin._workflow_ttl_seconds == langfuse_module.DEFAULT_WORKFLOW_TTL_SECONDS  # pylint: disable=protected-access

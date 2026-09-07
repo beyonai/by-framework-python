@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 import uuid
+import weakref
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -41,6 +44,53 @@ LANGFUSE_PARENT_OBSERVATION_METADATA_KEY = "langfuse_parent_observation_id"
 _QUOTES_TO_STRIP = "\"'“”‘’"
 _FALSE_LIKE_VALUES = {"0", "false", "no", "off", "disabled"}
 _CLIENT_DISPATCH_TRACER_CACHE: dict[LangfuseConfig, "_SdkLangfuseTracer"] = {}
+
+# Langfuse reporting is best-effort telemetry, never business data. Every
+# degraded path below sheds load (drop + count) instead of queueing without a
+# bound — an unreachable Langfuse must cost trace fidelity, not worker memory.
+DEFAULT_MAX_ACTIVE_WORKFLOWS = 10000
+DEFAULT_WORKFLOW_TTL_SECONDS = 3600.0
+DEFAULT_MAX_PENDING_TRACE_OUTPUTS = 128
+DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_SECONDS = 5.0
+_TRACE_OUTPUT_EXECUTOR_WORKERS = 2
+
+ENV_MAX_ACTIVE_WORKFLOWS = "BYAI_LANGFUSE_MAX_ACTIVE_WORKFLOWS"
+ENV_WORKFLOW_TTL_SECONDS = "BYAI_LANGFUSE_WORKFLOW_TTL_SECONDS"
+ENV_MAX_PENDING_TRACE_OUTPUTS = "BYAI_LANGFUSE_MAX_PENDING_TRACE_OUTPUTS"
+ENV_SHUTDOWN_FLUSH_TIMEOUT_SECONDS = "BYAI_LANGFUSE_SHUTDOWN_FLUSH_TIMEOUT_SECONDS"
+
+# Keyed by the Langfuse base class so repeated build_langchain_callback() calls
+# reuse one subclass instead of minting a fresh type per task. Weak keys keep a
+# stubbed or reloaded SDK class collectable.
+_ROOT_PROMOTION_SUBCLASSES: "weakref.WeakKeyDictionary[type, type]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _env_number(name: str, default: float, *, minimum: float) -> float:
+    """Read a positive numeric override from the environment, fail-soft."""
+    raw = LangfuseConfig._clean_env_value(os.environ.get(name, ""))
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "LangfusePlugin: %s=%r is not a number — falling back to %s.",
+            name,
+            raw,
+            default,
+        )
+        return default
+    if value < minimum:
+        logger.warning(
+            "LangfusePlugin: %s=%s is below the %s minimum — clamping.",
+            name,
+            value,
+            minimum,
+        )
+        return minimum
+    return value
 
 
 @dataclass(frozen=True)
@@ -133,7 +183,17 @@ def _langchain_callback_metadata(
 
 
 def _without_langchain_root_promotion(callback_handler_cls: Any) -> Any:
-    """Return a CallbackHandler class that keeps LangChain runs as child spans."""
+    """Return a CallbackHandler class that keeps LangChain runs as child spans.
+
+    Cached per base class: this runs once per LangGraph invocation (i.e. once
+    per task), and minting a fresh type each time leaves classes that only the
+    generational collector can reclaim while invalidating CPython's type method
+    cache on every creation. Per-callback state lives on the *instance*
+    (``_by_framework_metadata``), so one shared subclass is safe.
+    """
+    cached = _ROOT_PROMOTION_SUBCLASSES.get(callback_handler_cls)
+    if cached is not None:
+        return cached
 
     # pylint: disable=too-few-public-methods,useless-parent-delegation
     class ByFrameworkCallbackHandler(callback_handler_cls):
@@ -233,6 +293,11 @@ def _without_langchain_root_promotion(callback_handler_cls: Any) -> Any:
     ByFrameworkCallbackHandler.__name__ = callback_handler_cls.__name__
     ByFrameworkCallbackHandler.__qualname__ = callback_handler_cls.__qualname__
     ByFrameworkCallbackHandler.__module__ = callback_handler_cls.__module__
+    try:
+        _ROOT_PROMOTION_SUBCLASSES[callback_handler_cls] = ByFrameworkCallbackHandler
+    except TypeError:
+        # A non-weakref-able base (exotic metaclass) just skips the cache.
+        pass
     return ByFrameworkCallbackHandler
 
 
@@ -315,6 +380,14 @@ class _ObservationStartRequest:
     as_root: bool = False
 
 
+@dataclass(frozen=True)
+class _ActiveWorkflow:
+    """A durable workflow observation plus the deadline after which it expires."""
+
+    observation: ObservationHandle
+    expires_at: float
+
+
 class WorkerRegistryObservationStore:
     """Observation store backed by the existing WorkerRegistry session registry."""
 
@@ -358,6 +431,8 @@ class _SdkLangfuseTracer:
     def __init__(self, client: Any, config: LangfuseConfig | None = None):
         self._client = client
         self._config = config
+        self._http_client: Any = None
+        self._http_client_failed = False
 
     def start_observation(self, request: _ObservationStartRequest) -> ObservationHandle:
         """Start a Langfuse observation with the current framework trace context."""
@@ -421,13 +496,52 @@ class _SdkLangfuseTracer:
 
         return obs
 
+    def _get_http_client(self) -> Any:
+        """Return the pooled ingestion client, building it on first use.
+
+        One client per tracer keeps the TLS connection alive across uploads;
+        the previous module-level ``httpx.post`` opened and tore down a fresh
+        connection for every task completion. ``httpx.Client`` is safe to share
+        across the trace-output worker threads.
+        """
+        if self._http_client is not None or self._http_client_failed:
+            return self._http_client
+        if self._config is None:
+            return None
+
+        try:
+            import httpx
+
+            self._http_client = httpx.Client(
+                base_url=self._config.base_url.rstrip("/"),
+                auth=(self._config.public_key, self._config.secret_key),
+                headers={
+                    "x-langfuse-sdk-name": "by-framework-python",
+                    "x-langfuse-public-key": self._config.public_key,
+                },
+                timeout=5,
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            self._http_client_failed = True
+            logger.warning(
+                "LangfusePlugin: could not build the trace-output HTTP client — "
+                "trace outputs will not be uploaded.",
+                exc_info=True,
+            )
+        return self._http_client
+
     def update_trace_output(self, trace_id: str, output: Any) -> None:
-        """Best-effort trace output upsert for the Langfuse trace list."""
+        """Best-effort trace output upsert for the Langfuse trace list.
+
+        ``output`` must already be serialized by ``LangfusePlugin._serialize_value``.
+        """
         if self._config is None or not trace_id:
             return
 
         try:
-            import httpx
+            client = self._get_http_client()
+            if client is None:
+                return
 
             now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
             payload = {
@@ -440,17 +554,7 @@ class _SdkLangfuseTracer:
                     }
                 ]
             }
-            base_url = self._config.base_url.rstrip("/")
-            response = httpx.post(
-                f"{base_url}/api/public/ingestion",
-                json=payload,
-                auth=(self._config.public_key, self._config.secret_key),
-                headers={
-                    "x-langfuse-sdk-name": "by-framework-python",
-                    "x-langfuse-public-key": self._config.public_key,
-                },
-                timeout=5,
-            )
+            response = client.post("/api/public/ingestion", json=payload)
             response.raise_for_status()
         except Exception:  # pylint: disable=broad-exception-caught
             pass
@@ -490,6 +594,13 @@ class _SdkLangfuseTracer:
 
     def shutdown(self) -> None:
         """Flush tracing state using whichever shutdown API the SDK exposes."""
+        http_client, self._http_client = self._http_client, None
+        if http_client is not None:
+            try:
+                http_client.close()
+            except Exception:  # pylint: disable=broad-exception-caught
+                pass
+
         shutdown = getattr(self._client, "shutdown", None)
         if callable(shutdown):
             shutdown()
@@ -509,16 +620,71 @@ class LangfusePlugin(Plugin):
         observation_store: Optional[ObservationStore] = None,
         plugin_id: str = "langfuse",
         enabled: bool = True,
-        max_active_workflows: int = 10000,
+        max_active_workflows: Optional[int] = None,
+        workflow_ttl_seconds: Optional[float] = None,
+        max_pending_trace_output_updates: Optional[int] = None,
+        shutdown_flush_timeout_seconds: Optional[float] = None,
     ):
         super().__init__(PluginManifest(plugin_id=plugin_id, enabled=enabled))
         self._tracer = tracer
         self._observation_store = observation_store
-        self._active_workflows: OrderedDict[tuple[str, str], ObservationHandle] = (
+        self._active_workflows: OrderedDict[tuple[str, str], _ActiveWorkflow] = (
             OrderedDict()
         )
-        self._max_active_workflows = max(1, int(max_active_workflows or 10000))
+        # Explicit kwargs always win; the env override only applies when the
+        # caller said nothing. See CLAUDE.md's "explicitly-passed kwarg" invariant.
+        self._max_active_workflows = self._resolve_limit(
+            max_active_workflows,
+            ENV_MAX_ACTIVE_WORKFLOWS,
+            DEFAULT_MAX_ACTIVE_WORKFLOWS,
+            minimum=1,
+        )
+        self._workflow_ttl_seconds = float(
+            self._resolve_limit(
+                workflow_ttl_seconds,
+                ENV_WORKFLOW_TTL_SECONDS,
+                DEFAULT_WORKFLOW_TTL_SECONDS,
+                minimum=1.0,
+                cast=float,
+            )
+        )
+        self._max_pending_trace_output_updates = self._resolve_limit(
+            max_pending_trace_output_updates,
+            ENV_MAX_PENDING_TRACE_OUTPUTS,
+            DEFAULT_MAX_PENDING_TRACE_OUTPUTS,
+            minimum=1,
+        )
+        self._shutdown_flush_timeout_seconds = float(
+            self._resolve_limit(
+                shutdown_flush_timeout_seconds,
+                ENV_SHUTDOWN_FLUSH_TIMEOUT_SECONDS,
+                DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_SECONDS,
+                minimum=0.1,
+                cast=float,
+            )
+        )
         self._pending_trace_output_updates: set[asyncio.Future[Any]] = set()
+        self._dropped_trace_output_updates = 0
+        self._trace_output_executor: Optional[ThreadPoolExecutor] = None
+
+    @staticmethod
+    def _resolve_limit(
+        explicit: Any,
+        env_name: str,
+        default: Any,
+        *,
+        minimum: Any,
+        cast: Any = int,
+    ) -> Any:
+        """Resolve a tunable: explicit kwarg > environment > built-in default."""
+        if explicit is not None:
+            try:
+                return max(minimum, cast(explicit))
+            except (TypeError, ValueError):
+                logger.warning(
+                    "LangfusePlugin: ignoring invalid %s=%r.", env_name, explicit
+                )
+        return cast(_env_number(env_name, float(default), minimum=float(minimum)))
 
     async def register_agent_configs(
         self, build_context: Any
@@ -537,11 +703,52 @@ class LangfusePlugin(Plugin):
 
     async def on_worker_shutdown(self, worker: Any) -> None:
         del worker
-        if self._pending_trace_output_updates:
-            await asyncio.gather(
-                *list(self._pending_trace_output_updates),
-                return_exceptions=True,
+        # Bounded: an unreachable Langfuse must not be able to hold worker
+        # shutdown open. Whatever has not flushed by the deadline is abandoned.
+        pending = list(self._pending_trace_output_updates)
+        if pending:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    timeout=self._shutdown_flush_timeout_seconds,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.warning(
+                    "LangfusePlugin: %d trace-output upload(s) did not flush "
+                    "within %.1fs — abandoning them to finish shutdown.",
+                    # Anything cancelled (never left the queue) or still running
+                    # when the deadline hit did not make it to Langfuse.
+                    sum(
+                        1
+                        for future in pending
+                        if future.cancelled() or not future.done()
+                    ),
+                    self._shutdown_flush_timeout_seconds,
+                )
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.warning(
+                    "LangfusePlugin: trace-output flush failed during shutdown.",
+                    exc_info=True,
+                )
+
+        if self._dropped_trace_output_updates:
+            logger.warning(
+                "LangfusePlugin: dropped %d trace-output upload(s) this run "
+                "because the in-flight limit (%d) was reached.",
+                self._dropped_trace_output_updates,
+                self._max_pending_trace_output_updates,
             )
+
+        executor, self._trace_output_executor = self._trace_output_executor, None
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.warning(
+                    "LangfusePlugin: trace-output executor shutdown failed.",
+                    exc_info=True,
+                )
+
         if self._tracer is not None:
             self._tracer.shutdown()
 
@@ -549,6 +756,7 @@ class LangfusePlugin(Plugin):
         tracer = self._get_tracer()
         if tracer is None:
             return
+        self._expire_active_workflows()
         observation_store = self._get_observation_store(context)
         identity = self._build_task_identity(context)
 
@@ -588,9 +796,13 @@ class LangfusePlugin(Plugin):
             else str(root_parent_id or "")
         )
         workflow_key = (identity.session_id, identity.message_id)
-        workflow_obs = self._active_workflows.get(workflow_key)
-        if workflow_obs is not None:
-            self._active_workflows.move_to_end(workflow_key)
+        tracked = self._active_workflows.get(workflow_key)
+        workflow_obs = tracked.observation if tracked is not None else None
+        if tracked is not None:
+            # Touching a workflow refreshes its deadline *and* moves it to the
+            # tail — that is what keeps LRU order identical to expiry order,
+            # which _expire_active_workflows() relies on.
+            self._track_active_workflow(workflow_key, workflow_obs)
         workflow_span_id = str_to_uint64(f"{execution_anchor}:agent.workflow")
         workflow_observation_id = f"{workflow_span_id:016x}"
 
@@ -612,7 +824,12 @@ class LangfusePlugin(Plugin):
                 )
             )
             if workflow_obs is not None:
-                self._active_workflows[workflow_key] = workflow_obs
+                self._track_active_workflow(workflow_key, workflow_obs)
+                # Claim ownership on the context immediately. The tracer calls
+                # below can raise (the registry swallows it), and a workflow
+                # that entered the table without a context attribute would have
+                # nothing left to end or evict it.
+                setattr(context, LANGFUSE_WORKFLOW_OBSERVATION_ATTR, workflow_obs)
                 self._evict_active_workflows_if_needed()
 
         header_metadata = metadata.get("header_metadata", {})
@@ -675,42 +892,31 @@ class LangfusePlugin(Plugin):
         self._close_attribute_propagation(context)
 
     async def on_task_error(self, context: Any, error: Exception) -> None:
+        # No early return on an empty observation list: the workflow entry can
+        # outlive the per-execution observations (on_task_start may have failed
+        # after registering it), and bailing here is what used to orphan it.
+        output = {"error": str(error)}
         observations = self._iter_context_observations(context)
-        if not observations:
-            self._close_attribute_propagation(context)
-            return
-
         for observation in observations:
             observation.update(level="ERROR", status_message=str(error))
-        self._end_observation(
-            context,
-            output={"error": str(error)},
-        )
-        self._end_workflow_observation(context, output={"error": str(error)})
-        self._update_trace_output(context, output={"error": str(error)})
+        if observations:
+            self._end_observation(context, output=output)
+        workflow_ended = self._end_workflow_observation(context, output=output)
+        if observations or workflow_ended:
+            self._update_trace_output(context, output=output)
         self._close_attribute_propagation(context)
 
     async def on_task_cancel(self, context: Any, command: Any) -> None:
-        observations = self._iter_context_observations(context)
-        if not observations:
-            self._close_attribute_propagation(context)
-            return
-
         reason = getattr(command, "reason", "") or "cancelled"
+        output = {"cancelled": True, "reason": reason}
+        observations = self._iter_context_observations(context)
         for observation in observations:
             observation.update(level="WARNING", status_message=reason)
-        self._end_observation(
-            context,
-            output={"cancelled": True, "reason": reason},
-        )
-        self._end_workflow_observation(
-            context,
-            output={"cancelled": True, "reason": reason},
-        )
-        self._update_trace_output(
-            context,
-            output={"cancelled": True, "reason": reason},
-        )
+        if observations:
+            self._end_observation(context, output=output)
+        workflow_ended = self._end_workflow_observation(context, output=output)
+        if observations or workflow_ended:
+            self._update_trace_output(context, output=output)
         self._close_attribute_propagation(context)
 
     async def on_call_agent_start(self, context: Any, command: Any) -> None:
@@ -1133,44 +1339,90 @@ class LangfusePlugin(Plugin):
             pass
 
     def _end_observation(self, context: Any, *, output: Any) -> None:
-        serialized_output = self._serialize_value(output)
+        """End the per-execution observations. ``output`` must already be serialized."""
         for observation in self._iter_context_observations(context):
             try:
-                observation.end(output=serialized_output)
+                observation.end(output=output)
             except TypeError:
-                observation.update(output=serialized_output)
+                observation.update(output=output)
                 observation.end()
 
-    def _end_workflow_observation(self, context: Any, *, output: Any) -> None:
-        observation = getattr(context, LANGFUSE_WORKFLOW_OBSERVATION_ATTR, None)
-        if observation is None:
-            return
+    def _end_workflow_observation(self, context: Any, *, output: Any) -> bool:
+        """End and deregister this context's workflow. ``output`` must be serialized.
 
-        serialized_output = self._serialize_value(output)
-        try:
-            observation.end(output=serialized_output)
-        except TypeError:
-            observation.update(output=serialized_output)
-            observation.end()
-
+        Falls back to the tracked entry when the context attribute is missing:
+        ``on_task_start`` registers the workflow before the remaining tracer
+        calls, so a mid-hook failure can leave a table entry whose only handle
+        is the ``(session_id, message_id)`` key. Returns whether a workflow was
+        actually ended.
+        """
         key = (
             str(getattr(context, "session_id", "")),
             str(getattr(context, "message_id", "")),
         )
-        if self._active_workflows.get(key) is observation:
+        observation = getattr(context, LANGFUSE_WORKFLOW_OBSERVATION_ATTR, None)
+        tracked = self._active_workflows.get(key)
+        target = (
+            observation
+            if observation is not None
+            else (tracked.observation if tracked is not None else None)
+        )
+        if target is None:
+            return False
+
+        try:
+            target.end(output=output)
+        except TypeError:
+            target.update(output=output)
+            target.end()
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "LangfusePlugin: failed to end workflow observation.", exc_info=True
+            )
+
+        if tracked is not None and tracked.observation is target:
             self._active_workflows.pop(key, None)
+        return True
+
+    def _track_active_workflow(
+        self, key: tuple[str, str], observation: ObservationHandle
+    ) -> None:
+        """Register or refresh a workflow, keeping it at the LRU/expiry tail."""
+        self._active_workflows.pop(key, None)
+        self._active_workflows[key] = _ActiveWorkflow(
+            observation=observation,
+            expires_at=time.monotonic() + self._workflow_ttl_seconds,
+        )
+
+    @staticmethod
+    def _finish_workflow(entry: _ActiveWorkflow, status_message: str) -> None:
+        """Close an entry the plugin is discarding rather than completing."""
+        try:
+            entry.observation.update(level="WARNING", status_message=status_message)
+            entry.observation.end()
+        except Exception:  # pylint: disable=broad-exception-caught
+            pass
+
+    def _expire_active_workflows(self) -> None:
+        """Drop workflows whose suspended task never came back.
+
+        Relies on the invariant that every write goes through
+        ``_track_active_workflow`` — which refreshes ``expires_at`` and moves
+        the entry to the tail — so LRU order equals expiry order and the scan
+        can stop at the first live entry instead of walking the whole table.
+        """
+        now = time.monotonic()
+        while self._active_workflows:
+            key, entry = next(iter(self._active_workflows.items()))
+            if entry.expires_at > now:
+                return
+            self._active_workflows.pop(key, None)
+            self._finish_workflow(entry, "workflow expired from active workflow cache")
 
     def _evict_active_workflows_if_needed(self) -> None:
         while len(self._active_workflows) > self._max_active_workflows:
-            _, observation = self._active_workflows.popitem(last=False)
-            try:
-                observation.update(
-                    level="WARNING",
-                    status_message="workflow evicted from active workflow cache",
-                )
-                observation.end()
-            except Exception:  # pylint: disable=broad-exception-caught
-                pass
+            _, entry = self._active_workflows.popitem(last=False)
+            self._finish_workflow(entry, "workflow evicted from active workflow cache")
 
     @staticmethod
     def _is_non_terminal_result(result: Any) -> bool:
@@ -1179,7 +1431,45 @@ class LangfusePlugin(Plugin):
         status = str(result.get("status", ""))
         return status == "QUEUED" or status.startswith("QUEUED:")
 
+    def _get_trace_output_executor(self) -> Optional[ThreadPoolExecutor]:
+        """Return the plugin's own upload pool, built on first use.
+
+        Deliberately not the asyncio default executor: that pool is shared with
+        the rest of the framework's blocking calls, and a stalled Langfuse
+        would starve unrelated work. Lazy because a plugin that never traces a
+        task should not spawn threads.
+        """
+        if self._trace_output_executor is not None:
+            return self._trace_output_executor
+        try:
+            self._trace_output_executor = ThreadPoolExecutor(
+                max_workers=_TRACE_OUTPUT_EXECUTOR_WORKERS,
+                thread_name_prefix="langfuse-trace-output",
+            )
+        except Exception:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "LangfusePlugin: could not start the trace-output executor — "
+                "trace outputs will not be uploaded.",
+                exc_info=True,
+            )
+        return self._trace_output_executor
+
+    def _note_dropped_trace_output(self) -> None:
+        """Count a shed upload, logging only on powers of two to stay quiet."""
+        self._dropped_trace_output_updates += 1
+        dropped = self._dropped_trace_output_updates
+        if dropped & (dropped - 1) == 0:
+            logger.warning(
+                "LangfusePlugin: trace-output upload dropped — %d in flight "
+                "already (limit %d, %d dropped so far). Langfuse is likely slow "
+                "or unreachable; trace outputs are best-effort.",
+                len(self._pending_trace_output_updates),
+                self._max_pending_trace_output_updates,
+                dropped,
+            )
+
     def _update_trace_output(self, context: Any, *, output: Any) -> None:
+        """Upsert the trace-level output. ``output`` must already be serialized."""
         tracer = self._tracer
         if tracer is None or not hasattr(tracer, "update_trace_output"):
             return
@@ -1190,17 +1480,31 @@ class LangfusePlugin(Plugin):
 
         try:
             trace_id_hex = f"{str_to_uint128(trace_id):032x}"
-            serialized_output = self._serialize_value(output)
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
-                tracer.update_trace_output(trace_id_hex, serialized_output)
+                tracer.update_trace_output(trace_id_hex, output)
                 return
+
+            # Shed load *before* submitting. Dropping only the future would
+            # leave the work item — and the payload it closes over — sitting in
+            # the executor queue, which is the unbounded growth this guards.
+            if (
+                len(self._pending_trace_output_updates)
+                >= self._max_pending_trace_output_updates
+            ):
+                self._note_dropped_trace_output()
+                return
+
+            executor = self._get_trace_output_executor()
+            if executor is None:
+                return
+
             future = loop.run_in_executor(
-                None,
+                executor,
                 tracer.update_trace_output,
                 trace_id_hex,
-                serialized_output,
+                output,
             )
             self._pending_trace_output_updates.add(future)
 
@@ -1208,7 +1512,10 @@ class LangfusePlugin(Plugin):
                 self._pending_trace_output_updates.discard(done)
                 try:
                     done.result()
-                except Exception:  # pylint: disable=broad-exception-caught
+                # CancelledError is a BaseException: shutdown cancels whatever
+                # has not flushed, and letting that escape the callback would
+                # dump a traceback per abandoned upload.
+                except BaseException:  # pylint: disable=broad-exception-caught
                     pass
 
             future.add_done_callback(_discard_done)
