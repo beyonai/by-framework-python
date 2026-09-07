@@ -151,6 +151,22 @@ Pre-commit hooks are configured in `.pre-commit-config.yaml` and run isort, ruff
   plugin/trace integration point must degrade to a no-op (logged) rather
   than raising.
 
+- **A rule enforced only behind an optional dependency is not enforced.** If
+  the check short-circuits when a package is missing, then whatever controls
+  the environment controls the rule — and a green run stops meaning anything.
+  Incident: `tests/metrics/test_catalog.py` asserts every exported metric has a
+  `metrics/catalog.py` entry, but returned early when `prometheus-client` was
+  absent, while `make test` synced with `--extra dev` and dropped the root
+  `observability` extra. The assertion ran against an empty registry and
+  reported success for months; four uncatalogued metrics landed on main with CI
+  green (#142, then the CI fix). Correct form: enforce the rule where the
+  optional dependency cannot reach it — here `scripts/check-metric-catalog.sh`
+  reads the source, so **every new Prometheus `Counter`/`Gauge`/`Histogram` in
+  `src/` needs a `catalog.py` entry** regardless of what is installed — and
+  make the dependent test `pytest.skip()` rather than `return`, so degrading is
+  at least visible. Test commands must sync the extras the tests exercise
+  (`make test` uses `--all-extras`); narrowing them silently deletes coverage.
+
 ## Iron rules
 
 <!-- No process rules (test invocation, release steps) have caused an

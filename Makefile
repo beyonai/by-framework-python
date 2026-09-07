@@ -37,11 +37,22 @@ list-projects:
 		echo $$project; \
 	done
 
+# All ten projects share the workspace venv, so syncing them in a loop makes
+# each one PRUNE the previous one's dependencies — the loop used to end with a
+# venv holding only the last project's deps (and it uninstalled prometheus-client
+# on the second iteration). --all-packages resolves the whole workspace once
+# instead. The loop survives only for an explicit PROJECTS override, where
+# narrowing the venv is what the caller asked for.
 install:
-	@for project in $(PROJECTS); do \
-		echo "==> Syncing $$project"; \
-		(cd $$project && uv sync --all-extras); \
-	done
+	@if [ "$(strip $(PROJECTS))" = "$(strip $(PYTHON_PROJECTS))" ]; then \
+		echo "==> Syncing workspace (all packages, all extras)"; \
+		uv sync --all-extras --all-packages; \
+	else \
+		for project in $(PROJECTS); do \
+			echo "==> Syncing $$project (narrowed: PROJECTS override)"; \
+			(cd $$project && uv sync --all-extras); \
+		done; \
+	fi
 
 format:
 	@PROJECTS="$(PROJECTS)" ./scripts/python_quality.sh format $(FILES)
@@ -80,6 +91,18 @@ lint-changed:
 		$(MAKE) lint PROJECTS="$(PROJECTS)" FILES="$$changed_files"; \
 	fi
 
+# --all-extras, not --extra dev: `uv run` only ever adds what it is asked for,
+# it never restores an extra it was not told about. So once `install`'s old
+# per-project loop had uninstalled prometheus-client, `--extra dev` left it
+# uninstalled and the root project's whole `observability` extra stayed missing
+# for the entire test run. tests/metrics then ran against a build with no
+# Prometheus registry, where the metric catalog check short-circuits and reports
+# success without inspecting anything. State what the tests need, rather than
+# inheriting whatever `install` happened to leave behind.
+#
+# Deliberately per-project rather than --all-packages: each project must be
+# testable with only its own declared dependencies, or a package that quietly
+# leans on a sibling's deps would still pass here and break on install.
 test:
 	@set -e; for project in $(PROJECTS); do \
 		if ! find "$$project/tests" -type f \( -name 'test_*.py' -o -name '*_test.py' \) -print -quit 2>/dev/null | grep -q .; then \
@@ -87,7 +110,7 @@ test:
 			continue; \
 		fi; \
 		echo "==> Testing $$project"; \
-		(cd $$project && uv run --extra dev pytest); \
+		(cd $$project && uv run --all-extras pytest); \
 	done
 
 clean:
