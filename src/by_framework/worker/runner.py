@@ -83,6 +83,7 @@ class WorkerRunner:
         self.worker = worker
         self.group_name = group_name or self._auto_group_name()
         self.consumer_name = worker.worker_id
+        self.max_concurrency = max_concurrency
         self.semaphore = asyncio.Semaphore(max_concurrency)
         self.fetch_count = fetch_count
         # OTel for worker.execute is emitted via a live wrapping span (see
@@ -120,6 +121,14 @@ class WorkerRunner:
         self._consumer_health_timeout_seconds = max(
             float(self.worker.heartbeat_lease_ttl_seconds) * 2.0,
             stream_block_seconds * 3.0,
+        )
+        # Poll interval used by _acquire_slot() while waiting for a saturated
+        # semaphore. Derived from _consumer_health_timeout_seconds (not a
+        # hardcoded constant) so it stays well under the health-check
+        # deadline under any configuration, with a floor to avoid busy-
+        # polling if the timeout is configured very small.
+        self._slot_wait_poll_seconds = max(
+            self._consumer_health_timeout_seconds / 4.0, 1.0
         )
         # Set as the first step of _shutdown() - see
         # docs/architecture/worker-readiness-endpoint.md Decision 6.
@@ -386,9 +395,23 @@ class WorkerRunner:
         finally:
             await self.redis.xack(stream_name, self.group_name, msg_id)
 
+    async def _acquire_slot(self) -> None:
+        """Wait for a concurrency slot, marking the consumer tick on every
+        poll so a saturated-but-alive loop isn't judged stalled.
+
+        Polling on `len(self._running_tasks)` instead of wrapping
+        `semaphore.acquire()` in `asyncio.wait_for()` avoids relying on
+        Semaphore cancellation semantics for a lock this runner is the only
+        waiter on — see design.md's "why not asyncio.wait_for" section.
+        """
+        while len(self._running_tasks) >= self.max_concurrency:
+            self._mark_consumer_tick()
+            await asyncio.sleep(self._slot_wait_poll_seconds)
+        await self.semaphore.acquire()
+
     async def _run_once(self) -> bool:
         """Fetch and start processing messages."""
-        await self.semaphore.acquire()
+        await self._acquire_slot()
 
         try:
             messages = await self.fetch_messages(
@@ -401,7 +424,7 @@ class WorkerRunner:
 
             for i, (stream_name, msg_id, data_dict) in enumerate(messages):
                 if i > 0:
-                    await self.semaphore.acquire()
+                    await self._acquire_slot()
 
                 task = asyncio.create_task(
                     self._process_and_release(stream_name, msg_id, data_dict)

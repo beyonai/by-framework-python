@@ -193,6 +193,81 @@ class StartupOrderStop(RuntimeError):
     """Sentinel used to stop the infinite runner loop in startup-order tests."""
 
 
+class _ContinuousMockRedis(MockRedisRunner):
+    """Returns a fresh AskAgentCommand message on every xreadgroup call.
+
+    Used by the semaphore-saturation tests to simulate a control stream
+    that always has more work waiting, so the consume loop is genuinely
+    busy (not idle) while a concurrency slot is unavailable.
+    """
+
+    def __init__(self, agent_type: str = "dummy_agent"):
+        super().__init__(message_to_return=None)
+        self.agent_type = agent_type
+        self._counter = 0
+
+    async def xreadgroup(self, groupname, consumername, streams, count=1, block=0):
+        self.called_xreadgroup = True
+        self._counter += 1
+        msg = AskAgentCommand(
+            header=MessageHeader(
+                message_id=f"msg-{self._counter}",
+                session_id="sess-1",
+                trace_id="trace-1",
+                target_agent_type=self.agent_type,
+            ),
+            content="test",
+        )
+        return [
+            [
+                RedisKeys.ctrl_stream(self.agent_type).encode(),
+                [
+                    (
+                        f"{self._counter}-0".encode(),
+                        {b"data": json.dumps(msg.to_dict()).encode()},
+                    )
+                ],
+            ]
+        ]
+
+
+class _SlowWorker(DummyWorker):
+    """Every task takes `delay` seconds - stands in for a long-running
+    LLM/tool-call agent task that legitimately occupies a concurrency slot."""
+
+    def __init__(self, delay: float):
+        super().__init__()
+        self.delay = delay
+        self.completed = 0
+
+    async def _handle_message(self, command, **kwargs):
+        await asyncio.sleep(self.delay)
+        self.completed += 1
+        return AgentTaskResult(status=AgentState.COMPLETED.value)
+
+
+class _MixedDurationWorker(DummyWorker):
+    """The first message processed takes `long_delay`; every subsequent one
+    takes `short_delay` - simulates one slot pinned by a long task while
+    the rest of the pool cycles normally."""
+
+    def __init__(self, long_delay: float, short_delay: float):
+        super().__init__()
+        self.long_delay = long_delay
+        self.short_delay = short_delay
+        self.completed = 0
+        self._long_dispatched = False
+        self._lock = asyncio.Lock()
+
+    async def _handle_message(self, command, **kwargs):
+        async with self._lock:
+            is_long = not self._long_dispatched
+            self._long_dispatched = True
+        await asyncio.sleep(self.long_delay if is_long else self.short_delay)
+        self.completed += 1
+        return AgentTaskResult(status=AgentState.COMPLETED.value)
+
+
 class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
 
     async def test_runner_pull_and_dispatch(self):
@@ -1394,6 +1469,139 @@ class TestWorkerRunner(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(body["reason"], "serving")
         finally:
             runner._health_server.stop()
+            runner._consumer_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await runner._consumer_task
+
+    async def test_runner_healthy_during_single_slot_saturation_live(self):
+        """max_concurrency=1: a single task running well past the (shrunk)
+        health timeout, with more messages continuously available, must
+        never flip _is_consumer_healthy() to False - this is the exact
+        scenario from the PRD's Background (real asyncio scheduling, no
+        mocked clock): the consume loop is busy, not stuck."""
+        worker = _SlowWorker(delay=0.3)
+        redis_mock = _ContinuousMockRedis()
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            max_concurrency=1,
+            fetch_count=1,
+        )
+        # Shrink well below the task duration so a stale tick would be
+        # caught, and re-derive the poll interval the same way __init__
+        # does (a smaller floor than production's 1.0s so the test runs
+        # fast, without changing the ratio the design specifies).
+        runner._consumer_health_timeout_seconds = 0.1
+        runner._slot_wait_poll_seconds = max(
+            runner._consumer_health_timeout_seconds / 4.0, 0.02
+        )
+        runner._mark_consumer_tick()
+        runner._consumer_task = asyncio.ensure_future(runner._consume_loop())
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 1.0
+            saw_unhealthy = False
+            while loop.time() < deadline:
+                if not runner._is_consumer_healthy():
+                    saw_unhealthy = True
+                    break
+                await asyncio.sleep(0.01)
+            self.assertFalse(
+                saw_unhealthy,
+                "consumer was judged unhealthy while merely saturated, not stuck",
+            )
+            # Sanity: the loop was actually doing work throughout, not
+            # idling because fetch never returned anything.
+            self.assertGreater(worker.completed, 0)
+        finally:
+            runner._consumer_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await runner._consumer_task
+            await runner.wait_for_tasks()
+
+    async def test_runner_healthy_during_partial_saturation_live(self):
+        """max_concurrency>1: one slot pinned by a long task while the rest
+        of the pool keeps cycling normally must never flip
+        _is_consumer_healthy() to False."""
+        worker = _MixedDurationWorker(long_delay=0.4, short_delay=0.05)
+        redis_mock = _ContinuousMockRedis()
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            max_concurrency=3,
+            fetch_count=1,
+        )
+        runner._consumer_health_timeout_seconds = 0.1
+        runner._slot_wait_poll_seconds = max(
+            runner._consumer_health_timeout_seconds / 4.0, 0.02
+        )
+        runner._mark_consumer_tick()
+        runner._consumer_task = asyncio.ensure_future(runner._consume_loop())
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 1.0
+            saw_unhealthy = False
+            while loop.time() < deadline:
+                if not runner._is_consumer_healthy():
+                    saw_unhealthy = True
+                    break
+                await asyncio.sleep(0.01)
+            self.assertFalse(
+                saw_unhealthy,
+                "consumer was judged unhealthy while one slot was merely "
+                "pinned by a long task, not stuck",
+            )
+            # The short-task slots must have cycled multiple times while
+            # the long task was still occupying its own slot.
+            self.assertGreater(worker.completed, 1)
+        finally:
+            runner._consumer_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await runner._consumer_task
+            await runner.wait_for_tasks()
+
+    async def test_runner_consumer_stalled_detected_despite_free_slot_live(self):
+        """Regression guard: a free concurrency slot must not mask a
+        genuinely stuck consume loop. If fetch/dispatch itself stops
+        making progress - not because every slot is occupied -
+        _is_consumer_healthy() must still flip to False. Uses real
+        asyncio scheduling (wall-clock sleep past the shrunk timeout, no
+        mocked clock) so this fix cannot degrade into "saturated (or
+        merely idle) == always healthy"."""
+        worker = DummyWorker()
+        redis_mock = MockRedisRunner(message_to_return=[])
+        runner = WorkerRunner(
+            redis_client=redis_mock,
+            worker=worker,
+            group_name="test_group",
+            max_concurrency=5,
+        )
+        runner._consumer_health_timeout_seconds = 0.2
+        runner._slot_wait_poll_seconds = 0.05
+        runner._mark_consumer_tick()
+
+        hang_forever = asyncio.Event()
+
+        async def _hanging_fetch(*args, **kwargs):
+            await hang_forever.wait()
+            return []
+
+        # Simulate the consume loop getting stuck somewhere other than the
+        # slot wait (e.g. an unexpected hang inside fetch/dispatch) while a
+        # slot is freely available - _acquire_slot()'s polling branch must
+        # never even be entered here (len(_running_tasks) stays 0, well
+        # under max_concurrency), so it cannot be the thing masking this.
+        runner.fetch_messages = _hanging_fetch
+
+        runner._consumer_task = asyncio.ensure_future(runner._consume_loop())
+        try:
+            await asyncio.sleep(runner._consumer_health_timeout_seconds + 0.3)
+            self.assertFalse(runner._is_consumer_healthy())
+            self.assertEqual(len(runner._running_tasks), 0)
+        finally:
+            hang_forever.set()
             runner._consumer_task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await runner._consumer_task
