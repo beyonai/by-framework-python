@@ -314,6 +314,22 @@ Entry anatomy:
   best-effort — a background component that fails to construct must never
   prevent the worker from consuming — and every one of them must be
   cancelled and awaited in `_shutdown()`, or shutdown hangs on it.
+  `_run_once()` acquires a concurrency slot via `_acquire_slot()`, never a
+  bare `await self.semaphore.acquire()` — a saturated pool (all
+  `max_concurrency` slots held by legitimately long-running tasks) must not
+  be indistinguishable from a genuinely stuck consume loop. `_acquire_slot()`
+  polls `len(self._running_tasks) >= self.max_concurrency` and calls
+  `_mark_consumer_tick()` on every poll while waiting, so `_is_consumer_healthy()`
+  (whose own comparison logic is untouched) keeps seeing fresh ticks for as
+  long as the loop is merely busy, not stalled. `self._slot_wait_poll_seconds`
+  is derived from `_consumer_health_timeout_seconds` (not hardcoded) so the
+  two stay proportional under any lease-TTL/stream-block-ms configuration.
+  Trade-off this does *not* solve, by design: it cannot distinguish a
+  legitimately long task from a deadlocked one that will never return — both
+  present as `_running_tasks` stuck at `max_concurrency`; task-level SLA
+  enforcement (detecting and cancelling an individual stuck task) is a
+  separate concern from consumer-loop liveness and is not implemented here —
+  see `CancelTaskCommand` for the existing per-task cancel path.
 
 - `src/by_framework/worker/health_server.py` — `WorkerHealthServer`: the
   `/readyz` readiness HTTP endpoint, on its own daemon thread (mirrors

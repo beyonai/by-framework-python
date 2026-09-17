@@ -216,7 +216,15 @@ regardless.
 2. `draining` — `SIGTERM`/`SIGINT` received, shutdown in progress
 3. `evicted` — `admin_lifecycle == "evicted"`
 4. `suspended` — `admin_lifecycle == "suspended"`
-5. `consumer_stalled` — consume loop stale past `_consumer_health_timeout_seconds`
+5. `consumer_stalled` — consume loop stale past `_consumer_health_timeout_seconds`.
+   "Stale" means the loop itself has stopped making progress (crashed task,
+   or an unexpected hang outside slot-waiting) — it deliberately excludes a
+   consume loop that is merely waiting for every `max_concurrency` slot to
+   free up while legitimately long-running tasks are in flight. A saturated-
+   but-alive loop keeps refreshing its liveness signal while it waits (see
+   `runner.py`'s `_acquire_slot()` in `docs/architecture/KEY_FILES.md`), so
+   it never surfaces here; only a loop that has actually stopped responding
+   does.
 6. `serving` — none of the above; `ready=true`
 
 `ready` is `true` if and only if `reason == "serving"`.
