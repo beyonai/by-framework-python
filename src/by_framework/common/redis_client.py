@@ -11,6 +11,7 @@ from redis.asyncio.cluster import ClusterNode, RedisCluster
 from .config import RedisConfig
 from .constants import get_key_schema_version
 from .exceptions import RedisConnectionError, StreamGroupExistsError
+from .redis_password import resolve_redis_password
 
 _redis_client: Optional[Redis] = None
 
@@ -42,6 +43,9 @@ def init_redis(
 
     A RedisConfig can be passed via `config` instead of individual kwargs;
     when provided, its fields take precedence over the individual params.
+
+    A password prefixed with ``{cipher}`` is decrypted first (see
+    ``redis_password.resolve_redis_password``); other values pass through.
     """
     global _redis_client
     if _redis_client is None:
@@ -70,6 +74,10 @@ def init_redis(
             kwargs["max_connections"] = max_connections
 
         try:
+            # Every config source (env, CLI, run_worker kwargs, dashboard)
+            # reaches Redis through here, so {cipher} values are decrypted
+            # once, at the last point before the client sees the password.
+            password = resolve_redis_password(password)
             if config is not None and config.mode == "cluster":
                 _redis_client = RedisCluster(
                     startup_nodes=[

@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour rather than erroring.
 
 ### Added
+- Encrypted Redis passwords. A password prefixed with `{cipher}` (from
+  `REDIS_PASSWORD`, `--redis-password`, or `run_worker(redis_password=...)`)
+  is decrypted with the RSA cipher format shared with byclaw-be and the Java
+  SDK before connecting. Other passwords are passed through unchanged; a
+  `{cipher}` value that cannot be decrypted fails Redis initialization with
+  `RedisConnectionError`.
 - Standardized Open Source governance files (CONTRIBUTING, CODE_OF_CONDUCT, SECURITY).
 - GitHub Issue and Pull Request templates.
 - Dependabot configuration for dependency monitoring.

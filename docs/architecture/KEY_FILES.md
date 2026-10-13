@@ -72,6 +72,18 @@ Entry anatomy:
   margin is a deliberate second line of defense against event-loop stalls;
   don't shrink one without the other.
 
+- `src/by_framework/common/redis_password.py` — `{cipher}` Redis password
+  decryption, a line-for-line port of the Java SDK's `RedisPasswordCipher`
+  (format shared with byclaw-be). Must keep byte-for-byte parity with Java:
+  hex via the Java `asciiToBcd` quirks (odd length errors, non-hex chars are
+  not rejected), `bit_length() // 8` blocks with a zero-padded short tail,
+  JDK RSA/ECB/PKCS1Padding unpadding (`00 02`, ≥8 pad bytes, `c < n`), and
+  per-block UTF-8 decode with replacement. Values without the prefix must
+  pass through untouched. Called only from `redis_client.init_redis()`,
+  the single choke point all password sources reach — decrypting earlier
+  (e.g. in `RedisConfig.from_env()`) would miss explicit kwargs. Error
+  messages must never include the ciphertext or plaintext.
+
 - `src/by_framework/admin/cli.py` — `by-admin` Typer CLI for cluster ops
   (worker list/suspend/evict, type deny/allow, metrics snapshot). `_get_redis()`
   must replicate the SDK-wide Redis resolution order — see
