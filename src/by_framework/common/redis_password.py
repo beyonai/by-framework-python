@@ -102,6 +102,5 @@ def _asc_to_bcd(asc: int) -> int:
 def _split_array(data: bytes, length: int) -> list[bytes]:
     # A short trailing block is right-padded with zeros, as in Java.
     return [
-        data[i : i + length].ljust(length, b"\x00")
-        for i in range(0, len(data), length)
+        data[i : i + length].ljust(length, b"\x00") for i in range(0, len(data), length)
     ]
